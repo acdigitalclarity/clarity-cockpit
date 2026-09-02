@@ -34,11 +34,16 @@ var (
 // SessionTab replaces the old PreviewTab (design/cockpit-pane/DECISIONS.md
 // slice 3): it is still tab index 0 and still the default, but now shows
 // the selected lane's own conversation (ui/session.go) rather than a raw
-// tmux capture. The old PreviewPane type is left in the tree, unused by
-// this window for now - see NewTabbedWindow's own comment.
+// tmux capture. NeedsYouTab (slice 5) replaces the old Diff tab in the
+// same slot: DiffPane's own upstream content is dropped from the tabs -
+// it stays reachable from nothing in this slice (the brief's own words) -
+// and the slot now shows the selected Needs-you row's own detail
+// (ui/needsyou.go) instead. Both PreviewPane and DiffPane are left in the
+// tree, unused by this window, rather than deleted - see NewTabbedWindow's
+// own comment.
 const (
 	SessionTab int = iota
-	DiffTab
+	NeedsYouTab
 	TerminalTab
 )
 
@@ -61,26 +66,25 @@ type TabbedWindow struct {
 	contentHeight int
 
 	session  *SessionPane
-	diff     *DiffPane
+	needsYou *NeedsYouPane
 	terminal *TerminalPane
 }
 
-// NewTabbedWindow wires the three tabs: Session (this fork's slice-3
-// replacement for the old tmux-capture Preview pane), Diff and Terminal
-// (both untouched in this slice - see DECISIONS.md's build-slice list,
-// items 5 and 6). PreviewPane's own type/tests are kept in the tree,
-// dormant, for a later slice to relocate its tmux-mirror capability under
-// the Terminal tab per DECISIONS.md's tab-3 definition - nothing upstream
-// is thrown away, it simply has no tab slot pointed at it right now.
-func NewTabbedWindow(session *SessionPane, diff *DiffPane, terminal *TerminalPane) *TabbedWindow {
+// NewTabbedWindow wires the three tabs: Session (slice 3's replacement for
+// the old tmux-capture Preview pane), Needs you (slice 5's replacement for
+// the old Diff pane) and Terminal (untouched in this slice - see
+// DECISIONS.md's build-slice list, item 6). PreviewPane and DiffPane are
+// both kept in the tree, dormant - nothing upstream is thrown away, neither
+// simply has a tab slot pointed at it any more.
+func NewTabbedWindow(session *SessionPane, needsYou *NeedsYouPane, terminal *TerminalPane) *TabbedWindow {
 	return &TabbedWindow{
 		tabs: []string{
 			"Session",
-			"Diff",
+			"Needs you",
 			"Terminal",
 		},
 		session:  session,
-		diff:     diff,
+		needsYou: needsYou,
 		terminal: terminal,
 	}
 }
@@ -113,13 +117,13 @@ func (w *TabbedWindow) SetSize(width, height int) {
 
 	w.contentWidth, w.contentHeight = contentWidth, contentHeight
 	w.session.SetSize(contentWidth, contentHeight)
-	w.diff.SetSize(contentWidth, contentHeight)
+	w.needsYou.SetSize(contentWidth, contentHeight)
 	w.terminal.SetSize(contentWidth, contentHeight)
 }
 
-// GetContentSize returns the content area every tab shares - Session, Diff
-// and Terminal are all sized identically by SetSize above, so this used to
-// read PreviewPane's own width/height specifically; now it reads the
+// GetContentSize returns the content area every tab shares - Session, Needs
+// you and Terminal are all sized identically by SetSize above, so this used
+// to read PreviewPane's own width/height specifically; now it reads the
 // dimensions SetSize itself computed, which is exactly the same number
 // regardless of which pane it came from.
 func (w *TabbedWindow) GetContentSize() (width, height int) {
@@ -132,10 +136,9 @@ func (w *TabbedWindow) Toggle() {
 
 // SetSessionInfo replaces the Session tab's data for the selected lane (nil
 // when nothing is selected - the pane then shows the resting frame).
-// Unlike UpdateDiff/UpdateTerminal below, this is never gated on the active
-// tab: the data comes from the feed tick's already-cached LaneTail (cheap),
-// and gating it would show stale turns for a beat after switching onto the
-// tab.
+// Unlike UpdateTerminal below, this is never gated on the active tab: the
+// data comes from the feed tick's already-cached LaneTail (cheap), and
+// gating it would show stale turns for a beat after switching onto the tab.
 func (w *TabbedWindow) SetSessionInfo(info *SessionInfo) {
 	w.session.SetInfo(info)
 }
@@ -146,11 +149,12 @@ func (w *TabbedWindow) SetSessionFleetCounts(live, waiting int) {
 	w.session.SetFleetCounts(live, waiting)
 }
 
-func (w *TabbedWindow) UpdateDiff(instance *session.Instance) {
-	if w.activeTab != DiffTab {
-		return
-	}
-	w.diff.SetDiff(instance)
+// SetNeedsYouInfo replaces the Needs-you tab's data for the selected row
+// (nil when the cursor is not on one - the pane then shows its own plain
+// message). Never gated on the active tab, same reasoning as
+// SetSessionInfo above.
+func (w *TabbedWindow) SetNeedsYouInfo(info *NeedsYouInfo) {
+	w.needsYou.SetInfo(info)
 }
 
 // UpdateTerminal updates the terminal pane content. Only updates when terminal tab is active.
@@ -166,8 +170,8 @@ func (w *TabbedWindow) ScrollUp() {
 	switch w.activeTab {
 	case SessionTab:
 		w.session.ScrollUp()
-	case DiffTab:
-		w.diff.ScrollUp()
+	case NeedsYouTab:
+		w.needsYou.ScrollUp()
 	case TerminalTab:
 		if err := w.terminal.ScrollUp(); err != nil {
 			log.InfoLog.Printf("tabbed window failed to scroll terminal up: %v", err)
@@ -179,8 +183,8 @@ func (w *TabbedWindow) ScrollDown() {
 	switch w.activeTab {
 	case SessionTab:
 		w.session.ScrollDown()
-	case DiffTab:
-		w.diff.ScrollDown()
+	case NeedsYouTab:
+		w.needsYou.ScrollDown()
 	case TerminalTab:
 		if err := w.terminal.ScrollDown(); err != nil {
 			log.InfoLog.Printf("tabbed window failed to scroll terminal down: %v", err)
@@ -193,9 +197,9 @@ func (w *TabbedWindow) IsInSessionTab() bool {
 	return w.activeTab == SessionTab
 }
 
-// IsInDiffTab returns true if the diff tab is currently active
-func (w *TabbedWindow) IsInDiffTab() bool {
-	return w.activeTab == DiffTab
+// IsInNeedsYouTab returns true if the Needs-you tab is currently active
+func (w *TabbedWindow) IsInNeedsYouTab() bool {
+	return w.activeTab == NeedsYouTab
 }
 
 // IsInTerminalTab returns true if the terminal tab is currently active
@@ -206,6 +210,18 @@ func (w *TabbedWindow) IsInTerminalTab() bool {
 // GetActiveTab returns the currently active tab index
 func (w *TabbedWindow) GetActiveTab() int {
 	return w.activeTab
+}
+
+// SetActiveTab jumps directly to tab, a no-op outside [0, len(tabs)) - used
+// by app.go's tab-follows-row-kind rule (slice 5's "selecting a Needs-you
+// row changes the right pane's active tab to Needs you; selecting a lane
+// row returns it to Session") to set the tab programmatically, unlike
+// Toggle's own one-step cycle.
+func (w *TabbedWindow) SetActiveTab(tab int) {
+	if tab < 0 || tab >= len(w.tabs) {
+		return
+	}
+	w.activeTab = tab
 }
 
 // AttachTerminal attaches to the terminal tmux session
@@ -278,8 +294,8 @@ func (w *TabbedWindow) String() string {
 	switch w.activeTab {
 	case SessionTab:
 		content = w.session.String()
-	case DiffTab:
-		content = w.diff.String()
+	case NeedsYouTab:
+		content = w.needsYou.String()
 	case TerminalTab:
 		content = w.terminal.String()
 	}

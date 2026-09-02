@@ -78,13 +78,24 @@ type SessionPane struct {
 	live, waiting int // fleet counters for the resting frame (splash.FleetCounts)
 
 	viewport viewport.Model // the scrollable turns region only, not the whole pane
+
+	// composer is the shared inline message box (slice 5) - app.go owns
+	// the single instance and wires it into both this pane and NeedsYouPane
+	// via SetComposer, since only one row can be the current send target.
+	composer *Composer
 }
 
 // NewSessionPane returns an empty SessionPane - SetSize and SetInfo (or
 // Clear) still need calling before String() shows anything meaningful,
 // same contract as PreviewPane/TerminalPane/DiffPane.
 func NewSessionPane() *SessionPane {
-	return &SessionPane{viewport: viewport.New()}
+	return &SessionPane{viewport: viewport.New(), composer: NewComposer()}
+}
+
+// SetComposer wires the shared Composer app.go owns into this pane's own
+// render - called once at construction, not per-tick.
+func (s *SessionPane) SetComposer(c *Composer) {
+	s.composer = c
 }
 
 // SetSize sets the pane's own content dimensions (the tabbed window's
@@ -200,6 +211,23 @@ func (s *SessionPane) String() string {
 		return strings.Repeat("\n", h)
 	}
 	if s.info == nil {
+		// DEFECT (slice 5's own scratchfix proof, PROOF (b)): a tracked
+		// instance whose program keeps no Claude transcript at all (the
+		// proof's own `cat`-backed lane; equally any non-Claude program)
+		// never has a SessionInfo to show - selectedSessionInfo returns nil
+		// for it exactly as it does for "nothing selected" at all. Without
+		// this branch the composer, already open and holding its own
+		// captured target (Composer.Open captures lane/isExternal
+		// independently of SessionInfo), would silently never render: m
+		// would flip m.state to stateMsg and the composer's data model
+		// would update, but the pane kept returning the bare resting frame
+		// with no box drawn at all. The resting frame still shows (never a
+		// placeholder line, per DECISIONS.md's own "no placeholder text"
+		// rule) - only its own foot rows now make room for the composer
+		// whenever it has something to show.
+		if s.composer.IsOpen() || s.composer.HasResult() {
+			return s.renderRestingWithComposer()
+		}
 		return s.renderResting()
 	}
 
@@ -248,6 +276,34 @@ func (s *SessionPane) renderResting() string {
 		frame = FallbackMark(s.width)
 	}
 	return lipgloss.Place(s.width, s.height, lipgloss.Center, lipgloss.Center, frame)
+}
+
+// renderRestingWithComposer is renderResting's own layout, shrunk to leave
+// room for the composer's fixed 3-line box at the foot - the "no
+// SessionInfo, but the composer is engaged" case (see String()'s own
+// comment). lane is passed as "" since a composer reaching this branch is
+// always open or holding a result, both of which render from their own
+// captured target (Composer.Render's own doc comment), never the fallback
+// argument.
+func (s *SessionPane) renderRestingWithComposer() string {
+	composerLines := s.composer.Render(s.width, "")
+	restHeight := s.height - len(composerLines)
+	if restHeight < 0 {
+		restHeight = 0
+	}
+
+	frame := splash.RenderFrame(s.width, restHeight, -1, -1, s.live, s.waiting)
+	if !fitsBox(frame, s.width, restHeight) {
+		frame = FallbackMark(s.width)
+	}
+	rest := lipgloss.Place(s.width, restHeight, lipgloss.Center, lipgloss.Center, frame)
+
+	lines := strings.Split(rest, "\n")
+	lines = append(lines, composerLines...)
+	for i, l := range lines {
+		lines[i] = fitRow(l, s.width)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // fitsBox reports whether every line of content is within width and the
@@ -339,7 +395,14 @@ func (s *SessionPane) renderHeaderLine2() string {
 
 // rule is a full-width horizontal divider, dim.
 func (s *SessionPane) rule() string {
-	return sessionMutedStyle.Render(strings.Repeat("─", s.width))
+	return muteRule(s.width)
+}
+
+// muteRule is a full-width horizontal divider, dim - shared by SessionPane
+// and NeedsYouPane (needsyou.go) so the two tabs' dividers never drift out
+// of style.
+func muteRule(width int) string {
+	return sessionMutedStyle.Render(strings.Repeat("─", width))
 }
 
 // renderEarlierLine is "⋯ earlier in this session · N messages · shift+↑ to
@@ -371,27 +434,12 @@ func (s *SessionPane) renderStateLine() string {
 		g, t.State, t.LastTurn.Local().Format("15:04:05"), t.PendingAgents, trailing))
 }
 
-// renderComposerLines draws the inert composer box exactly as the mock-up
-// (design/cockpit-pane/PANE-MOCKUP-164x45.md lines 38-40), greyed - except
-// its foot text, which the brief deliberately overrides to "m message · esc
-// back" (the mock's "enter send · esc cancel" describes slice 5's WIRED
-// composer; this slice draws the box only, no input handling).
+// renderComposerLines draws the composer box exactly as the mock-up
+// (design/cockpit-pane/PANE-MOCKUP-164x45.md lines 38-40) - WIRED (slice
+// 5): the shared Composer's own Render, targeted at this pane's selected
+// lane whenever the composer is not already open on a captured target.
 func (s *SessionPane) renderComposerLines() []string {
-	width := s.width
-	title := fmt.Sprintf(" message %s ", s.info.Lane)
-	top := "┌" + title + strings.Repeat("─", maxInt0(width-2-lipgloss.Width(title))) + "┐"
-
-	prompt := "▸ █"
-	mid := "│ " + prompt + strings.Repeat(" ", maxInt0(width-4-lipgloss.Width(prompt))) + " │"
-
-	foot := " m message · esc back "
-	bottom := "└" + strings.Repeat("─", maxInt0(width-2-lipgloss.Width(foot))) + foot + "─┘"
-
-	return []string{
-		sessionMutedStyle.Render(fitRow(top, width)),
-		sessionMutedStyle.Render(fitRow(mid, width)),
-		sessionMutedStyle.Render(fitRow(bottom, width)),
-	}
+	return s.composer.Render(s.width, s.info.Lane)
 }
 
 // -- small rendering helpers, package-private to this file --------------

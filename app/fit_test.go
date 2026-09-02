@@ -116,6 +116,44 @@ func TestView_PreviewBottomBorderVisible(t *testing.T) {
 	}
 }
 
+// TestView_NoLineExceedsWidth_NeedsYouTabSelected is the FINISH
+// requirement's own Needs-you case (the brief's "fit tests gain a
+// Needs-you case"): with a Needs-you row selected (so the tab has switched
+// to Needs you, slice 5's own tab-follows-row-kind rule) and its composer
+// box drawn, nothing still exceeds the pane at any of the three named
+// terminal sizes.
+func TestView_NoLineExceedsWidth_NeedsYouTabSelected(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(clarity.ClaudeProjectsRootEnvVar, root)
+	queuePath := filepath.Join(root, "FLEET-QUEUE.md")
+	require.NoError(t, os.WriteFile(queuePath, []byte(
+		"| rank | class | source | title |\n| --- | --- | --- | --- |\n"+
+			"| 1 | blocked-on-owner | #277 | Owner: one settings act - move state-claim-warn to Stop and add the specialist boot line |\n"),
+		0644))
+	t.Setenv(clarity.FeedQueuePathEnvVar, queuePath)
+
+	for _, sz := range []struct{ w, h int }{{120, 36}, {164, 45}, {200, 55}} {
+		t.Run(fmt.Sprintf("%dx%d", sz.w, sz.h), func(t *testing.T) {
+			h := newHome(context.Background(), "true", false, true)
+			h.updateHandleWindowSizeEvent(tea.WindowSizeMsg{Width: sz.w, Height: sz.h})
+
+			_, cmd := h.Update(feedTickMsg{})
+			require.NotNil(t, cmd)
+
+			h.list.Up() // the default tracked-group cursor wraps to the sole Needs-you row
+			h.selectionChanged()
+			require.Equal(t, ui.NeedsYouTab, h.tabbedWindow.GetActiveTab(),
+				"selecting the Needs-you row must have switched the tab")
+
+			v := h.View()
+			for i, line := range strings.Split(v.Content, "\n") {
+				require.LessOrEqualf(t, ansi.StringWidth(line), sz.w,
+					"line %d exceeds terminal width %d: %q", i, sz.w, line)
+			}
+		})
+	}
+}
+
 // TestUpdateHandleWindowSizeEvent_CollapsesBelowThreshold documents the
 // OVERFLOW fix's stated decision: below collapsePreviewBelowWidth columns
 // the preview/diff pane is collapsed (zero width) rather than fought over,
