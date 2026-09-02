@@ -10,12 +10,46 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/require"
 )
+
+// TestView_ListStartsAtOneSpaceMargin is the MARGIN defect's own test: at
+// 164 wide the list's own " Instances " title line already carries exactly
+// one leading space, but View()'s outer lipgloss.JoinVertical(lipgloss.
+// Center, ...) padded listAndPreview (156 wide - TabbedWindow renders 8
+// columns narrower than the 99 it was given) up to the taller rows'
+// full 164, centering the shortfall and pushing the whole list 4 columns
+// right (column 5, close to the brief's observed "column 6" at the real
+// fleet's own preview content). Left-aligning that join instead of
+// centering it removes the manufactured indent at every width, leaving
+// only the one space already baked into " Instances ".
+func TestView_ListStartsAtOneSpaceMargin(t *testing.T) {
+	for _, sz := range []struct{ w, h int }{{120, 36}, {164, 45}} {
+		t.Run(fmt.Sprintf("%dx%d", sz.w, sz.h), func(t *testing.T) {
+			h := newHome(context.Background(), "true", false, true)
+			h.updateHandleWindowSizeEvent(tea.WindowSizeMsg{Width: sz.w, Height: sz.h})
+			v := h.View()
+			var firstNonBlank string
+			for _, line := range strings.Split(v.Content, "\n") {
+				if strings.TrimSpace(ansi.Strip(line)) != "" {
+					firstNonBlank = line
+					break
+				}
+			}
+			require.NotEmpty(t, firstNonBlank, "View() must render at least one non-blank line")
+			plain := ansi.Strip(firstNonBlank)
+			require.True(t, strings.HasPrefix(plain, " Instances"),
+				"first non-blank line must lead with the list's own one-space margin, got %q", plain)
+			require.False(t, strings.HasPrefix(plain, "  Instances"),
+				"exactly one leading space, not more, got %q", plain)
+		})
+	}
+}
 
 // TestView_NoLineExceedsWidth is the brief's own named test: a View() at
 // 164x45 and 120x36 (plus the collapse-threshold case at 80x24 and a wide
@@ -140,4 +174,48 @@ func TestFeedTick_ComputesContextFillForPausedInstances(t *testing.T) {
 	pct, ok := inst.GetContextFill()
 	require.True(t, ok, "a Paused tracked instance's context fill must be derivable from its own transcript, not stuck at n/a")
 	require.Equal(t, 50, pct)
+}
+
+// TestFeedTick_ComputesLaneStateForTrackedInstance is item 1's own app-level
+// test: the state word every lane row now carries comes from
+// clarity.ReadLaneTail, computed on this same feed tick for every tracked
+// instance (not just Paused ones, since a Running instance's row needs the
+// word just as much) - GetLaneState must report it after one tick.
+func TestFeedTick_ComputesLaneStateForTrackedInstance(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(clarity.ClaudeProjectsRootEnvVar, root)
+	t.Setenv(clarity.FeedQueuePathEnvVar, filepath.Join(root, "no-such-queue.json"))
+
+	lanePath := t.TempDir()
+	dir := filepath.Join(root, clarity.EncodeProjectDir(lanePath))
+	require.NoError(t, os.MkdirAll(dir, 0755))
+	transcript := filepath.Join(dir, "t.jsonl")
+	ts := time.Now().UTC().Format(time.RFC3339)
+	line := `{"type":"system","subtype":"turn_duration","timestamp":"` + ts +
+		`","durationMs":1000,"messageCount":3,"pendingBackgroundAgentCount":2}` + "\n"
+	require.NoError(t, os.WriteFile(transcript, []byte(line), 0644))
+
+	inst, err := session.NewInstance(session.InstanceOptions{
+		Title:   "working-lane",
+		Path:    lanePath,
+		Program: "echo",
+	})
+	require.NoError(t, err)
+
+	_, _, ok := inst.GetLaneState()
+	require.False(t, ok, "no lane state cached yet")
+
+	sp := spinner.New()
+	h := &home{
+		ctx:  context.Background(),
+		list: ui.NewList(&sp, false),
+	}
+	h.list.AddInstance(inst)
+
+	_, cmd := h.Update(feedTickMsg{})
+	require.NotNil(t, cmd, "feedTickMsg self-reschedules")
+
+	state, _, ok := inst.GetLaneState()
+	require.True(t, ok, "a tracked instance's lane state must be derivable from its own transcript after one feed tick")
+	require.Equal(t, clarity.StateWorking, state)
 }

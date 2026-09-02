@@ -141,3 +141,80 @@ func TestRender_KnownContextFill_StillRenders(t *testing.T) {
 	out := l.String()
 	require.Contains(t, out, "ctx 42%")
 }
+
+// TestString_TrackedRow_ShowsStateGlyphWordAndLastTurn is item 1's own
+// tracked-row test: once SetLaneState has a real value cached, the title
+// line carries the state glyph, its word, and the last-turn time (local,
+// hh:mm) alongside the existing ctx figure.
+func TestString_TrackedRow_ShowsStateGlyphWordAndLastTurn(t *testing.T) {
+	l := newTestList("working-lane")
+	l.SetSize(120, 40)
+	lastTurn := time.Date(2026, 9, 2, 19, 4, 0, 0, time.Local)
+	l.items[0].SetLaneState(clarity.StateWorking, lastTurn, true)
+
+	out := l.String()
+	require.Contains(t, out, "●", "the working glyph must render")
+	require.Contains(t, out, "working", "the state word must render")
+	require.Contains(t, out, "19:04", "the last-turn time must render, local hh:mm")
+}
+
+// TestString_ExternalRow_ShowsStateGlyphWordAndLastTurn is the same test
+// for an external lane row.
+func TestString_ExternalRow_ShowsStateGlyphWordAndLastTurn(t *testing.T) {
+	l := newTestList()
+	l.SetSize(120, 40)
+	lastTurn := time.Date(2026, 9, 2, 18, 29, 0, 0, time.Local)
+	l.SetExternal([]clarity.ExternalLane{
+		{Name: "travel-matrix-m4", LastWrite: time.Now(), Fill: clarity.Fill{Pct: 80}, FillOK: true,
+			State: clarity.StateStalled, LastTurn: lastTurn, StateOK: true},
+	})
+
+	out := l.String()
+	require.Contains(t, out, "◐", "the stalled glyph must render")
+	require.Contains(t, out, "stalled", "the state word must render")
+	require.Contains(t, out, "18:29", "the last-turn time must render, local hh:mm")
+}
+
+// TestString_LaneRows_DropWordWhenCollapsed is item 1's "below 100 columns
+// drop the word, keep the glyph": with SetCollapsed(true), the state word
+// disappears from both row kinds but the glyph stays.
+func TestString_LaneRows_DropWordWhenCollapsed(t *testing.T) {
+	l := newTestList("tracked-one")
+	l.SetSize(80, 40)
+	l.SetCollapsed(true)
+	l.items[0].SetLaneState(clarity.StateWorking, time.Now(), true)
+	l.SetExternal([]clarity.ExternalLane{
+		{Name: "external-one", LastWrite: time.Now(), State: clarity.StateIdle, LastTurn: time.Now(), StateOK: true},
+	})
+
+	out := l.String()
+	require.Contains(t, out, "●", "the tracked row's glyph must still render")
+	require.Contains(t, out, "○", "the external row's glyph must still render")
+	require.NotContains(t, out, "working", "the state word must be dropped below the collapse threshold")
+	require.NotContains(t, out, "idle", "the state word must be dropped below the collapse threshold")
+}
+
+// TestString_TrackedAndExternalRows_ShareCtxColumn is item 4's "one table"
+// requirement across row KINDS, not just within external rows
+// (TestString_ExternalRows_ColumnsLineUp covers that half): a tracked
+// instance's title line and an external lane's row must place "ctx" in the
+// same column.
+func TestString_TrackedAndExternalRows_ShareCtxColumn(t *testing.T) {
+	l := newTestList("a-tracked-lane")
+	l.SetSize(120, 40)
+	l.SetExternal([]clarity.ExternalLane{{Name: "an-external-lane", LastWrite: time.Now()}})
+
+	out := l.String()
+	var ctxCols []int
+	for _, line := range strings.Split(out, "\n") {
+		// Strip ANSI first: the tracked row and the external row carry
+		// different escape sequences (different styles), so a raw
+		// strings.Index would compare byte offsets that include those
+		// codes, not the rendered column.
+		if idx := strings.Index(ansi.Strip(line), "ctx"); idx >= 0 {
+			ctxCols = append(ctxCols, idx)
+		}
+	}
+	require.Len(t, ctxCols, 2, "expected exactly the tracked row and the external row to carry a ctx column")
+	require.Equal(t, ctxCols[0], ctxCols[1], "ctx must land in the same column for a tracked row and an external row alike")
+}

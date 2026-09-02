@@ -6,7 +6,9 @@ import (
 	"claude-squad/session/clarity"
 	"errors"
 	"fmt"
+	"image/color"
 	"strings"
+	"time"
 
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/lipgloss/v2"
@@ -15,20 +17,11 @@ import (
 	"github.com/mattn/go-runewidth"
 )
 
-const readyIcon = "● "
-const pausedIcon = "⏸ "
-
-var readyStyle = lipgloss.NewStyle().
-	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#51bd73"), Dark: lipgloss.Color("#51bd73")})
-
 var addedLinesStyle = lipgloss.NewStyle().
 	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#51bd73"), Dark: lipgloss.Color("#51bd73")})
 
 var removedLinesStyle = lipgloss.NewStyle().
 	Foreground(lipgloss.Color("#de613e"))
-
-var pausedStyle = lipgloss.NewStyle().
-	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#888888"), Dark: lipgloss.Color("#888888")})
 
 var titleStyle = lipgloss.NewStyle().
 	Padding(1, 1, 0, 1).
@@ -78,6 +71,113 @@ var externalRowSelectedStyle = lipgloss.NewStyle().
 	Background(lipgloss.Color("#dde4f0")).
 	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#1a1a1a"), Dark: lipgloss.Color("#1a1a1a")})
 
+// laneStateAccentStyle/laneStateStalledStyle/laneStateIdleStyle are the
+// state-word row's own colours (DECISIONS.md, 2 Sep evening, PANE-MOCKUP-*):
+// working and waiting on you reuse the selected row's own accent
+// (selectedTitleStyle/externalRowSelectedStyle's background colour, #dde4f0
+// - the accent already used for the selected row), stalled reuses the
+// Needs-you heading's orange (needsYouTitleStyle's foreground), idle is
+// dim (externalRowStyle's own dim foreground).
+var laneStateAccentStyle = lipgloss.NewStyle().
+	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#dde4f0"), Dark: lipgloss.Color("#dde4f0")})
+
+var laneStateStalledStyle = lipgloss.NewStyle().
+	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#b5581a"), Dark: lipgloss.Color("#e0a458")})
+
+var laneStateIdleStyle = lipgloss.NewStyle().
+	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#777777"), Dark: lipgloss.Color("#999999")})
+
+// laneStateGlyph returns the glyph and style ClassifyState's four words
+// render as - working ● and waiting on you ◉ share the accent style,
+// stalled ◐ the orange, idle ○ dim. An unknown/not-yet-computed state (the
+// empty string, before the first feed tick has classified this lane) draws
+// a blank glyph: the row still reserves the column, it simply has nothing
+// to show yet, same convention as the ctx gauge's "show nothing, not n/a".
+func laneStateGlyph(state string) (string, lipgloss.Style) {
+	switch state {
+	case clarity.StateWorking:
+		return "●", laneStateAccentStyle
+	case clarity.StateWaitingYou:
+		return "◉", laneStateAccentStyle
+	case clarity.StateStalled:
+		return "◐", laneStateStalledStyle
+	case clarity.StateIdle:
+		return "○", laneStateIdleStyle
+	default:
+		return " ", lipgloss.NewStyle()
+	}
+}
+
+// laneStateWordWidth is the widest of the four state words ClassifyState
+// produces ("waiting on you") - the state field is padded to this width on
+// every row so the last-turn time lands in the same column regardless of
+// which word a given row shows.
+var laneStateWordWidth = len(clarity.StateWaitingYou)
+
+// laneCtxFieldWidth is "ctx 100%" - the widest a context-fill percentage
+// ever renders (0-100%, three digits plus a leading 100% edge case), fixed
+// so the field's own width never changes row to row; the percentage
+// right-aligns inside it (item 1's "ctx percentage right-aligned").
+const laneCtxFieldWidth = len("ctx 100%")
+
+// laneTimeWidth is "15:04" - the last-turn time, local, hours:minutes.
+const laneTimeWidth = len("15:04")
+
+// laneSuffixWidth is the plain-text width of laneRowSuffix's output for a
+// given showWord - kept as an explicit function (not just len() on a
+// sample render) so nameCol sizing and the actual render can never drift
+// out of step with each other.
+func laneSuffixWidth(showWord bool) int {
+	// " " + ctx + "  " + glyph + " " + time
+	w := 1 + laneCtxFieldWidth + 2 + 1 + 1 + laneTimeWidth
+	if showWord {
+		// + word + " "
+		w += laneStateWordWidth + 1
+	}
+	return w
+}
+
+// laneCtxField renders a lane's "ctx NN%" label right-justified within a
+// fixed-width field, so the trailing "%" always lands in the same column
+// regardless of how many digits the percentage has (item 1's "ctx
+// percentage right-aligned") - the label itself is left-aligned within
+// that padding, so "ctx 42%" still appears as a literal, unbroken
+// substring rather than gaining an internal gap. When the fill genuinely
+// cannot be derived the number is blank (not "n/a", the OWN ROW fix's
+// rule) but the "ctx" label still marks the column.
+func laneCtxField(pct int, ok bool) string {
+	if !ok {
+		return runewidth.FillRight("ctx", laneCtxFieldWidth)
+	}
+	return fmt.Sprintf("%*s", laneCtxFieldWidth, fmt.Sprintf("ctx %d%%", pct))
+}
+
+// laneRowSuffix renders the fixed-width tail every lane row (tracked or
+// external) shares: right-aligned ctx, the state glyph (and word, unless
+// collapsed), then the last-turn time - the FINISH defect's "one table"
+// requirement. Every segment carries rowBg/rowFg forward explicitly (the
+// same technique the diff-stat badge already uses, see Render() below) so
+// the glyph's own state colour does not reset the row's selected-highlight
+// background for the characters after it.
+func laneRowSuffix(rowBg, rowFg color.Color, pct int, fillOK bool, state string, lastTurn time.Time, turnOK bool, showWord bool) string {
+	plain := lipgloss.NewStyle().Background(rowBg).Foreground(rowFg)
+	glyph, glyphStyle := laneStateGlyph(state)
+	glyphStyle = glyphStyle.Background(rowBg)
+
+	timeText := strings.Repeat(" ", laneTimeWidth)
+	if turnOK {
+		timeText = lastTurn.Local().Format("15:04")
+	}
+
+	ctx := plain.Render(laneCtxField(pct, fillOK))
+	timeSeg := plain.Render(timeText)
+	if !showWord {
+		return fmt.Sprintf(" %s  %s %s", ctx, glyphStyle.Render(glyph), timeSeg)
+	}
+	word := plain.Foreground(glyphStyle.GetForeground()).Render(runewidth.FillRight(state, laneStateWordWidth))
+	return fmt.Sprintf(" %s  %s %s %s", ctx, glyphStyle.Render(glyph), word, timeSeg)
+}
+
 type List struct {
 	items         []*session.Instance
 	selectedIdx   int
@@ -104,6 +204,22 @@ type List struct {
 	// rather than items - the two lists share one selection cursor that
 	// wraps from the bottom of items into the top of external and back.
 	selExternal bool
+
+	// collapsed mirrors app.go's own collapsePreviewBelowWidth decision
+	// (the terminal itself, not just this list's own column share, is
+	// under 100 columns) - item 1's "below 100 columns drop the word, keep
+	// the glyph" on every lane row. Set via SetCollapsed, never derived
+	// from l.width itself: at every width this app is normally run at, the
+	// list's OWN column share is under 100 regardless of whether the
+	// terminal is collapsed or not, so l.width alone cannot tell the two
+	// apart.
+	collapsed bool
+}
+
+// SetCollapsed records whether the terminal itself is below
+// app.go's collapsePreviewBelowWidth threshold.
+func (l *List) SetCollapsed(collapsed bool) {
+	l.collapsed = collapsed
 }
 
 // SetNeedsYou replaces the "Needs you" feed lines shown above the instance
@@ -195,36 +311,53 @@ func ansiTruncateRow(s string, width int) string {
 	return ansi.Truncate(s, width, "…")
 }
 
-// externalRowSuffixWidth is the fixed width of every external-lane row's
-// content after the name column: " ctx " (5) + the fill percentage padded
-// to 5 ("%-5s") + " last write " (12) + "HH:MM:SS" (8) = 30, matching the
-// literal format string in String() below exactly.
-const externalRowSuffixWidth = 30
-
-// externalNameColMax is the widest the name column is ever allowed to be -
-// long enough for this fleet's actual lane names (see the OVERFLOW repro
+// laneNameColMax is the widest the name column is ever allowed to be - long
+// enough for this fleet's actual lane names (see the OVERFLOW repro
 // capture: 21-27 characters) without eating into the suffix's budget on a
-// wide terminal.
-const externalNameColMax = 28
+// wide terminal. Shared by both row kinds (item 4's "one table").
+const laneNameColMax = 28
 
-// externalNameColWidth returns the fixed column width the external-lane
-// name is padded/truncated to, so every row's "ctx NN%" and "last write
-// HH:MM:SS" line up under each other regardless of individual lane-name
-// length (the FINISH defect's "pad the lane name to a column" requirement).
-// It shrinks below externalNameColMax on a narrow list column so the
-// suffix - the ctx/last-write information that matters most - is never the
-// part a too-wide fixed name column pushes past the row's own truncation
-// and off the edge.
-func (l *List) externalNameColWidth() int {
-	avail := l.rowInnerWidth() - externalRowSuffixWidth
+// laneRowInnerWidth converts a component's own AdjustPreviewWidth(list
+// width) into the row-content budget List.rowInnerWidth() computes for the
+// "Needs you"/external section (that -2 is the small left/right padding
+// those styles apply). InstanceRenderer's r.width is already
+// AdjustPreviewWidth(list width) (see setWidth below), so this is the one
+// place both the tracked-instance title line and the external rows derive
+// their shared column grid from, instead of two independently-drifting
+// calculations.
+func laneRowInnerWidth(componentWidth int) int {
+	w := componentWidth - 2
+	if w < 1 {
+		w = 1
+	}
+	return w
+}
+
+// laneNameColWidthFor returns the fixed column width a lane row's name is
+// padded/truncated to within a rowInner budget, so every row's
+// ctx/glyph/word/time line up under each other regardless of individual
+// lane-name length or whether the row is a tracked instance's "N. name" or
+// a bare external lane name (the FINISH defect's "pad the lane name to a
+// column" requirement, generalized to both row kinds). It shrinks below
+// laneNameColMax on a narrow list column so the suffix - the state
+// information that matters most - is never the part a too-wide fixed name
+// column pushes past the row's own truncation and off the edge.
+func laneNameColWidthFor(rowInner int, showWord bool) int {
+	avail := rowInner - laneSuffixWidth(showWord)
 	const minCol = 6
 	if avail < minCol {
 		avail = minCol
 	}
-	if avail > externalNameColMax {
-		avail = externalNameColMax
+	if avail > laneNameColMax {
+		avail = laneNameColMax
 	}
 	return avail
+}
+
+// laneNameColWidth is laneNameColWidthFor applied to this List's own
+// rowInnerWidth() - the external-lane section's own budget.
+func (l *List) laneNameColWidth(showWord bool) int {
+	return laneNameColWidthFor(l.rowInnerWidth(), showWord)
 }
 
 // InstanceRenderer handles rendering of session.Instance objects
@@ -240,7 +373,7 @@ func (r *InstanceRenderer) setWidth(width int) {
 // ɹ and ɻ are other options.
 const branchIcon = "Ꮧ"
 
-func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, hasMultipleRepos bool) string {
+func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, hasMultipleRepos bool, showWord bool) string {
 	prefix := fmt.Sprintf(" %d. ", idx)
 	if idx >= 10 {
 		prefix = prefix[:len(prefix)-1]
@@ -252,30 +385,27 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, h
 		descS = listDescStyle
 	}
 
-	// add spinner next to title if it's running
-	var join string
-	switch i.Status {
-	case session.Running, session.Loading:
-		join = fmt.Sprintf("%s ", r.spinner.View())
-	case session.Ready:
-		join = readyStyle.Render(readyIcon)
-	case session.Paused:
-		join = pausedStyle.Render(pausedIcon)
-	default:
-	}
+	// The title line now carries the same state table every lane row
+	// shares (item 1): name padded to a column, ctx right-aligned, the
+	// clarity-derived state glyph and word, then last-turn time - replacing
+	// the plain tmux-status glyph (ready/paused/spinner) this line used to
+	// end with, since ClassifyState's four words are a strict superset of
+	// what that conveyed (a Paused instance's transcript reads idle or
+	// stalled on its own merits).
+	nameCol := laneNameColWidthFor(laneRowInnerWidth(r.width), showWord)
+	name := runewidth.FillRight(runewidth.Truncate(prefix+i.Title, nameCol, "…"), nameCol)
 
-	// Cut the title if it's too long
-	titleText := i.Title
-	widthAvail := r.width - 3 - runewidth.StringWidth(prefix) - 1
-	if widthAvail > 0 && runewidth.StringWidth(titleText) > widthAvail {
-		titleText = runewidth.Truncate(titleText, widthAvail-3, "...")
-	}
-	title := titleS.Render(lipgloss.JoinHorizontal(
-		lipgloss.Left,
-		lipgloss.Place(r.width-3, 1, lipgloss.Left, lipgloss.Center, fmt.Sprintf("%s %s", prefix, titleText)),
-		" ",
-		join,
-	))
+	pct, fillOK := i.GetContextFill()
+	state, lastTurn, turnOK := i.GetLaneState()
+	suffix := laneRowSuffix(titleS.GetBackground(), titleS.GetForeground(), pct, fillOK, state, lastTurn, turnOK, showWord)
+	// titleS carries its own left/right Padding, added once by wrapping the
+	// WHOLE truncated line in it here (not the name alone) - the truncation
+	// budget (laneRowInnerWidth) already excludes that padding's width, so
+	// truncating first and padding last is the order that keeps the styled
+	// result within r.width; truncating an already-padded string instead
+	// (as an earlier version of this line did) over-truncates by exactly
+	// the padding's own width, eating into the suffix's last-turn time.
+	title := titleS.Render(ansiTruncateRow(name+suffix, laneRowInnerWidth(r.width)))
 
 	stat := i.GetDiffStats()
 
@@ -310,26 +440,6 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, h
 	// Use fixed width for diff stats to avoid layout issues
 	remainingWidth -= diffWidth
 
-	// Context-fill gauge: the same number scripts/fleet_dashboard.py would
-	// show for this instance's lane (see session/clarity/gauge.go). A
-	// tracked instance's fill is now derived from its own transcript
-	// whether the instance is Paused or Running (app.go's feedTickMsg
-	// handler computes it for every tracked instance, not just the active
-	// ones - see that file's comment); when it genuinely cannot be derived
-	// (no transcript resolves at all) this shows nothing rather than the
-	// "n/a" upstream fell back to, per the brief's OWN ROW fix. The column
-	// is still reserved at a fixed width either way, so every row's gauge
-	// and diff badge line up regardless of whether this particular row has
-	// a fill to show.
-	const gaugeColWidth = len("ctx 100%")
-	gaugeText := ""
-	if fillPct, ok := i.GetContextFill(); ok {
-		gaugeText = fmt.Sprintf("ctx %d%%", fillPct)
-	}
-	gauge := runewidth.FillRight(gaugeText, gaugeColWidth)
-	gaugeWidth := gaugeColWidth + 2 // surrounding separator spaces
-	remainingWidth -= gaugeWidth
-
 	branch := i.Branch
 	if i.Started() && hasMultipleRepos {
 		repoName, err := i.RepoName()
@@ -363,14 +473,14 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, h
 	// worktree and so no branch to show. Upstream's "<icon>-<branch>"
 	// segment rendered unconditionally, so a branchless row showed a bare
 	// Cherokee glyph and hyphen with nothing after it (the OWN ROW defect's
-	// garbled second line) - blank space of the same width keeps the
-	// gauge/diff columns lined up with every other row instead.
+	// garbled second line) - blank space of the same width keeps the diff
+	// badge lined up with every other row instead.
 	branchSegment := fmt.Sprintf("%s-%s", branchIcon, branch)
 	if !i.HasWorktree() {
 		branchSegment = strings.Repeat(" ", runewidth.StringWidth(branchSegment))
 	}
 
-	branchLine := fmt.Sprintf("%s %s%s %s %s", strings.Repeat(" ", len(prefix)), branchSegment, spaces, gauge, diff)
+	branchLine := fmt.Sprintf("%s %s%s %s", strings.Repeat(" ", len(prefix)), branchSegment, spaces, diff)
 
 	// join title and subtitle
 	text := lipgloss.JoinVertical(
@@ -425,10 +535,13 @@ func (l *List) String() string {
 		b.WriteString("\n")
 	}
 
-	// Render the list.
+	// Render the list. showWord is item 1's "below 100 columns drop the
+	// word, keep the glyph" - one decision per render pass, shared by every
+	// tracked and external row alike (item 4's "one table").
+	showWord := !l.collapsed
 	for i, item := range l.items {
 		selected := !l.selExternal && i == l.selectedIdx
-		b.WriteString(l.renderer.Render(item, i+1, selected, len(l.repos) > 1))
+		b.WriteString(l.renderer.Render(item, i+1, selected, len(l.repos) > 1, showWord))
 		if i != len(l.items)-1 {
 			b.WriteString("\n\n")
 		}
@@ -449,18 +562,20 @@ func (l *List) String() string {
 			if l.selExternal && i == l.selectedIdx {
 				style = externalRowSelectedStyle
 			}
-			fillLabel := "n/a"
-			if lane.FillOK {
-				fillLabel = fmt.Sprintf("%d%%", lane.Fill.Pct)
-			}
-			// Pad (or truncate) the name to a fixed column first, so ctx and
-			// last write line up across every row regardless of how long an
-			// individual lane name is - then truncate the WHOLE row to the
-			// list's inner width, since a name near the column width plus
-			// the fixed suffix can still run past a narrow terminal.
-			nameCol := l.externalNameColWidth()
+			// Pad (or truncate) the name to a fixed column first, so every
+			// row's suffix lines up regardless of how long an individual
+			// lane name is - then truncate the WHOLE row to the list's
+			// inner width, since a name near the column width plus the
+			// fixed suffix can still run past a narrow terminal.
+			nameCol := l.laneNameColWidth(showWord)
 			name := runewidth.FillRight(ansiTruncateRow(lane.Name, nameCol), nameCol)
-			line := fmt.Sprintf("%s ctx %-5s last write %s", name, fillLabel, lane.LastWrite.Format("15:04:05"))
+			suffix := laneRowSuffix(style.GetBackground(), style.GetForeground(),
+				lane.Fill.Pct, lane.FillOK, lane.State, lane.LastTurn, lane.StateOK, showWord)
+			// style carries its own left/right Padding, added once by
+			// wrapping the WHOLE truncated line in it here (not the name
+			// alone) - see the matching comment on the tracked-row title
+			// line above; the same over-truncation bug applied here first.
+			line := name + suffix
 			b.WriteString(style.Render(ansiTruncateRow(line, innerWidth)))
 			b.WriteString("\n")
 		}

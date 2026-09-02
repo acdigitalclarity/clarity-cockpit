@@ -128,6 +128,14 @@ type home struct {
 	// nil once handed off (any key press, or 2s after the entrance
 	// completes), and nil from construction entirely when noSplash is set.
 	splashModel *splash.Model
+
+	// laneTailCache memoizes clarity.ReadLaneTail per transcript path (see
+	// session/clarity/tail_cache.go) - feedTickMsg's handler below reads
+	// through it for every tracked instance and external lane, so a
+	// transcript unchanged since the last tick is not reparsed. Lazily
+	// initialized on first use rather than in newHome, so a *home built
+	// directly in a test (skipping newHome) still works.
+	laneTailCache *clarity.LaneTailCache
 }
 
 func newHome(ctx context.Context, program string, autoYes bool, noSplash bool) *home {
@@ -207,13 +215,18 @@ func (m *home) updateHandleWindowSizeEvent(msg tea.WindowSizeMsg) {
 	// width fell out of the split - fixed in ui/list.go - so this ratio
 	// change is cosmetic breathing room for the list column, not the fix.)
 	var listWidth, tabsWidth int
-	if msg.Width < collapsePreviewBelowWidth {
+	collapsed := msg.Width < collapsePreviewBelowWidth
+	if collapsed {
 		listWidth = msg.Width
 		tabsWidth = 0
 	} else {
 		listWidth = int(float32(msg.Width) * 0.4)
 		tabsWidth = msg.Width - listWidth
 	}
+	// Item 1's "below 100 columns drop the word, keep the glyph" - the
+	// list's own row renderer cannot see msg.Width (only its share of it),
+	// so the collapsed/not-collapsed decision is threaded down explicitly.
+	m.list.SetCollapsed(collapsed)
 
 	// Menu takes 10% of height, list and window take 90%.
 	//
@@ -361,6 +374,11 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tickUpdateMetadataCmd(m.snapshotActiveInstances(), m.list.GetSelectedInstance())
 	case feedTickMsg:
+		if m.laneTailCache == nil {
+			m.laneTailCache = clarity.NewLaneTailCache()
+		}
+		now := time.Now()
+
 		// Exactly one read of the fleet's ranked queue file per tick - see
 		// clarity.NeedsYou's doc comment. This self-reschedules the same way
 		// previewTickMsg/tickUpdateMetadataCmd do above: message-driven,
@@ -370,16 +388,44 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Refresh the external-lane rows on this same tick - exactly one
 		// glob per tick (clarity.DiscoverExternalLanes), same cadence as
 		// the feed above, never a tick of its own (the brief's requirement).
-		tracked := make(map[string]bool, m.list.NumInstances()*2)
+		// Excluded by working-directory path (DEDUPE defect's root-cause
+		// fix), never by a name derived from either side's own transcript
+		// directory encoding.
+		trackedPaths := make([]string, 0, m.list.NumInstances())
 		for _, inst := range m.list.GetInstances() {
-			for _, n := range clarity.TrackedExclusionNames(inst.Title) {
-				tracked[n] = true
-			}
+			trackedPaths = append(trackedPaths, inst.Path)
 		}
-		if external, err := clarity.DiscoverExternalLanes(tracked); err != nil {
+		if external, err := clarity.DiscoverExternalLanes(clarity.TrackedExclusionPaths(trackedPaths)); err != nil {
 			log.WarningLog.Printf("discover external lanes failed: %v", err)
 		} else {
+			// The state word every lane row now carries (item 1): read
+			// through the shared cache keyed by each lane's own transcript
+			// path, so an external lane whose file has not changed since
+			// the last tick is not reparsed.
+			for i := range external {
+				if tail, err := m.laneTailCache.Get(external[i].TranscriptPath, now); err == nil {
+					external[i].State = tail.State
+					external[i].LastTurn = tail.LastTurn
+					external[i].StateOK = true
+				}
+			}
 			m.list.SetExternal(external)
+		}
+
+		// Same state derivation for every TRACKED instance, running or
+		// paused - a lane's transcript is exactly as file-only-derivable
+		// either way (see the context-fill comment just below, which
+		// applies for the identical reason).
+		for _, inst := range m.list.GetInstances() {
+			path, ok := clarity.NewestTranscript(inst.Path)
+			if !ok {
+				continue
+			}
+			tail, err := m.laneTailCache.Get(path, now)
+			if err != nil {
+				continue
+			}
+			inst.SetLaneState(tail.State, tail.LastTurn, true)
 		}
 
 		// Context-fill for Paused tracked instances (the OWN ROW defect's
@@ -1354,8 +1400,17 @@ func (m *home) View() tea.View {
 		footer = m.statusBox.String()
 	}
 
+	// lipgloss.Left, not Center: listAndPreview (TabbedWindow renders a few
+	// columns narrower than the width it is given, see tabbed_window.go)
+	// comes out narrower than menu.String()'s own full-width row, and
+	// JoinVertical pads every block up to the widest one using this
+	// alignment - Center split that shortfall either side of listAndPreview,
+	// pushing the list's own one-space-margined " Instances " title right
+	// by half of it (the MARGIN defect: column 5-6 at 164 wide instead of
+	// column 1). Left leaves the shortfall entirely on the right, where
+	// nothing is drawn anyway.
 	mainView := lipgloss.JoinVertical(
-		lipgloss.Center,
+		lipgloss.Left,
 		listAndPreview,
 		m.menu.String(),
 		footer,

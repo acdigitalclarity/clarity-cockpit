@@ -269,14 +269,12 @@ var (
 			if err != nil {
 				return fmt.Errorf("failed to load instances: %w", err)
 			}
-			tracked := make(map[string]bool, len(instances)*2)
+			trackedPaths := make([]string, 0, len(instances))
 			for _, inst := range instances {
-				for _, n := range clarity.TrackedExclusionNames(inst.Title) {
-					tracked[n] = true
-				}
+				trackedPaths = append(trackedPaths, inst.Path)
 			}
 
-			external, err := clarity.DiscoverExternalLanes(tracked)
+			external, err := clarity.DiscoverExternalLanes(clarity.TrackedExclusionPaths(trackedPaths))
 			if err != nil {
 				return fmt.Errorf("failed to discover external lanes: %w", err)
 			}

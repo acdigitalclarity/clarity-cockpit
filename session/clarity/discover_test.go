@@ -85,15 +85,61 @@ func TestDiscoverExternalLanes_ExcludesSubagentsLane(t *testing.T) {
 	require.Empty(t, lanes, "a lane whose derived name starts with subagents must be excluded")
 }
 
-func TestDiscoverExternalLanes_ExcludesTrackedTitles(t *testing.T) {
+// mkTranscriptDirWithCwd is mkTranscriptDir plus a leading record carrying
+// a "cwd" field - the ground truth a real Claude Code transcript records on
+// its user/assistant/system/attachment lines (confirmed against a live
+// transcript before this file was written: every one of those record types
+// carries the session's actual working directory, appearing within the
+// first ~50 lines in practice). DiscoverExternalLanes reads this field to
+// decide whether a lane is already tracked, rather than re-deriving a name
+// from the transcript directory's own (unreliable) encoding.
+func mkTranscriptDirWithCwd(t *testing.T, root, encodedDir, filename string, age time.Duration, cwd string) string {
+	t.Helper()
+	dir := filepath.Join(root, encodedDir)
+	require.NoError(t, os.MkdirAll(dir, 0755))
+	path := filepath.Join(dir, filename)
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	writeTranscriptLine(t, f, `{"type":"user","cwd":"`+cwd+`"}`)
+	writeTranscriptLine(t, f, fableUsageLine("claude-sonnet-5", 10_000, 0, 0))
+	require.NoError(t, f.Close())
+	mt := time.Now().Add(-age)
+	require.NoError(t, os.Chtimes(path, mt, mt))
+	return path
+}
+
+func TestDiscoverExternalLanes_ExcludesTrackedPath(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv(ClaudeProjectsRootEnvVar, root)
 
-	mkTranscriptDir(t, root, "-Users-allencoates-projects-Clarity-sessions-tracked-lane", "a.jsonl", time.Minute)
+	lanePath := "/Users/allencoates/projects/Clarity/sessions/tracked-lane"
+	mkTranscriptDirWithCwd(t, root, "-Users-allencoates-projects-Clarity-sessions-tracked-lane", "a.jsonl", time.Minute, lanePath)
 
-	lanes, err := DiscoverExternalLanes(map[string]bool{"sessions-tracked-lane": true})
+	lanes, err := DiscoverExternalLanes(TrackedExclusionPaths([]string{lanePath}))
 	require.NoError(t, err)
 	require.Empty(t, lanes, "a lane Claude Squad already tracks must never also show as an external row")
+}
+
+// TestDiscoverExternalLanes_ExcludesTrackedPathDespiteDotHyphenEncoding
+// reproduces the real defect seen at the fit gate: tracked instance
+// "2. andy.e-bid" (title carries a dot) also showed as external row
+// "sessions-andy-e-bid" (its ~/.claude/projects transcript directory
+// encodes the dot as a hyphen - a Claude Code encoding detail this
+// package's own EncodeProjectDir does not reproduce, see gauge.go).
+// Matching on the transcript's own "cwd" field - the lane's real working
+// directory, unaffected by any directory-name encoding - excludes it
+// regardless of that mismatch, where the old name-derived match did not.
+func TestDiscoverExternalLanes_ExcludesTrackedPathDespiteDotHyphenEncoding(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(ClaudeProjectsRootEnvVar, root)
+
+	lanePath := "/Users/allencoates/projects/Clarity/sessions/andy.e-bid"
+	encodedDir := "-Users-allencoates-projects-Clarity-sessions-andy-e-bid"
+	mkTranscriptDirWithCwd(t, root, encodedDir, "a.jsonl", time.Minute, lanePath)
+
+	lanes, err := DiscoverExternalLanes(TrackedExclusionPaths([]string{lanePath}))
+	require.NoError(t, err)
+	require.Empty(t, lanes, "a tracked lane must never also show as an external row, even when its transcript directory's own encoding of the lane name differs from the lane's title")
 }
 
 func TestDiscoverExternalLanes_DedupesToNewestTranscriptPerLane(t *testing.T) {
@@ -134,28 +180,25 @@ func TestDiscoverExternalLanes_NoMatches(t *testing.T) {
 	require.Empty(t, lanes)
 }
 
-func TestTrackedExclusionNames_CoversBothForms(t *testing.T) {
-	names := TrackedExclusionNames("ways-of-working")
-	require.Contains(t, names, "ways-of-working")
-	require.Contains(t, names, "sessions-ways-of-working")
+func TestTrackedExclusionPaths_CleansAndSkipsEmpty(t *testing.T) {
+	paths := TrackedExclusionPaths([]string{"/a/b/", "", "/a/b"})
+	require.Len(t, paths, 1, "a trailing-slash path and its clean form must collapse to one entry, and an empty path must be skipped")
+	require.True(t, paths["/a/b"])
 }
 
-func TestDiscoverExternalLanes_ExcludesTrackedTitleViaSessionsPrefix(t *testing.T) {
+func TestDiscoverExternalLanes_ExcludesTrackedPathViaSessionsFolder(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv(ClaudeProjectsRootEnvVar, root)
 
 	// A real clarity-attach instance titled "ways-of-working" has its
-	// transcripts under sessions/ways-of-working, which discover derives as
-	// "sessions-ways-of-working" - not the bare title. TrackedExclusionNames
-	// is what makes the exclusion actually reach this row.
-	mkTranscriptDir(t, root, "-Users-allencoates-projects-Clarity-sessions-ways-of-working", "a.jsonl", time.Minute)
+	// transcripts under sessions/ways-of-working - TrackedExclusionPaths
+	// reaches this row by the lane's own working directory, read from the
+	// transcript's "cwd" field, not by re-deriving a name from the
+	// transcript directory's encoding.
+	lanePath := "/Users/allencoates/projects/Clarity/sessions/ways-of-working"
+	mkTranscriptDirWithCwd(t, root, "-Users-allencoates-projects-Clarity-sessions-ways-of-working", "a.jsonl", time.Minute, lanePath)
 
-	exclude := make(map[string]bool)
-	for _, n := range TrackedExclusionNames("ways-of-working") {
-		exclude[n] = true
-	}
-
-	lanes, err := DiscoverExternalLanes(exclude)
+	lanes, err := DiscoverExternalLanes(TrackedExclusionPaths([]string{lanePath}))
 	require.NoError(t, err)
 	require.Empty(t, lanes, "a tracked session lane must not double-list as an external row")
 }

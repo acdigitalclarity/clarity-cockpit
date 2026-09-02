@@ -70,6 +70,15 @@ type Instance struct {
 	contextFillPct int
 	contextFillOK  bool
 
+	// laneState/laneLastTurn/laneStateOK cache this instance's clarity-
+	// derived conversational state (see session/clarity/tail.go's
+	// ClassifyState: working/waiting on you/idle/stalled) and the last
+	// timestamped record's time. Set only from the main event loop's feed
+	// tick, same contract as contextFillPct/SetContextFill above.
+	laneState    string
+	laneLastTurn time.Time
+	laneStateOK  bool
+
 	// selectedBranch is the existing branch to start on (empty = new branch from HEAD)
 	selectedBranch string
 
@@ -706,6 +715,21 @@ func (i *Instance) SetContextFill(pct int, ok bool) {
 // GetContextFill returns the cached context-fill gauge.
 func (i *Instance) GetContextFill() (pct int, ok bool) {
 	return i.contextFillPct, i.contextFillOK
+}
+
+// SetLaneState caches the instance's clarity-derived conversational state
+// and last-turn time. Should be called from the main event loop only, same
+// contract as SetContextFill.
+func (i *Instance) SetLaneState(state string, lastTurn time.Time, ok bool) {
+	i.laneState = state
+	i.laneLastTurn = lastTurn
+	i.laneStateOK = ok
+}
+
+// GetLaneState returns the cached clarity-derived state. ok is false before
+// the first feed tick has computed it for this instance.
+func (i *Instance) GetLaneState() (state string, lastTurn time.Time, ok bool) {
+	return i.laneState, i.laneLastTurn, i.laneStateOK
 }
 
 // SendPrompt sends a prompt to the tmux session
