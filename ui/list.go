@@ -57,6 +57,15 @@ var needsYouLineStyle = lipgloss.NewStyle().
 	Padding(0, 0, 0, 1).
 	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#5a5a5a"), Dark: lipgloss.Color("#aaaaaa")})
 
+// needsYouLineSelectedStyle is the current Needs-you row's own highlight -
+// the same background externalRowSelectedStyle already uses, so the one
+// cursor reads as one style regardless of which of the three groups it is
+// currently in (the brief's "the current highlight style").
+var needsYouLineSelectedStyle = lipgloss.NewStyle().
+	Padding(0, 0, 0, 1).
+	Background(lipgloss.Color("#dde4f0")).
+	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#1a1a1a"), Dark: lipgloss.Color("#1a1a1a")})
+
 var externalTitleStyle = lipgloss.NewStyle().
 	Bold(true).
 	Padding(1, 1, 0, 1).
@@ -233,10 +242,16 @@ type List struct {
 	// multiple repos in play.
 	repos map[string]int
 
-	// needsYou holds the "Needs you" feed lines, refreshed once per feed
-	// tick by the caller (see app.go's feedTickMsg handling) - this struct
-	// never reads the queue file itself, it only renders what it is handed.
-	needsYou []string
+	// needsYou holds the ranked "Needs you" feed rows, refreshed once per
+	// feed tick by the caller (see app.go's feedTickMsg handling) - this
+	// struct never reads the queue file itself, it only renders and
+	// selects what it is handed. Selectable (slice 5): the cursor visits
+	// these rows first, then items, then external (Down/Up below).
+	needsYou []clarity.FeedItem
+	// needsYouStatus carries the queue's own absent/parse-error/empty text
+	// (clarity.RankedNeedsYou's second return) when there are no selectable
+	// rows to show instead - never a silently empty section.
+	needsYouStatus string
 
 	// external holds the fleet's live lanes that are NOT tracked Claude
 	// Squad instances (see clarity.DiscoverExternalLanes), refreshed on the
@@ -245,9 +260,12 @@ type List struct {
 	external []clarity.ExternalLane
 
 	// selExternal is true when the current selection points into external
-	// rather than items - the two lists share one selection cursor that
-	// wraps from the bottom of items into the top of external and back.
+	// rather than items; selNeedsYou is true when it points into needsYou
+	// instead. At most one of the two is ever true - three groups sharing
+	// one cursor (needsYou, then items, then external - RowKind's own
+	// order), wrapping at either end (Down/Up below).
 	selExternal bool
+	selNeedsYou bool
 
 	// collapsed mirrors app.go's own collapsePreviewBelowWidth decision
 	// (the terminal itself, not just this list's own column share, is
@@ -266,10 +284,23 @@ func (l *List) SetCollapsed(collapsed bool) {
 	l.collapsed = collapsed
 }
 
-// SetNeedsYou replaces the "Needs you" feed lines shown above the instance
-// list.
-func (l *List) SetNeedsYou(lines []string) {
-	l.needsYou = lines
+// SetNeedsYou replaces the "Needs you" feed rows shown above the instance
+// list (items) and their status line (status - shown instead of any rows
+// when the queue is absent, unparseable or empty; "" when it read cleanly).
+// Mirrors SetExternal's own clamp: if the current selection was pointing
+// into needsYou and the new slice is shorter (or empty), the selection is
+// clamped so it never points past the end.
+func (l *List) SetNeedsYou(items []clarity.FeedItem, status string) {
+	l.needsYou = items
+	l.needsYouStatus = status
+	if l.selNeedsYou {
+		if len(l.needsYou) == 0 {
+			l.selNeedsYou = false
+			l.selectedIdx = 0
+		} else if l.selectedIdx >= len(l.needsYou) {
+			l.selectedIdx = len(l.needsYou) - 1
+		}
+	}
 }
 
 // SetExternal replaces the external-lane rows shown below the tracked
@@ -622,13 +653,22 @@ func (l *List) String() string {
 	// a bare empty section when the queue is absent, per the brief. Every
 	// row is truncated to the list's own inner width first (the OVERFLOW
 	// defect: a feed row can run to 100+ characters, and nothing downstream
-	// clips it back down).
+	// clips it back down). Rows are selectable (slice 5): the current one
+	// carries the same highlight style external rows already use.
 	innerWidth := l.rowInnerWidth()
-	if len(l.needsYou) > 0 {
+	if len(l.needsYou) > 0 || l.needsYouStatus != "" {
 		b.WriteString(needsYouTitleStyle.Render(" Needs you "))
 		b.WriteString("\n")
-		for _, line := range l.needsYou {
-			b.WriteString(needsYouLineStyle.Render(ansiTruncateRow(line, innerWidth)))
+		if l.needsYouStatus != "" {
+			b.WriteString(needsYouLineStyle.Render(ansiTruncateRow(l.needsYouStatus, innerWidth)))
+			b.WriteString("\n")
+		}
+		for i, item := range l.needsYou {
+			style := needsYouLineStyle
+			if l.selNeedsYou && i == l.selectedIdx {
+				style = needsYouLineSelectedStyle
+			}
+			b.WriteString(style.Render(ansiTruncateRow(clarity.FeedLine(item), innerWidth)))
 			b.WriteString("\n")
 		}
 		b.WriteString("\n")
@@ -639,7 +679,7 @@ func (l *List) String() string {
 	// tracked and external row alike (item 4's "one table").
 	showWord := !l.collapsed
 	for i, item := range l.items {
-		selected := !l.selExternal && i == l.selectedIdx
+		selected := !l.selExternal && !l.selNeedsYou && i == l.selectedIdx
 		b.WriteString(l.renderer.Render(item, i+1, selected, len(l.repos) > 1, showWord))
 		if i != len(l.items)-1 {
 			b.WriteString("\n\n")
@@ -705,39 +745,86 @@ func (l *List) String() string {
 	return lipgloss.Place(l.width, l.height, lipgloss.Left, lipgloss.Top, content)
 }
 
-// Down selects the next item in the list, crossing from the tracked
-// instances into the external rows (and wrapping back to the top of items)
-// when external rows are present.
+// RowKind identifies which of the three selectable groups the cursor
+// currently sits in - the brief's own cursor order: Needs-you rows, then
+// tracked instances, then external lanes.
+type RowKind int
+
+const (
+	RowKindNeedsYou RowKind = iota
+	RowKindTracked
+	RowKindExternal
+)
+
+// groupLens returns the three groups' lengths in cursor order
+// (RowKindNeedsYou, RowKindTracked, RowKindExternal) - the single source
+// both Down/Up and currentGroup/setGroup below cycle over, so a group that
+// is empty is transparently skipped without three copies of the same
+// "is this group present" logic.
+func (l *List) groupLens() [3]int {
+	return [3]int{len(l.needsYou), len(l.items), len(l.external)}
+}
+
+// currentGroup reports which group index (0/1/2, matching groupLens' own
+// order) the cursor is currently in.
+func (l *List) currentGroup() int {
+	if l.selNeedsYou {
+		return 0
+	}
+	if l.selExternal {
+		return 2
+	}
+	return 1
+}
+
+// setGroup moves the cursor to group g at idx, updating the two booleans
+// that jointly encode it.
+func (l *List) setGroup(g, idx int) {
+	l.selNeedsYou = g == 0
+	l.selExternal = g == 2
+	l.selectedIdx = idx
+}
+
+// SelectedRowKind reports which group the cursor is currently in.
+func (l *List) SelectedRowKind() RowKind {
+	switch l.currentGroup() {
+	case 0:
+		return RowKindNeedsYou
+	case 2:
+		return RowKindExternal
+	default:
+		return RowKindTracked
+	}
+}
+
+// Down selects the next row, cycling needsYou -> items -> external and
+// wrapping back to whichever group is first non-empty - an empty group is
+// skipped entirely, so this reduces to the pre-slice-5 two-group behaviour
+// (items <-> external) whenever needsYou is empty.
 func (l *List) Down() {
-	if len(l.items) == 0 && len(l.external) == 0 {
+	lens := l.groupLens()
+	if lens[0]+lens[1]+lens[2] == 0 {
 		return
 	}
-	if !l.selExternal {
-		if l.selectedIdx < len(l.items)-1 {
-			l.selectedIdx++
-			return
-		}
-		if len(l.external) > 0 {
-			l.selExternal = true
-			l.selectedIdx = 0
-			return
-		}
-		l.selectedIdx = 0
-		return
-	}
-	// Currently on an external row.
-	if l.selectedIdx < len(l.external)-1 {
+	g := l.currentGroup()
+	if l.selectedIdx < lens[g]-1 {
 		l.selectedIdx++
 		return
 	}
-	l.selExternal = false
-	l.selectedIdx = 0
+	for step := 1; step <= 3; step++ {
+		next := (g + step) % 3
+		if lens[next] > 0 {
+			l.setGroup(next, 0)
+			return
+		}
+	}
 }
 
 // Kill selects the next item in the list. A no-op when the selection is on
-// an external row - there is no tracked instance behind it to kill.
+// an external or Needs-you row - there is no tracked instance behind either
+// to kill.
 func (l *List) Kill() {
-	if l.selExternal || len(l.items) == 0 {
+	if l.selExternal || l.selNeedsYou || len(l.items) == 0 {
 		return
 	}
 	targetInstance := l.items[l.selectedIdx]
@@ -765,47 +852,37 @@ func (l *List) Kill() {
 }
 
 // Attach attaches to the selected tracked instance. Returns an error
-// without attaching anything when the selection is on an external row -
-// there is no tracked tmux session behind it to attach to.
+// without attaching anything when the selection is on an external or
+// Needs-you row - there is no tracked tmux session behind either to attach
+// to.
 func (l *List) Attach() (chan struct{}, error) {
-	if l.selExternal || len(l.items) == 0 || l.selectedIdx >= len(l.items) {
+	if l.selExternal || l.selNeedsYou || len(l.items) == 0 || l.selectedIdx >= len(l.items) {
 		return nil, errors.New("cannot attach: no tracked instance is selected")
 	}
 	targetInstance := l.items[l.selectedIdx]
 	return targetInstance.Attach()
 }
 
-// Up selects the previous item in the list, crossing from the external rows
-// into the tracked instances (and wrapping back to the bottom of external)
-// when external rows are present.
+// Up selects the previous row, cycling the same three groups Down does in
+// reverse (external -> items -> needsYou, wrapping), an empty group again
+// skipped entirely.
 func (l *List) Up() {
-	if len(l.items) == 0 && len(l.external) == 0 {
+	lens := l.groupLens()
+	if lens[0]+lens[1]+lens[2] == 0 {
 		return
 	}
-	if l.selExternal {
-		if l.selectedIdx > 0 {
-			l.selectedIdx--
-			return
-		}
-		if len(l.items) > 0 {
-			l.selExternal = false
-			l.selectedIdx = len(l.items) - 1
-			return
-		}
-		l.selectedIdx = len(l.external) - 1
-		return
-	}
-	// Currently on a tracked instance.
+	g := l.currentGroup()
 	if l.selectedIdx > 0 {
 		l.selectedIdx--
 		return
 	}
-	if len(l.external) > 0 {
-		l.selExternal = true
-		l.selectedIdx = len(l.external) - 1
-		return
+	for step := 1; step <= 3; step++ {
+		prev := ((g-step)%3 + 3) % 3
+		if lens[prev] > 0 {
+			l.setGroup(prev, lens[prev]-1)
+			return
+		}
 	}
-	l.selectedIdx = len(l.items) - 1
 }
 
 func (l *List) addRepo(repo string) {
@@ -844,22 +921,22 @@ func (l *List) AddInstance(instance *session.Instance) (finalize func()) {
 }
 
 // GetSelectedInstance returns the currently selected tracked instance, or
-// nil when the selection is on an external row (or the list is empty) - an
-// external row cannot be attached, killed, or otherwise treated as a
+// nil when the selection is on an external or Needs-you row (or the list is
+// empty) - neither can be attached, killed, or otherwise treated as a
 // tracked instance, so every caller that already nil-checks this (kill,
 // attach, checkout, push, resume, move) gets that guard for free.
 func (l *List) GetSelectedInstance() *session.Instance {
-	if l.selExternal || len(l.items) == 0 || l.selectedIdx >= len(l.items) {
+	if l.selExternal || l.selNeedsYou || len(l.items) == 0 || l.selectedIdx >= len(l.items) {
 		return nil
 	}
 	return l.items[l.selectedIdx]
 }
 
 // GetSelectedExternalLane returns the currently selected external lane, or
-// ok=false when the selection is on a tracked instance (or nothing is
-// selected) - the external-row counterpart to GetSelectedInstance, used by
-// the Session tab (design/cockpit-pane/DECISIONS.md slice 3) to build its
-// SessionInfo for whichever kind of row is selected.
+// ok=false when the selection is on a tracked or Needs-you row (or nothing
+// is selected) - the external-row counterpart to GetSelectedInstance, used
+// by the Session tab (design/cockpit-pane/DECISIONS.md slice 3) to build
+// its SessionInfo for whichever kind of row is selected.
 func (l *List) GetSelectedExternalLane() (clarity.ExternalLane, bool) {
 	if !l.selExternal || l.selectedIdx < 0 || l.selectedIdx >= len(l.external) {
 		return clarity.ExternalLane{}, false
@@ -867,13 +944,30 @@ func (l *List) GetSelectedExternalLane() (clarity.ExternalLane, bool) {
 	return l.external[l.selectedIdx], true
 }
 
+// GetSelectedNeedsYou returns the currently selected Needs-you row, or
+// ok=false when the selection is on a tracked or external row (or nothing
+// is selected) - the Needs-you counterpart to GetSelectedExternalLane, used
+// by the Needs-you tab (slice 5) to build its own render and by the
+// composer to resolve "the row's raising lane" as its send target.
+func (l *List) GetSelectedNeedsYou() (clarity.FeedItem, bool) {
+	if !l.selNeedsYou || l.selectedIdx < 0 || l.selectedIdx >= len(l.needsYou) {
+		return clarity.FeedItem{}, false
+	}
+	return l.needsYou[l.selectedIdx], true
+}
+
 // SelectedMsgTarget returns the lane name of the current selection,
 // whichever list it is in, plus whether it is an external row - both
 // tracked instances and external rows are messageable (the brief's
 // requirement), only tracked instances are attachable/killable. ok is
-// false when nothing is selected (both lists empty, or the index is out of
-// range for its list).
+// false when nothing is selected (both lists empty, the index is out of
+// range for its list, or the selection is on a Needs-you row - that row's
+// own raising lane is resolved separately, via GetSelectedNeedsYou, since
+// it may name a lane this list does not track at all).
 func (l *List) SelectedMsgTarget() (lane string, isExternal bool, ok bool) {
+	if l.selNeedsYou {
+		return "", false, false
+	}
 	if l.selExternal {
 		if l.selectedIdx < 0 || l.selectedIdx >= len(l.external) {
 			return "", false, false
@@ -886,11 +980,16 @@ func (l *List) SelectedMsgTarget() (lane string, isExternal bool, ok bool) {
 	return l.items[l.selectedIdx].Title, false, true
 }
 
-// SetSelectedInstance sets the selected index. Noop if the index is out of bounds.
+// SetSelectedInstance sets the selected index into the tracked-instance
+// group, clearing any external/Needs-you selection - a caller of this
+// always means "select a tracked instance". Noop if the index is out of
+// bounds.
 func (l *List) SetSelectedInstance(idx int) {
 	if idx >= len(l.items) {
 		return
 	}
+	l.selExternal = false
+	l.selNeedsYou = false
 	l.selectedIdx = idx
 }
 

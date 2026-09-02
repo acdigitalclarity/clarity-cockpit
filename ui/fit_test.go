@@ -22,7 +22,7 @@ import (
 func TestString_NeedsYouRow_TruncatesToListWidth(t *testing.T) {
 	l := newTestList("a")
 	l.SetSize(80, 40)
-	l.SetNeedsYou([]string{strings.Repeat("x", 200)})
+	l.SetNeedsYou([]clarity.FeedItem{{Lane: "lane-a", Title: strings.Repeat("x", 200)}}, "")
 
 	out := l.String()
 	for i, line := range strings.Split(out, "\n") {
@@ -134,7 +134,10 @@ func TestRender_UndeterminedContextFill_ShowsNothingNotNA(t *testing.T) {
 func TestString_NeverExceedsListHeight(t *testing.T) {
 	l := newTestList("a", "b")
 	l.SetSize(80, 21) // app.go's own contentHeight at a 24-row terminal
-	l.SetNeedsYou([]string{"one", "two", "three", "four", "five"})
+	l.SetNeedsYou([]clarity.FeedItem{
+		{Lane: "lane-a", Title: "one"}, {Lane: "lane-b", Title: "two"}, {Lane: "lane-c", Title: "three"},
+		{Lane: "lane-d", Title: "four"}, {Lane: "lane-e", Title: "five"},
+	}, "")
 	lanes := make([]clarity.ExternalLane, 6)
 	for i := range lanes {
 		lanes[i] = clarity.ExternalLane{Name: fmt.Sprintf("sessions-lane-%d", i), LastWrite: time.Now()}
@@ -255,7 +258,7 @@ func TestString_LaneRows_DropWordWhenCollapsed(t *testing.T) {
 func TestSessionPane_FitsAt120x36And164x45And200x55(t *testing.T) {
 	for _, sz := range []struct{ w, h int }{{120, 36}, {164, 45}, {200, 55}} {
 		t.Run(fmt.Sprintf("%dx%d", sz.w, sz.h), func(t *testing.T) {
-			w := NewTabbedWindow(NewSessionPane(), NewDiffPane(), NewTerminalPane())
+			w := NewTabbedWindow(NewSessionPane(), NewNeedsYouPane(), NewTerminalPane())
 			w.SetSize(sz.w, int(float32(sz.h)*0.9))
 			contentWidth, contentHeight := w.GetContentSize()
 			require.Greater(t, contentWidth, 0)

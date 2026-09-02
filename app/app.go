@@ -1,6 +1,7 @@
 package app
 
 import (
+	"claude-squad/cmd"
 	"claude-squad/config"
 	"claude-squad/keys"
 	"claude-squad/log"
@@ -111,14 +112,35 @@ type home struct {
 	statusText string
 	// global spinner instance. we plumb this down to where it's needed
 	spinner spinner.Model
-	// textInputOverlay handles text input with state
+	// textInputOverlay handles text input with state - the "new instance"/
+	// "enter prompt" flows only; the m-key composer (stateMsg) is the
+	// inline Composer below, not this overlay (design/cockpit-pane/
+	// DECISIONS.md slice 5 - the old full-screen overlay drove m before
+	// this slice wired the mock-up's own inline box instead).
 	textInputOverlay *overlay.TextInputOverlay
-	// msgTargetLane and msgTargetExternal name the row the m-key prompt
-	// (stateMsg) is currently addressed to - captured when the prompt opens
-	// so the send still goes to the right row even if the list's selection
-	// moves before the overlay closes.
-	msgTargetLane     string
-	msgTargetExternal bool
+	// composer is the shared inline message box (slice 5) both the Session
+	// and Needs-you tabs render at their own foot - one instance, since
+	// only one row can be the current send target at a time.
+	composer *ui.Composer
+	// cmdExec runs the composer's external-lane clipboard copy (pbcopy) -
+	// the same cmd.Executor seam session/tmux already uses for tmux, so
+	// tests can inject a fake without touching the real clipboard.
+	cmdExec cmd.Executor
+	// boardCache fetches and caches a Needs-you row's board issue body
+	// (clarity.BoardCache) - lazily initialized on first use, same pattern
+	// as laneTailCache below.
+	boardCache *clarity.BoardCache
+	// laneTab/needsYouTab remember the user's own last-chosen tab for each
+	// row kind (slice 5's "remember the user's own tab choice per row kind
+	// so tab does not fight the cursor") - laneTab covers both tracked and
+	// external rows (one lane kind), needsYouTab the Needs-you rows.
+	laneTab, needsYouTab int
+	// prevRowKind is the row kind as of the last selection-changed call -
+	// the tab is only force-switched on a KIND TRANSITION (see
+	// syncTabToRowKind), never on every Up/Down within the same kind, so a
+	// manual Tab press away from the default while browsing several
+	// Needs-you rows in a row is not immediately undone by the next Down.
+	prevRowKind ui.RowKind
 	// textOverlay displays text information
 	textOverlay *overlay.TextOverlay
 	// confirmationOverlay displays confirmation modals
@@ -152,11 +174,17 @@ func newHome(ctx context.Context, program string, autoYes bool, noSplash bool) *
 		os.Exit(1)
 	}
 
+	composer := ui.NewComposer()
+	sessionPane := ui.NewSessionPane()
+	sessionPane.SetComposer(composer)
+	needsYouPane := ui.NewNeedsYouPane()
+	needsYouPane.SetComposer(composer)
+
 	h := &home{
 		ctx:          ctx,
 		spinner:      spinner.New(spinner.WithSpinner(spinner.MiniDot)),
 		menu:         ui.NewMenu(),
-		tabbedWindow: ui.NewTabbedWindow(ui.NewSessionPane(), ui.NewDiffPane(), ui.NewTerminalPane()),
+		tabbedWindow: ui.NewTabbedWindow(sessionPane, needsYouPane, ui.NewTerminalPane()),
 		errBox:       ui.NewErrBox(),
 		statusBox:    ui.NewStatusBox(),
 		storage:      storage,
@@ -165,6 +193,11 @@ func newHome(ctx context.Context, program string, autoYes bool, noSplash bool) *
 		autoYes:      autoYes,
 		state:        stateDefault,
 		appState:     appState,
+		composer:     composer,
+		cmdExec:      cmd.MakeExecutor(),
+		laneTab:      ui.SessionTab,
+		needsYouTab:  ui.NeedsYouTab,
+		prevRowKind:  ui.RowKindTracked,
 	}
 	if !noSplash {
 		h.splashModel = splash.New()
@@ -419,10 +452,11 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		now := time.Now()
 
 		// Exactly one read of the fleet's ranked queue file per tick - see
-		// clarity.NeedsYou's doc comment. This self-reschedules the same way
-		// previewTickMsg/tickUpdateMetadataCmd do above: message-driven,
-		// never a blocking polling loop.
-		m.list.SetNeedsYou(clarity.NeedsYou(clarity.DefaultFeedPath(), feedTopN))
+		// clarity.RankedNeedsYou's doc comment. This self-reschedules the
+		// same way previewTickMsg/tickUpdateMetadataCmd do above: message-
+		// driven, never a blocking polling loop.
+		needsYouItems, needsYouStatus := clarity.RankedNeedsYou(clarity.DefaultFeedPath(), feedTopN)
+		m.list.SetNeedsYou(needsYouItems, needsYouStatus)
 
 		// Refresh the external-lane rows on this same tick - exactly one
 		// glob per tick (clarity.DiscoverExternalLanes), same cadence as
@@ -495,10 +529,16 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// LaneTail is only as fresh as this tick anyway.
 		m.updateSessionTabInfo(now)
 
-		return m, func() tea.Msg {
+		// Needs-you tab data (slice 5): re-read on every tick too, so a
+		// board fetch that resolved between ticks (or a re-ranked queue
+		// changing the selected row's own title/class) shows up without
+		// waiting on a key press.
+		needsYouCmd := m.refreshNeedsYouTab()
+
+		return m, tea.Batch(needsYouCmd, func() tea.Msg {
 			time.Sleep(feedRefreshInterval)
 			return feedTickMsg{}
-		}
+		})
 	case tea.MouseWheelMsg:
 		// Handle mouse wheel events for scrolling the diff/preview pane
 		if msg.Button == tea.MouseWheelDown || msg.Button == tea.MouseWheelUp {
@@ -589,11 +629,17 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
-	case msgSentMsg:
+	case composerResultMsg:
+		m.state = stateDefault
+		m.menu.SetState(ui.StateDefault)
 		if msg.err != nil {
+			m.composer.Close()
 			return m, m.handleError(msg.err)
 		}
-		return m, m.setStatus(msg.text)
+		m.composer.SetResult(msg.result)
+		return m, nil
+	case boardFetchedMsg:
+		return m, m.refreshNeedsYouTab()
 	}
 	return m, nil
 }
@@ -822,37 +868,37 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 		return m, nil
 	}
 
-	// Handle the m-key one-line message prompt.
+	// Handle the composer (m key): typing, enter to send, esc/ctrl+c to
+	// close - the mock-up's own inline box (ui.Composer), not the generic
+	// full-screen textInputOverlay the "new instance"/"enter prompt" flows
+	// use.
 	if m.state == stateMsg {
-		if msg.String() == "ctrl+c" {
-			m.textInputOverlay = nil
+		if msg.String() == "ctrl+c" || msg.Code == tea.KeyEsc {
+			m.composer.Close()
 			m.state = stateDefault
-			return m, tea.Sequence(
-				tea.RequestWindowSize,
-				func() tea.Msg {
-					m.menu.SetState(ui.StateDefault)
-					return nil
-				},
-			)
-		}
-
-		shouldClose, _ := m.textInputOverlay.HandleKeyPress(msg)
-		if !shouldClose {
+			m.menu.SetState(ui.StateDefault)
 			return m, nil
 		}
-
-		text := m.textInputOverlay.GetValue()
-		canceled := m.textInputOverlay.IsCanceled()
-		lane, isExternal := m.msgTargetLane, m.msgTargetExternal
-
-		m.textInputOverlay = nil
-		m.state = stateDefault
-		m.menu.SetState(ui.StateDefault)
-
-		if canceled || strings.TrimSpace(text) == "" {
-			return m, tea.RequestWindowSize
+		switch msg.Code {
+		case tea.KeyEnter:
+			text := m.composer.Value()
+			if strings.TrimSpace(text) == "" {
+				m.composer.Close()
+				m.state = stateDefault
+				m.menu.SetState(ui.StateDefault)
+				return m, nil
+			}
+			lane, isExternal := m.composer.Lane(), m.composer.IsExternal()
+			return m, m.sendComposerCmd(lane, isExternal, text)
+		case tea.KeyBackspace:
+			m.composer.Backspace()
+			return m, nil
+		default:
+			if msg.Text != "" {
+				m.composer.Type(msg.Text)
+			}
+			return m, nil
 		}
-		return m, tea.Batch(tea.RequestWindowSize, m.sendMsgCmd(lane, isExternal, text))
 	}
 
 	// Handle confirmation state
@@ -942,10 +988,10 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 		return m, nil
 	case keys.KeyUp:
 		m.list.Up()
-		return m, m.instanceChanged()
+		return m, tea.Batch(m.instanceChanged(), m.selectionChanged())
 	case keys.KeyDown:
 		m.list.Down()
-		return m, m.instanceChanged()
+		return m, tea.Batch(m.instanceChanged(), m.selectionChanged())
 	case keys.KeyShiftUp:
 		m.tabbedWindow.ScrollUp()
 		return m, m.instanceChanged()
@@ -954,6 +1000,7 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 		return m, m.instanceChanged()
 	case keys.KeyTab:
 		m.tabbedWindow.Toggle()
+		m.rememberTabForCurrentRowKind()
 		m.menu.SetActiveTab(m.tabbedWindow.GetActiveTab())
 		return m, m.instanceChanged()
 	case keys.KeyKill:
@@ -1056,19 +1103,13 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 		}
 		return m, nil
 	case keys.KeyMsg:
-		lane, isExternal, ok := m.list.SelectedMsgTarget()
+		lane, isExternal, ok := m.composerTarget()
 		if !ok {
 			return m, nil
 		}
-		m.msgTargetLane = lane
-		m.msgTargetExternal = isExternal
+		m.composer.Open(lane, isExternal)
 		m.state = stateMsg
 		m.menu.SetState(ui.StatePrompt)
-		label := "Message " + lane
-		if isExternal {
-			label += " (external)"
-		}
-		m.textInputOverlay = overlay.NewTextInputOverlay(label, "")
 		return m, nil
 	case keys.KeyResume:
 		selected := m.list.GetSelectedInstance()
@@ -1117,16 +1158,15 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 	}
 }
 
-// instanceChanged updates the diff/terminal panes and the menu based on the
-// selected TRACKED instance (nil for an external row or no selection). The
-// Session tab is deliberately not touched here - its data comes from the
-// feed tick only (see feedTickMsg's own Session-tab block below), on the
-// SELECTED row whichever kind it is, tracked or external.
+// instanceChanged updates the terminal pane and the menu based on the
+// selected TRACKED instance (nil for an external or Needs-you row, or no
+// selection). Neither the Session tab nor the Needs-you tab is touched
+// here - both come from the feed tick only (see feedTickMsg's own blocks
+// below), on the SELECTED row whichever kind it is.
 func (m *home) instanceChanged() tea.Cmd {
 	// selected may be nil
 	selected := m.list.GetSelectedInstance()
 
-	m.tabbedWindow.UpdateDiff(selected)
 	// Update menu with current instance
 	m.menu.SetInstance(selected)
 
@@ -1134,6 +1174,137 @@ func (m *home) instanceChanged() tea.Cmd {
 		return m.handleError(err)
 	}
 	return nil
+}
+
+// composerTarget resolves the CURRENT selection's own send target: the
+// lane name and whether the composer must use the clipboard-copy path (no
+// tracked tmux session to deliver into). A tracked or external row
+// resolves directly via the list's own SelectedMsgTarget; a Needs-you
+// row's raising lane (item.Lane) is looked up against the tracked
+// instances and external lanes the list currently holds instead, since the
+// row names no group at all and may not resolve to either (a board-
+// sourced row's Lane is the issue number itself, "#277" -
+// clarity.BoardIssueNumber's own doc comment, session/clarity/feed.go) -
+// an unresolved lane falls back to isExternal=true (copy), the safe
+// default: never claim a delivery this cockpit cannot confirm.
+func (m *home) composerTarget() (lane string, isExternal bool, ok bool) {
+	if item, isNeedsYou := m.list.GetSelectedNeedsYou(); isNeedsYou {
+		lane = item.Lane
+		for _, inst := range m.list.GetInstances() {
+			if inst.Title == lane {
+				return lane, false, true
+			}
+		}
+		for _, ext := range m.list.GetExternal() {
+			if clarity.MatchesQueriedLane(ext, lane) {
+				return lane, true, true
+			}
+		}
+		return lane, true, true
+	}
+	return m.list.SelectedMsgTarget()
+}
+
+// selectionChanged is the Up/Down keys' own follow-up to list.Up()/Down():
+// the tab-follows-row-kind rule (slice 5) and a fresh Needs-you tab read
+// for whichever row is now selected, so a newly selected Needs-you row's
+// detail (and any board fetch it needs) starts immediately rather than
+// waiting up to feedRefreshInterval for the next tick.
+func (m *home) selectionChanged() tea.Cmd {
+	m.syncTabToRowKind()
+	return m.refreshNeedsYouTab()
+}
+
+// syncTabToRowKind is slice 5's "selecting a Needs-you row changes the
+// right pane's active tab to Needs you; selecting a lane row returns it to
+// Session (remember the user's own tab choice per row kind so tab does not
+// fight the cursor)": the tab is force-switched only on a KIND TRANSITION
+// (tracked/external <-> Needs-you), to whichever tab that kind last held -
+// never on every Up/Down within the same kind, so a manual Tab press away
+// from the default while browsing several rows of one kind in a row is not
+// immediately undone by the next Down.
+func (m *home) syncTabToRowKind() {
+	if m.tabbedWindow == nil {
+		return
+	}
+	kind := m.list.SelectedRowKind()
+	if kind == m.prevRowKind {
+		return
+	}
+	if kind == ui.RowKindNeedsYou {
+		m.tabbedWindow.SetActiveTab(m.needsYouTab)
+	} else {
+		m.tabbedWindow.SetActiveTab(m.laneTab)
+	}
+	m.menu.SetActiveTab(m.tabbedWindow.GetActiveTab())
+	m.prevRowKind = kind
+}
+
+// rememberTabForCurrentRowKind records a manual Tab press (keys.KeyTab)
+// against whichever row kind is currently selected, so syncTabToRowKind
+// restores it the next time the cursor returns to that kind.
+func (m *home) rememberTabForCurrentRowKind() {
+	if m.list.SelectedRowKind() == ui.RowKindNeedsYou {
+		m.needsYouTab = m.tabbedWindow.GetActiveTab()
+	} else {
+		m.laneTab = m.tabbedWindow.GetActiveTab()
+	}
+}
+
+// refreshNeedsYouTab rebuilds the Needs-you tab's data for whichever row is
+// currently selected (nil when it is not a Needs-you row). The board fetch
+// itself never runs on this (the UI) thread: a cache hit (clarity.Board-
+// Cache.Peek) renders immediately, a miss renders one Loading tick and
+// returns a tea.Cmd that fetches in the background and reports back via
+// boardFetchedMsg.
+func (m *home) refreshNeedsYouTab() tea.Cmd {
+	if m.tabbedWindow == nil {
+		return nil
+	}
+	item, ok := m.list.GetSelectedNeedsYou()
+	if !ok {
+		m.tabbedWindow.SetNeedsYouInfo(nil)
+		return nil
+	}
+	info := &ui.NeedsYouInfo{Item: item}
+	n, isBoard := clarity.BoardIssueNumber(item.Source)
+	if !isBoard {
+		// A lane-file-sourced row (fleet_queue_build.py's lane_rows()) names
+		// no board issue at all - there is nothing to fetch a recommendation
+		// from, and the feed item itself carries no body/recommendation
+		// fields either (session/clarity/feed.go's own FeedItem shape).
+		info.Recommendation = "no recommendation on the row"
+		m.tabbedWindow.SetNeedsYouInfo(info)
+		return nil
+	}
+	if m.boardCache == nil {
+		m.boardCache = clarity.NewBoardCache()
+	}
+	if cached, ok := m.boardCache.Peek(n); ok {
+		if cached.Err != "" {
+			info.BoardUnreachable = cached.Err
+		} else {
+			info.Explanation = cached.Explanation
+			info.Recommendation = cached.Recommendation
+		}
+		m.tabbedWindow.SetNeedsYouInfo(info)
+		return nil
+	}
+	info.Loading = true
+	m.tabbedWindow.SetNeedsYouInfo(info)
+	return m.fetchBoardCmd(n)
+}
+
+// fetchBoardCmd runs BoardCache.Get(n) - the one gh api call - in the
+// background; the fetched result lands in the cache itself, so the
+// returned message carries nothing but a "go re-read the cache" signal
+// (boardFetchedMsg), never a stale copy of what was selected when the
+// fetch started.
+func (m *home) fetchBoardCmd(n int) tea.Cmd {
+	return func() tea.Msg {
+		m.boardCache.Get(n)
+		return boardFetchedMsg{}
+	}
 }
 
 type keyupMsg struct{}
@@ -1157,13 +1328,20 @@ type hideErrMsg struct{}
 // hideStatusMsg implements tea.Msg and clears the status text from the screen.
 type hideStatusMsg struct{}
 
-// msgSentMsg carries the result of an m-key/sendMsgCmd delivery back to
-// Update: either the line that landed (or the UNCONSTRUCTED line) in text,
+// composerResultMsg carries the result of a composer send back to Update:
+// either the foot text to show ("sent · landed hh:mm:ss" / "copied · ..."),
 // or a delivery error.
-type msgSentMsg struct {
-	text string
-	err  error
+type composerResultMsg struct {
+	result string
+	err    error
 }
+
+// boardFetchedMsg signals that a background board-issue fetch (fetchBoard-
+// Cmd) has landed in clarity.BoardCache - the Needs-you tab's own data is
+// re-read from the cache (refreshNeedsYouTab), never carried on this
+// message itself, so a stale row (the selection having moved on while the
+// fetch was in flight) is never rendered.
+type boardFetchedMsg struct{}
 
 // previewTickMsg implements tea.Msg and triggers a preview update
 type previewTickMsg struct{}
@@ -1441,33 +1619,38 @@ func (m *home) setStatus(text string) tea.Cmd {
 	}
 }
 
-// sendMsgCmd delivers text to lane (a tracked instance, unless isExternal)
-// in the background and reports the result through setStatus: the last
-// pane line that landed for a tracked instance, or the fixed UNCONSTRUCTED
-// line for an external row. This is the TUI's m key doing exactly what
-// `cs-clarity msg <lane> '<text>'` does from the command line.
-func (m *home) sendMsgCmd(lane string, isExternal bool, text string) tea.Cmd {
+// sendComposerCmd delivers text to lane in the background and reports the
+// result as a composerResultMsg the composer's own foot then shows: for a
+// tracked instance, SendPrompt followed by a pane capture to confirm the
+// line landed ("sent · landed hh:mm:ss" - the capture succeeding is the
+// confirmation, same as the pre-slice-5 m key's own delivery path); for an
+// external lane, a clipboard copy instead ("copied · this lane runs in
+// your own terminal, paste it there") - never a claimed delivery this
+// cockpit cannot confirm.
+func (m *home) sendComposerCmd(lane string, isExternal bool, text string) tea.Cmd {
 	return func() tea.Msg {
 		if isExternal {
-			return msgSentMsg{text: clarity.ExternalMsgUnconstructed(lane)}
+			if err := clarity.CopyToClipboard(m.cmdExec, text); err != nil {
+				return composerResultMsg{err: fmt.Errorf("could not copy to clipboard: %w", err)}
+			}
+			return composerResultMsg{result: "copied · this lane runs in your own terminal, paste it there"}
 		}
 		for _, inst := range m.list.GetInstances() {
 			if inst.Title != lane {
 				continue
 			}
 			if !inst.Started() || inst.Paused() || !inst.TmuxAlive() {
-				return msgSentMsg{err: fmt.Errorf("%q is not a live tmux session", lane)}
+				return composerResultMsg{err: fmt.Errorf("%q is not a live tmux session", lane)}
 			}
 			if err := inst.SendPrompt(text); err != nil {
-				return msgSentMsg{err: fmt.Errorf("failed to send message to %q: %w", lane, err)}
+				return composerResultMsg{err: fmt.Errorf("failed to send message to %q: %w", lane, err)}
 			}
-			pane, err := inst.Preview()
-			if err != nil {
-				return msgSentMsg{err: fmt.Errorf("message sent to %q but pane capture failed: %w", lane, err)}
+			if _, err := inst.Preview(); err != nil {
+				return composerResultMsg{err: fmt.Errorf("message sent to %q but pane capture failed: %w", lane, err)}
 			}
-			return msgSentMsg{text: clarity.LastPaneLine(pane)}
+			return composerResultMsg{result: fmt.Sprintf("sent · landed %s", time.Now().Local().Format("15:04:05"))}
 		}
-		return msgSentMsg{err: fmt.Errorf("no such tracked instance %q", lane)}
+		return composerResultMsg{err: fmt.Errorf("no such tracked instance %q", lane)}
 	}
 }
 

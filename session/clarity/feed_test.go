@@ -119,6 +119,48 @@ func TestNeedsYou_EmptyQueueIsNotAnEmptySlice(t *testing.T) {
 	require.Equal(t, []string{"feed: queue is empty"}, lines)
 }
 
+// --- RankedNeedsYou (board #280 slice 5: structured rows for selection) --
+
+func TestRankedNeedsYou_ReturnsRankedItemsNoStatus(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "FLEET-QUEUE.md")
+	require.NoError(t, os.WriteFile(path, []byte(sampleQueue), 0644))
+
+	items, status := RankedNeedsYou(path, 2)
+	require.Equal(t, "", status)
+	require.Equal(t, []string{"needs your go on the merge", "waiting on a credential"},
+		[]string{items[0].Title, items[1].Title})
+}
+
+func TestRankedNeedsYou_AbsentQueueReportsStatusNoItems(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "FLEET-QUEUE.md")
+	items, status := RankedNeedsYou(path, 5)
+	require.Nil(t, items)
+	require.Equal(t, "feed: UNCONSTRUCTED - no queue at "+path, status)
+}
+
+func TestRankedNeedsYou_EmptyQueueReportsStatusNoItems(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "FLEET-QUEUE.md")
+	header := "| rank | class | source | title |\n| --- | --- | --- | --- |\n"
+	require.NoError(t, os.WriteFile(path, []byte(header), 0644))
+
+	items, status := RankedNeedsYou(path, 5)
+	require.Nil(t, items)
+	require.Equal(t, "feed: queue is empty", status)
+}
+
+func TestBoardSourcedItem_LaneIsTheIssueNumberItself(t *testing.T) {
+	// A board row's Source is "#<n>" (fleet_queue_build.py's board_rows()),
+	// which has no directory to derive a lane name from - laneFromSource
+	// falls back to the source string itself, so Lane on a board-sourced
+	// item is the issue number, not a real lane. Pinned here so a caller
+	// (the Needs-you tab) never assumes otherwise.
+	queue := "| rank | class | source | title |\n| --- | --- | --- | --- |\n" +
+		"| 1 | blocked-on-owner | #277 | Owner: one settings act |\n"
+	items, err := ParseQueueMarkdown([]byte(queue))
+	require.NoError(t, err)
+	require.Equal(t, "#277", items[0].Lane)
+}
+
 func TestDefaultFeedPath_EnvOverride(t *testing.T) {
 	t.Setenv(FeedQueuePathEnvVar, "/tmp/custom-queue.md")
 	require.Equal(t, "/tmp/custom-queue.md", DefaultFeedPath())

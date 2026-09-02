@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -180,26 +181,64 @@ func FeedLine(item FeedItem) string {
 // does exactly one read of path per call; the caller (a periodic UI tick)
 // decides the cadence, this function never loops or polls on its own.
 func NeedsYou(path string, n int) []string {
-	items, err := LoadFeed(path)
+	items, status := RankedNeedsYou(path, n)
+	if status != "" {
+		return []string{status}
+	}
+	lines := make([]string, 0, len(items))
+	for _, item := range items {
+		lines = append(lines, FeedLine(item))
+	}
+	return lines
+}
+
+// RankedNeedsYou is NeedsYou's structured counterpart (board #280's own
+// slice 5): the ranked FeedItems themselves, capped to n, for a caller (the
+// list's own selectable Needs-you rows) that needs each row's fields, not
+// just its rendered line. status carries the same absent/parse-error/empty
+// text NeedsYou renders as its sole line, "" when the queue read cleanly -
+// items is nil whenever status is non-empty, so a caller never has to
+// juggle both a status line AND a stale/partial item slice at once.
+func RankedNeedsYou(path string, n int) (items []FeedItem, status string) {
+	loaded, err := LoadFeed(path)
 	if err != nil {
 		var absent *FeedAbsentError
 		if errors.As(err, &absent) {
-			return []string{fmt.Sprintf("feed: UNCONSTRUCTED - no queue at %s", absent.Path)}
+			return nil, fmt.Sprintf("feed: UNCONSTRUCTED - no queue at %s", absent.Path)
 		}
-		return []string{fmt.Sprintf("feed: UNCONSTRUCTED - could not parse queue at %s: %v", path, err)}
+		return nil, fmt.Sprintf("feed: UNCONSTRUCTED - could not parse queue at %s: %v", path, err)
 	}
-	ranked := RankItems(items)
+	ranked := RankItems(loaded)
 	if len(ranked) == 0 {
-		return []string{"feed: queue is empty"}
+		return nil, "feed: queue is empty"
 	}
 	if n > 0 && len(ranked) > n {
 		ranked = ranked[:n]
 	}
-	lines := make([]string, 0, len(ranked))
-	for _, item := range ranked {
-		lines = append(lines, FeedLine(item))
+	return ranked, ""
+}
+
+// boardIssueSourceRe matches a feed item's Source field when it names a
+// board issue directly - fleet_queue_build.py's board_rows() writes
+// "#<number>" - as opposed to a lane-file source
+// ("sessions/lane/STATUS.md:12", that same script's lane_rows()), which
+// carries no issue number to fetch.
+var boardIssueSourceRe = regexp.MustCompile(`^#(\d+)$`)
+
+// BoardIssueNumber extracts the issue number from a feed item's Source
+// field. ok is false when source is not a bare "#<n>" board reference (a
+// lane-file source, or anything else) - the Needs-you tab's own signal for
+// "there is no board issue here to fetch a recommendation from".
+func BoardIssueNumber(source string) (int, bool) {
+	m := boardIssueSourceRe.FindStringSubmatch(source)
+	if m == nil {
+		return 0, false
 	}
-	return lines
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // builtLinePrefix is the literal prefix scripts/fleet_queue_build.py writes
