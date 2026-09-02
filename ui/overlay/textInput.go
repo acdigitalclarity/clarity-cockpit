@@ -206,9 +206,21 @@ func (t *TextInputOverlay) HandleKeyPress(msg tea.KeyMsg) (bool, bool) {
 			t.setFocusIndex(t.FocusIndex + 1)
 			return false, false
 		}
-		// Send enter to textarea
 		if t.isTextarea() {
-			t.textarea, _ = t.textarea.Update(msg)
+			// Alt+Enter inserts a literal newline in the prompt; plain Enter
+			// submits immediately with the current profile/branch selection,
+			// so creating an instance no longer requires tabbing through
+			// every focus stop (profile picker, branch picker, Enter button)
+			// before the keystroke that actually creates it.
+			if msg.Alt {
+				t.textarea, _ = t.textarea.Update(msg)
+				return false, false
+			}
+			t.Submitted = true
+			if t.OnSubmit != nil {
+				t.OnSubmit()
+			}
+			return true, false
 		}
 		return false, false
 	default:
