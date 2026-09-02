@@ -682,19 +682,22 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 
 		// Create the kill action as a tea.Cmd
 		killAction := func() tea.Msg {
-			// Get worktree and check if branch is checked out
-			worktree, err := selected.GetGitWorktree()
-			if err != nil {
-				return err
-			}
+			// clarity-attach instances have no git worktree, so there is no
+			// branch checkout state to protect - skip straight to cleanup.
+			if selected.HasWorktree() {
+				worktree, err := selected.GetGitWorktree()
+				if err != nil {
+					return err
+				}
 
-			checkedOut, err := worktree.IsBranchCheckedOut()
-			if err != nil {
-				return err
-			}
+				checkedOut, err := worktree.IsBranchCheckedOut()
+				if err != nil {
+					return err
+				}
 
-			if checkedOut {
-				return fmt.Errorf("instance %s is currently checked out", selected.Title)
+				if checkedOut {
+					return fmt.Errorf("instance %s is currently checked out", selected.Title)
+				}
 			}
 
 			// Clean up terminal session for this instance
@@ -721,6 +724,9 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 
 		// Create the push action as a tea.Cmd
 		pushAction := func() tea.Msg {
+			if !selected.HasWorktree() {
+				return fmt.Errorf("instance %s has no git worktree to push (clarity-attach instance)", selected.Title)
+			}
 			// Default commit message with timestamp
 			commitMsg := fmt.Sprintf("[claudesquad] update from '%s' on %s", selected.Title, time.Now().Format(time.RFC822))
 			worktree, err := selected.GetGitWorktree()
