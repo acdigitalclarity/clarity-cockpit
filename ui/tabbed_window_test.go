@@ -58,9 +58,10 @@ func TestTabbedWindow_ScrollKeys_DispatchToNeedsYouPane(t *testing.T) {
 	require.True(t, w.IsInNeedsYouTab())
 
 	w.SetNeedsYouInfo(&NeedsYouInfo{
-		Item:           clarity.FeedItem{Rank: 1, Title: "t"},
-		Explanation:    strings.Repeat("word ", 200),
-		Recommendation: "ok",
+		Item:        clarity.FeedItem{Rank: 1, Title: "t"},
+		Lane:        "lane-a",
+		Explanation: []clarity.BoardSection{{Text: strings.Repeat("word ", 200)}},
+		Options:     []clarity.BoardOption{{Text: "ok"}},
 	})
 
 	before := w.String()

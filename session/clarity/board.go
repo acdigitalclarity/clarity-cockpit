@@ -30,12 +30,49 @@ const boardRepo = "acdigitalclarity/clarity-tasks"
 // is not re-hit on every 3-second feed tick.
 const BoardRetryInterval = time.Minute
 
-// BoardExplanation is one issue's parsed body, or a fetch failure reason.
+// BoardSection is one labeled part of a Needs-you row's explanation - a
+// card's own "## What"/"## Where"/"## Why" heading (Label holds the plain
+// word, e.g. "What"), or a single unlabeled section (Label "") holding the
+// body's own first paragraphs when the card carries no "## " headings at
+// all (board #280's slice 5b, DEFECT 1).
+type BoardSection struct {
+	Label string
+	Text  string
+}
+
+// BoardOption is one line of a card's "## Options" list (or its single
+// "## Recommendation"/"## Recommended" paragraph, folded into one option
+// when the card names no lettered list) - Recommended marks whichever line
+// the card itself calls out inline (e.g. "... two minutes. Recommended.").
+type BoardOption struct {
+	Text        string
+	Recommended bool
+}
+
+// BoardExplanation is one issue's parsed card, or a fetch failure reason.
 type BoardExplanation struct {
-	Explanation    string
-	Recommendation string
+	// Lane is the row's raising lane: the "## Lane" section's own content,
+	// falling back to the issue's own "lane:<name>" label when the body
+	// carries no Lane section; "" when neither resolves (slice 5b, DEFECT
+	// 2) - a caller never claims a delivery target this field leaves empty.
+	Lane string
+	// Explanation is the What/Where/Why sections in reading order, or a
+	// single unlabeled section holding the body's own paragraphs when the
+	// card carries no headings at all (free prose). Empty when the body has
+	// neither.
+	Explanation []BoardSection
+	// Options is the card's own Options list (or its single Recommendation/
+	// Recommended paragraph, as one option) - nil when the card names none.
+	Options []BoardOption
+	// ExpectedReply is the "## Expected reply" section's own content, ""
+	// when the card carries none.
+	ExpectedReply string
+	// Also holds anything on the row not classified into the fields above
+	// (an unrecognised heading, or a preamble before the first heading) -
+	// never dropped silently, "" when nothing is left over.
+	Also string
 	// Err is the fetch failure reason, "" on success. A caller renders
-	// "board unreachable: <Err>" and shows neither field above.
+	// "board unreachable: <Err>" and shows none of the fields above.
 	Err string
 }
 
@@ -123,13 +160,19 @@ func (c *BoardCache) fetch(n int) BoardExplanation {
 		return BoardExplanation{Err: reasonFromExecError(err)}
 	}
 	var payload struct {
-		Body string `json:"body"`
+		Body   string `json:"body"`
+		Labels []struct {
+			Name string `json:"name"`
+		} `json:"labels"`
 	}
 	if err := json.Unmarshal(out, &payload); err != nil {
 		return BoardExplanation{Err: fmt.Sprintf("unparseable gh api response: %v", err)}
 	}
-	explanation, recommendation := ParseBoardBody(payload.Body)
-	return BoardExplanation{Explanation: explanation, Recommendation: recommendation}
+	labels := make([]string, len(payload.Labels))
+	for i, l := range payload.Labels {
+		labels[i] = l.Name
+	}
+	return ParseBoardBody(payload.Body, labels)
 }
 
 // reasonFromExecError prefers a failed gh call's own stderr (exec.Cmd's
@@ -145,30 +188,170 @@ func reasonFromExecError(err error) string {
 	return err.Error()
 }
 
-// ParseBoardBody splits a board issue's markdown body into the Needs-you
-// tab's two fields. The board's own owner-action card shape (README's
-// contract: Lane/What/Where/Why/Options/Expected reply, each a "## "
-// heading) always opens with a heading, so the explanation is the FIRST
-// such section's own content, heading stripped. The card marks its pick
-// inline inside "## Options" ("... two minutes. Recommended.") rather than
-// under a dedicated heading, so the recommendation is the first paragraph
-// anywhere in the body that mentions "recommend" (case-insensitive) -
-// "no recommendation on the row" when nothing does.
-func ParseBoardBody(body string) (explanation, recommendation string) {
-	paragraphs := splitParagraphs(body)
-	if len(paragraphs) > 0 {
-		explanation = stripHeading(paragraphs[0])
-	}
-	for _, p := range paragraphs {
-		if strings.Contains(strings.ToLower(p), "recommend") {
-			recommendation = stripHeading(p)
-			break
+// laneLabelPrefix is the board's own "lane:<name>" issue label
+// (acdigitalclarity/clarity-tasks convention, confirmed on issues 243, 244
+// and 277 via `gh api .../issues/<n> --jq '.labels[].name'`) - ParseBoard-
+// Body's fallback when the body itself carries no "## Lane" section.
+const laneLabelPrefix = "lane:"
+
+// ParseBoardBody splits a board issue's markdown body (and, for the Lane
+// fallback, its GitHub labels) into the Needs-you tab's fields (board #280,
+// slice 5b, DEFECT 1 and DEFECT 2). The board's own owner-action card shape
+// (README's contract: Lane/What/Where/Why/Options/Expected reply, each a
+// "## " heading) is classified heading by heading; a body with no "## "
+// heading at all is free prose - its own paragraphs become the explanation,
+// with whichever paragraph first mentions "recommend" pulled out as the
+// recommendation instead. Anything on the row that classifies into neither
+// shape - an unrecognised heading, or text before the first heading - is
+// never dropped: it lands in Also.
+func ParseBoardBody(body string, labels []string) BoardExplanation {
+	var out BoardExplanation
+	sections := splitHeadedSections(body)
+	if sections == nil {
+		out = parseFreeProseBody(body)
+	} else {
+		for _, s := range sections {
+			classifySection(&out, s.heading, s.body)
 		}
 	}
-	if recommendation == "" {
-		recommendation = "no recommendation on the row"
+	if out.Lane == "" {
+		out.Lane = laneFromLabels(labels)
 	}
-	return explanation, recommendation
+	return out
+}
+
+// classifySection files one "## Heading" section's content into out,
+// matching the board README's own six headings by plain-word name
+// (case-insensitive) and routing anything else to Also.
+func classifySection(out *BoardExplanation, heading, body string) {
+	switch strings.ToLower(strings.TrimSpace(heading)) {
+	case "lane":
+		out.Lane = firstLine(body)
+	case "what":
+		if body != "" {
+			out.Explanation = append(out.Explanation, BoardSection{Label: "What", Text: body})
+		}
+	case "where":
+		if body != "" {
+			out.Explanation = append(out.Explanation, BoardSection{Label: "Where", Text: body})
+		}
+	case "why":
+		if body != "" {
+			out.Explanation = append(out.Explanation, BoardSection{Label: "Why", Text: body})
+		}
+	case "options":
+		out.Options = append(out.Options, parseOptions(body)...)
+	case "recommendation", "recommended":
+		if body != "" {
+			out.Options = append(out.Options, BoardOption{Text: body, Recommended: true})
+		}
+	case "expected reply":
+		out.ExpectedReply = body
+	default:
+		if body != "" {
+			out.Also = appendAlso(out.Also, heading, body)
+		}
+	}
+}
+
+// parseFreeProseBody is ParseBoardBody's fallback for a body with no "## "
+// heading at all: every paragraph that first mentions "recommend" (case-
+// insensitive) becomes a marked option; everything else becomes the
+// explanation's own single unlabeled section, in the body's own order.
+func parseFreeProseBody(body string) BoardExplanation {
+	var out BoardExplanation
+	var explanationParas []string
+	for _, p := range splitParagraphs(body) {
+		if strings.Contains(strings.ToLower(p), "recommend") {
+			out.Options = append(out.Options, BoardOption{Text: p, Recommended: true})
+			continue
+		}
+		explanationParas = append(explanationParas, p)
+	}
+	if len(explanationParas) > 0 {
+		out.Explanation = []BoardSection{{Text: strings.Join(explanationParas, "\n\n")}}
+	}
+	return out
+}
+
+// headedSection is one "## Heading" block: the heading text (without the
+// "## " marker) and everything up to the next heading or the body's end.
+type headedSection struct {
+	heading string
+	body    string
+}
+
+// splitHeadedSections scans body for lines starting with "## " and splits
+// it into one headedSection per heading, plus a leading section (heading
+// "") for any text before the first heading. Returns nil when the body
+// carries no "## " heading at all - ParseBoardBody's own signal to fall
+// back to free-prose parsing.
+func splitHeadedSections(body string) []headedSection {
+	lines := strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n")
+	var sections []headedSection
+	heading := ""
+	var cur []string
+	sawHeading := false
+	flush := func() {
+		sections = append(sections, headedSection{heading: heading, body: strings.TrimSpace(strings.Join(cur, "\n"))})
+	}
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "## ") {
+			flush()
+			heading = strings.TrimSpace(strings.TrimPrefix(trimmed, "##"))
+			cur = nil
+			sawHeading = true
+			continue
+		}
+		cur = append(cur, line)
+	}
+	flush()
+	if !sawHeading {
+		return nil
+	}
+	return sections
+}
+
+// parseOptions splits an "## Options" section's own content into one
+// BoardOption per non-empty line, marking whichever line mentions
+// "recommend" (case-insensitive) - the card's own inline pick ("(a) ...
+// Recommended.").
+func parseOptions(text string) []BoardOption {
+	var opts []BoardOption
+	for _, l := range strings.Split(text, "\n") {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		opts = append(opts, BoardOption{Text: l, Recommended: strings.Contains(strings.ToLower(l), "recommend")})
+	}
+	return opts
+}
+
+// appendAlso accumulates unclassified body text under one running string,
+// each block labeled by its own heading (when it had one) so a reader can
+// tell where it came from.
+func appendAlso(existing, heading, body string) string {
+	block := body
+	if heading != "" {
+		block = heading + ": " + body
+	}
+	if existing == "" {
+		return block
+	}
+	return existing + "\n\n" + block
+}
+
+// laneFromLabels returns the name half of the first "lane:<name>" label,
+// "" when none of labels carries that prefix.
+func laneFromLabels(labels []string) string {
+	for _, l := range labels {
+		if strings.HasPrefix(l, laneLabelPrefix) {
+			return strings.TrimPrefix(l, laneLabelPrefix)
+		}
+	}
+	return ""
 }
 
 // splitParagraphs splits body on blank lines, trimming each and dropping
@@ -183,20 +366,4 @@ func splitParagraphs(body string) []string {
 		}
 	}
 	return out
-}
-
-// stripHeading removes a leading markdown "## Heading" line from a
-// paragraph, leaving just its body text - a card's "## Options" paragraph
-// (the heading and its list items share one blank-line-delimited block)
-// would otherwise print the literal "##" marker.
-func stripHeading(p string) string {
-	lines := strings.SplitN(p, "\n", 2)
-	first := strings.TrimSpace(lines[0])
-	if !strings.HasPrefix(first, "#") {
-		return p
-	}
-	if len(lines) == 2 {
-		return strings.TrimSpace(lines[1])
-	}
-	return strings.TrimSpace(strings.TrimLeft(first, "# "))
 }

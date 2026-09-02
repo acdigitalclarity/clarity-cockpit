@@ -12,10 +12,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/require"
 )
 
@@ -132,18 +134,45 @@ func TestComposerTarget_NeedsYouRow_ResolvesToTrackedInstance(t *testing.T) {
 	require.Equal(t, "ways-of-working", lane)
 }
 
-func TestComposerTarget_NeedsYouRow_UnresolvedLaneFallsBackToCopy(t *testing.T) {
+// TestComposerTarget_NeedsYouRow_UnresolvedBoardLane_NoLane is board #280's
+// slice 5b DEFECT 2: a board-sourced row's raw item.Lane is the issue
+// number string itself ("#277") - never a real send target. With no board
+// fetch cached yet (or a failed one), the row's lane does not resolve at
+// all, and composerTarget must say so with lane="" rather than falling
+// back to that bogus "#277" string.
+func TestComposerTarget_NeedsYouRow_UnresolvedBoardLane_NoLane(t *testing.T) {
 	h := newComposerTestHome()
-	// A board-sourced row's own Lane is the issue number itself ("#277",
-	// laneFromSource's fallback) - it never resolves to any tracked or
-	// external lane.
 	h.list.SetNeedsYou([]clarity.FeedItem{{Rank: 1, Source: "#277", Lane: "#277", Title: "Owner: one settings act"}}, "")
 	h.list.Up()
 
 	lane, isExternal, ok := h.composerTarget()
 	require.True(t, ok)
 	require.True(t, isExternal, "an unresolved lane must never claim a delivery this cockpit cannot confirm")
-	require.Equal(t, "#277", lane)
+	require.Equal(t, "", lane, "neither the fetched body's Lane field nor a lane: label resolved")
+}
+
+// TestComposerTarget_NeedsYouRow_BoardLane_ResolvesFromFetchedBody is
+// DEFECT 2's fix proven the other way: once the board fetch lands, the
+// row's real raising lane (the card's own "## Lane" section) is the send
+// target, not the issue-number source string.
+func TestComposerTarget_NeedsYouRow_BoardLane_ResolvesFromFetchedBody(t *testing.T) {
+	h := newComposerTestHome()
+	inst, err := session.NewInstance(session.InstanceOptions{Title: "ways-of-working", Path: ".", Program: "echo"})
+	require.NoError(t, err)
+	h.list.AddInstance(inst)
+	h.list.SetNeedsYou([]clarity.FeedItem{{Rank: 1, Source: "#277", Lane: "#277", Title: "t"}}, "")
+	h.boardCache = clarity.NewBoardCacheWithDeps(cmd_test.MockCmdExec{
+		OutputFunc: func(cmd *exec.Cmd) ([]byte, error) {
+			return []byte(`{"body":"## Lane\nways-of-working"}`), nil
+		},
+	}, "acdigitalclarity/clarity-tasks", "gh")
+	h.boardCache.Get(277) // seed the cache synchronously, as app.go's fetchBoardCmd would
+
+	h.list.Up()
+	lane, isExternal, ok := h.composerTarget()
+	require.True(t, ok)
+	require.False(t, isExternal, "the fetched lane matches a tracked instance - it sends, it does not copy")
+	require.Equal(t, "ways-of-working", lane)
 }
 
 // -- tab-follows-row-kind (slice 5) ----------------------------------------
@@ -378,4 +407,41 @@ func TestComposerFlow_TypingAppendsToComposer(t *testing.T) {
 
 	h.handleKeyPress(tea.KeyPressMsg{Code: tea.KeyBackspace})
 	require.Equal(t, "h", h.composer.Value())
+}
+
+// TestComposerFlow_MOpensStateMsg_NotStatePrompt is board #280's slice 5b
+// DEFECT 3: the composer's own menu state is StateMsg, never the upstream
+// "enter prompt" instance-start overlay's StatePrompt it used to borrow.
+func TestComposerFlow_MOpensStateMsg_NotStatePrompt(t *testing.T) {
+	h := newComposerTestHome()
+	inst, err := session.NewInstance(session.InstanceOptions{Title: "lane-a", Path: ".", Program: "echo"})
+	require.NoError(t, err)
+	h.list.AddInstance(inst)
+	h.list.SetSelectedInstance(0)
+
+	pressGlobalKey(h, tea.KeyPressMsg{Code: 'm', Text: "m"})
+
+	require.Equal(t, "enter send · esc cancel", strings.TrimSpace(ansi.Strip(h.menu.String())),
+		"the footer while the composer is open, exactly - never StatePrompt's borrowed \"enter submit name\"")
+}
+
+// TestComposerFlow_NoLaneRow_TitleAndEnterMessage is board #280's slice 5b
+// DEFECT 2's composer-open half: a Needs-you row whose lane resolved to
+// neither the board card's Lane field nor its lane: label still opens the
+// composer, named "(no lane on this row)", and enter delivers nothing.
+func TestComposerFlow_NoLaneRow_TitleAndEnterMessage(t *testing.T) {
+	h := newComposerTestHome()
+	h.list.SetNeedsYou([]clarity.FeedItem{{Rank: 1, Source: "#277", Lane: "#277", Title: "t"}}, "")
+	h.list.Up()
+
+	pressGlobalKey(h, tea.KeyPressMsg{Code: 'm', Text: "m"})
+	require.True(t, h.composer.IsOpen())
+	require.Equal(t, "", h.composer.Lane())
+	require.Contains(t, strings.Join(h.composer.Render(80, ""), "\n"), "message (no lane on this row)")
+
+	h.composer.Type("hi")
+	_, cmd := h.handleKeyPress(tea.KeyPressMsg{Code: tea.KeyEnter})
+	require.Nil(t, cmd, "no lane to send to - enter never dispatches a send")
+	require.False(t, h.composer.IsOpen())
+	require.Equal(t, "no lane to send to", h.composer.Result())
 }

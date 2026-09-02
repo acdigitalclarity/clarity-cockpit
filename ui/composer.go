@@ -25,6 +25,14 @@ const (
 	ComposerFootEditing = "enter send · esc cancel"
 )
 
+// NoLaneLabel is the composer's own title/target text (and the Needs-you
+// header line 2's own fallback, ui/needsyou.go) for a Needs-you row whose
+// raising lane resolved to neither the board card's own "## Lane" section
+// nor the issue's "lane:" label (board #280, slice 5b, DEFECT 2) - the
+// composer still opens, but names no send target and enter delivers
+// nothing (app.go's stateMsg Enter handler checks Lane() == "" itself).
+const NoLaneLabel = "(no lane on this row)"
+
 // Composer is the shared model behind both panes' inline message box: is it
 // open, what has been typed, and (once a send resolves) the result text the
 // foot shows instead of the idle/editing prompt.
@@ -124,6 +132,9 @@ func (c *Composer) Render(width int, lane string) []string {
 	displayLane := lane
 	if c.open || c.result != "" {
 		displayLane = c.lane
+	}
+	if displayLane == "" {
+		displayLane = NoLaneLabel
 	}
 	title := fmt.Sprintf(" message %s ", displayLane)
 	top := "┌" + title + strings.Repeat("─", maxInt0(width-2-lipgloss.Width(title))) + "┐"
