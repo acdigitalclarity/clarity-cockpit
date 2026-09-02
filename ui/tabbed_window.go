@@ -83,6 +83,15 @@ func (w *TabbedWindow) SetSize(width, height int) {
 	w.width = AdjustPreviewWidth(width)
 	w.height = height
 
+	// Collapsed (app.go's OVERFLOW fix gives the preview/diff pane zero
+	// width below collapsePreviewBelowWidth columns): nothing to size, and
+	// the tmux panes underneath must never be asked for a non-positive
+	// size - leave the previous valid preview/diff/terminal sizes in place
+	// rather than computing negative ones.
+	if w.width <= 0 || height <= 0 {
+		return
+	}
+
 	// Calculate the content height by subtracting:
 	// 1. Tab height (including border and padding)
 	// 2. Window style vertical frame size

@@ -42,11 +42,13 @@ func (p *PreviewPane) SetSize(width, maxHeight int) {
 	p.viewport.SetHeight(maxHeight)
 }
 
-// setFallbackState sets the preview state with fallback text and a message
+// setFallbackState sets the preview state with fallback text and a message.
+// The mark is sized to the pane's current width (see ui.FallbackMark) so it
+// is never drawn wider than the pane itself.
 func (p *PreviewPane) setFallbackState(message string) {
 	p.previewState = previewState{
 		fallback: true,
-		text:     lipgloss.JoinVertical(lipgloss.Center, FallBackText, "", message),
+		text:     lipgloss.JoinVertical(lipgloss.Center, FallbackMark(p.width), "", message),
 	}
 }
 

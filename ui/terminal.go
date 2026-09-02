@@ -63,10 +63,11 @@ func (t *TerminalPane) SetSize(width, height int) {
 }
 
 // setFallbackState sets the terminal pane to display a fallback message.
-// Caller must hold t.mu.
+// The mark is sized to the pane's current width (see ui.FallbackMark) so it
+// is never drawn wider than the pane itself. Caller must hold t.mu.
 func (t *TerminalPane) setFallbackState(message string) {
 	t.fallback = true
-	t.fallbackText = lipgloss.JoinVertical(lipgloss.Center, FallBackText, "", message)
+	t.fallbackText = lipgloss.JoinVertical(lipgloss.Center, FallbackMark(t.width), "", message)
 	t.content = ""
 }
 
