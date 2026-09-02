@@ -16,9 +16,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/charmbracelet/bubbles/spinner"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/spinner"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/mattn/go-runewidth"
 )
 
@@ -26,11 +26,10 @@ const GlobalInstanceLimit = 10
 
 // Run is the main entrypoint into the application.
 func Run(ctx context.Context, program string, autoYes bool) error {
-	p := tea.NewProgram(
-		newHome(ctx, program, autoYes),
-		tea.WithAltScreen(),
-		tea.WithMouseCellMotion(), // Mouse scroll
-	)
+	// AltScreen and mouse-cell-motion (scroll) are now declared per-View,
+	// see (*home).View below - v2's declarative View fields replace v1's
+	// NewProgram options.
+	p := tea.NewProgram(newHome(ctx, program, autoYes))
 	_, err := p.Run()
 	return err
 }
@@ -243,7 +242,7 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			// Start failed — remove the instance from the list and show the error.
 			m.list.Kill()
-			return m, tea.Batch(tea.WindowSize(), m.instanceChanged(), m.handleError(msg.err))
+			return m, tea.Batch(tea.RequestWindowSize, m.instanceChanged(), m.handleError(msg.err))
 		}
 
 		// Save after successful start.
@@ -260,7 +259,7 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.showHelpScreen(helpStart(inst), nil)
 		}
 
-		return m, tea.Batch(tea.WindowSize(), m.instanceChanged())
+		return m, tea.Batch(tea.RequestWindowSize, m.instanceChanged())
 	case metadataUpdateDoneMsg:
 		for _, r := range msg.results {
 			// Skip instances that were paused while metadata was being computed
@@ -311,21 +310,19 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			time.Sleep(feedRefreshInterval)
 			return feedTickMsg{}
 		}
-	case tea.MouseMsg:
+	case tea.MouseWheelMsg:
 		// Handle mouse wheel events for scrolling the diff/preview pane
-		if msg.Action == tea.MouseActionPress {
-			if msg.Button == tea.MouseButtonWheelDown || msg.Button == tea.MouseButtonWheelUp {
-				selected := m.list.GetSelectedInstance()
-				if selected == nil || selected.Status == session.Paused {
-					return m, nil
-				}
+		if msg.Button == tea.MouseWheelDown || msg.Button == tea.MouseWheelUp {
+			selected := m.list.GetSelectedInstance()
+			if selected == nil || selected.Status == session.Paused {
+				return m, nil
+			}
 
-				switch msg.Button {
-				case tea.MouseButtonWheelUp:
-					m.tabbedWindow.ScrollUp()
-				case tea.MouseButtonWheelDown:
-					m.tabbedWindow.ScrollDown()
-				}
+			switch msg.Button {
+			case tea.MouseWheelUp:
+				m.tabbedWindow.ScrollUp()
+			case tea.MouseWheelDown:
+				m.tabbedWindow.ScrollDown()
 			}
 		}
 		return m, nil
@@ -343,7 +340,7 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.textInputOverlay.SetBranchResults(msg.branches, msg.version)
 		}
 		return m, nil
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		return m.handleKeyPress(msg)
 	case tea.WindowSizeMsg:
 		m.updateHandleWindowSizeEvent(msg)
@@ -387,7 +384,7 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.showHelpScreen(helpStart(msg.instance), nil)
 		}
 
-		return m, tea.Batch(tea.WindowSize(), m.instanceChanged())
+		return m, tea.Batch(tea.RequestWindowSize, m.instanceChanged())
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
@@ -408,7 +405,7 @@ func (m *home) handleQuit() (tea.Model, tea.Cmd) {
 	return m, tea.Quit
 }
 
-func (m *home) handleMenuHighlighting(msg tea.KeyMsg) (cmd tea.Cmd, returnEarly bool) {
+func (m *home) handleMenuHighlighting(msg tea.KeyPressMsg) (cmd tea.Cmd, returnEarly bool) {
 	// Handle menu highlighting when you press a button. We intercept it here and immediately return to
 	// update the ui while re-sending the keypress. Then, on the next call to this, we actually handle the keypress.
 	if m.keySent {
@@ -442,7 +439,7 @@ func (m *home) handleMenuHighlighting(msg tea.KeyMsg) (cmd tea.Cmd, returnEarly 
 		m.keydownCallback(name)), true
 }
 
-func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
+func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) {
 	cmd, returnEarly := m.handleMenuHighlighting(msg)
 	if returnEarly {
 		return m, cmd
@@ -459,7 +456,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			m.promptAfterName = false
 			m.list.Kill()
 			return m, tea.Sequence(
-				tea.WindowSize(),
+				tea.RequestWindowSize,
 				func() tea.Msg {
 					m.menu.SetState(ui.StateDefault)
 					return nil
@@ -468,7 +465,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		}
 
 		instance := m.list.GetInstances()[m.list.NumInstances()-1]
-		switch msg.Type {
+		switch msg.Code {
 		// Start the instance (enable previews etc) and go back to the main menu state.
 		case tea.KeyEnter:
 			if len(instance.Title) == 0 {
@@ -483,7 +480,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 				m.textInputOverlay = m.newPromptOverlay()
 				// Trigger initial branch search (no debounce, version 0)
 				initialSearch := m.runBranchSearch("", m.textInputOverlay.BranchFilterVersion())
-				return m, tea.Batch(tea.WindowSize(), initialSearch)
+				return m, tea.Batch(tea.RequestWindowSize, initialSearch)
 			}
 
 			// Set Loading status and finalize into the list immediately
@@ -503,14 +500,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 				}
 			}
 
-			return m, tea.Batch(tea.WindowSize(), m.instanceChanged(), startCmd)
-		case tea.KeyRunes:
-			if runewidth.StringWidth(instance.Title) >= 32 {
-				return m, m.handleError(fmt.Errorf("title cannot be longer than 32 characters"))
-			}
-			if err := instance.SetTitle(instance.Title + string(msg.Runes)); err != nil {
-				return m, m.handleError(err)
-			}
+			return m, tea.Batch(tea.RequestWindowSize, m.instanceChanged(), startCmd)
 		case tea.KeyBackspace:
 			runes := []rune(instance.Title)
 			if len(runes) == 0 {
@@ -529,13 +519,23 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			m.instanceChanged()
 
 			return m, tea.Sequence(
-				tea.WindowSize(),
+				tea.RequestWindowSize,
 				func() tea.Msg {
 					m.menu.SetState(ui.StateDefault)
 					return nil
 				},
 			)
 		default:
+			// Any other printable text (was tea.KeyRunes in v1 - v2 has no
+			// distinct rune sentinel, printable keys just carry msg.Text).
+			if msg.Text != "" {
+				if runewidth.StringWidth(instance.Title) >= 32 {
+					return m, m.handleError(fmt.Errorf("title cannot be longer than 32 characters"))
+				}
+				if err := instance.SetTitle(instance.Title + msg.Text); err != nil {
+					return m, m.handleError(err)
+				}
+			}
 		}
 		return m, nil
 	} else if m.state == statePrompt {
@@ -590,7 +590,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 						}
 					}
 
-					return m, tea.Batch(tea.WindowSize(), m.instanceChanged(), startCmd)
+					return m, tea.Batch(tea.RequestWindowSize, m.instanceChanged(), startCmd)
 				}
 
 				// Regular flow: instance already running, just send prompt
@@ -603,7 +603,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			m.textInputOverlay = nil
 			m.state = stateDefault
 			return m, tea.Sequence(
-				tea.WindowSize(),
+				tea.RequestWindowSize,
 				func() tea.Msg {
 					m.menu.SetState(ui.StateDefault)
 					m.showHelpScreen(helpStart(selected), nil)
@@ -628,7 +628,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			m.textInputOverlay = nil
 			m.state = stateDefault
 			return m, tea.Sequence(
-				tea.WindowSize(),
+				tea.RequestWindowSize,
 				func() tea.Msg {
 					m.menu.SetState(ui.StateDefault)
 					return nil
@@ -650,9 +650,9 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		m.menu.SetState(ui.StateDefault)
 
 		if canceled || strings.TrimSpace(text) == "" {
-			return m, tea.WindowSize()
+			return m, tea.RequestWindowSize
 		}
-		return m, tea.Batch(tea.WindowSize(), m.sendMsgCmd(lane, isExternal, text))
+		return m, tea.Batch(tea.RequestWindowSize, m.sendMsgCmd(lane, isExternal, text))
 	}
 
 	// Handle confirmation state
@@ -669,7 +669,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 	// Exit scrolling mode when ESC is pressed and preview pane is in scrolling mode
 	// Check if Escape key was pressed and we're not in the diff tab (meaning we're in preview tab)
 	// Always check for escape key first to ensure it doesn't get intercepted elsewhere
-	if msg.Type == tea.KeyEsc {
+	if msg.Code == tea.KeyEsc {
 		// If in preview tab and in scroll mode, exit scroll mode
 		if m.tabbedWindow.IsInPreviewTab() && m.tabbedWindow.IsPreviewInScrollMode() {
 			// Use the selected instance from the list
@@ -887,7 +887,7 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		if err := selected.Resume(); err != nil {
 			return m, m.handleError(err)
 		}
-		return m, tea.WindowSize()
+		return m, tea.RequestWindowSize
 	case keys.KeyEnter:
 		if m.list.NumInstances() == 0 {
 			return m, nil
@@ -1193,7 +1193,7 @@ func (m *home) cancelPromptOverlay() tea.Cmd {
 	m.textInputOverlay = nil
 	m.state = stateDefault
 	return tea.Sequence(
-		tea.WindowSize(),
+		tea.RequestWindowSize,
 		func() tea.Msg {
 			m.menu.SetState(ui.StateDefault)
 			return nil
@@ -1226,7 +1226,7 @@ func (m *home) confirmAction(message string, action tea.Cmd) tea.Cmd {
 	return nil
 }
 
-func (m *home) View() string {
+func (m *home) View() tea.View {
 	listWithPadding := lipgloss.NewStyle().PaddingTop(1).Render(m.list.String())
 	previewWithPadding := lipgloss.NewStyle().PaddingTop(1).Render(m.tabbedWindow.String())
 	listAndPreview := lipgloss.JoinHorizontal(lipgloss.Top, listWithPadding, previewWithPadding)
@@ -1246,22 +1246,28 @@ func (m *home) View() string {
 		footer,
 	)
 
+	content := mainView
 	if m.state == statePrompt {
 		if m.textInputOverlay == nil {
 			log.ErrorLog.Printf("text input overlay is nil")
 		}
-		return overlay.PlaceOverlay(0, 0, m.textInputOverlay.Render(), mainView, true, true)
+		content = overlay.PlaceOverlay(0, 0, m.textInputOverlay.Render(), mainView, true, true)
 	} else if m.state == stateHelp {
 		if m.textOverlay == nil {
 			log.ErrorLog.Printf("text overlay is nil")
 		}
-		return overlay.PlaceOverlay(0, 0, m.textOverlay.Render(), mainView, true, true)
+		content = overlay.PlaceOverlay(0, 0, m.textOverlay.Render(), mainView, true, true)
 	} else if m.state == stateConfirm {
 		if m.confirmationOverlay == nil {
 			log.ErrorLog.Printf("confirmation overlay is nil")
 		}
-		return overlay.PlaceOverlay(0, 0, m.confirmationOverlay.Render(), mainView, true, true)
+		content = overlay.PlaceOverlay(0, 0, m.confirmationOverlay.Render(), mainView, true, true)
 	}
 
-	return mainView
+	v := tea.NewView(content)
+	// v1's tea.WithAltScreen() / tea.WithMouseCellMotion() program options -
+	// v2 declares them per-View instead (see Run above).
+	v.AltScreen = true
+	v.MouseMode = tea.MouseModeCellMotion
+	return v
 }

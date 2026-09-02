@@ -4,9 +4,9 @@ import (
 	"claude-squad/config"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/textarea"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/textarea"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 var (
@@ -89,7 +89,9 @@ func newTextarea(initialValue string) textarea.Model {
 	ti.Focus()
 	ti.ShowLineNumbers = false
 	ti.Prompt = ""
-	ti.FocusedStyle.CursorLine = lipgloss.NewStyle()
+	styles := ti.Styles()
+	styles.Focused.CursorLine = lipgloss.NewStyle()
+	ti.SetStyles(styles)
 	ti.CharLimit = 0
 	ti.MaxHeight = 0
 	return ti
@@ -177,13 +179,16 @@ func (t *TextInputOverlay) updateFocusState() {
 
 // HandleKeyPress processes a key press and updates the state accordingly.
 // Returns (shouldClose, branchFilterChanged).
-func (t *TextInputOverlay) HandleKeyPress(msg tea.KeyMsg) (bool, bool) {
-	switch msg.Type {
+func (t *TextInputOverlay) HandleKeyPress(msg tea.KeyPressMsg) (bool, bool) {
+	switch msg.Code {
 	case tea.KeyTab:
-		t.setFocusIndex((t.FocusIndex + 1) % t.numStops)
-		return false, false
-	case tea.KeyShiftTab:
-		t.setFocusIndex((t.FocusIndex - 1 + t.numStops) % t.numStops)
+		// v1 had a distinct tea.KeyShiftTab code; v2 reports shift+tab as
+		// KeyTab with the shift modifier set.
+		if msg.Mod.Contains(tea.ModShift) {
+			t.setFocusIndex((t.FocusIndex - 1 + t.numStops) % t.numStops)
+		} else {
+			t.setFocusIndex((t.FocusIndex + 1) % t.numStops)
+		}
 		return false, false
 	case tea.KeyEsc:
 		t.Canceled = true
@@ -212,7 +217,7 @@ func (t *TextInputOverlay) HandleKeyPress(msg tea.KeyMsg) (bool, bool) {
 			// so creating an instance no longer requires tabbing through
 			// every focus stop (profile picker, branch picker, Enter button)
 			// before the keystroke that actually creates it.
-			if msg.Alt {
+			if msg.Mod.Contains(tea.ModAlt) {
 				t.textarea, _ = t.textarea.Update(msg)
 				return false, false
 			}
@@ -229,7 +234,7 @@ func (t *TextInputOverlay) HandleKeyPress(msg tea.KeyMsg) (bool, bool) {
 			return false, false
 		}
 		if t.isProfilePicker() {
-			if msg.Type == tea.KeyLeft || msg.Type == tea.KeyRight {
+			if msg.Code == tea.KeyLeft || msg.Code == tea.KeyRight {
 				t.profilePicker.HandleKeyPress(msg)
 			}
 			return false, false

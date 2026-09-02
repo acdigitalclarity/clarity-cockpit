@@ -3,7 +3,8 @@ package ui
 import (
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
+	"charm.land/lipgloss/v2/compat"
 	"github.com/mattn/go-runewidth"
 )
 
@@ -18,9 +19,9 @@ type StatusBox struct {
 	text          string
 }
 
-var statusStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{
-	Light: "#1a7a3c",
-	Dark:  "#51bd73",
+var statusStyle = lipgloss.NewStyle().Foreground(compat.AdaptiveColor{
+	Light: lipgloss.Color("#1a7a3c"),
+	Dark:  lipgloss.Color("#51bd73"),
 })
 
 func NewStatusBox() *StatusBox {

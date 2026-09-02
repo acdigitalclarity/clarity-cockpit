@@ -11,8 +11,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/charmbracelet/bubbles/spinner"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/spinner"
+	tea "charm.land/bubbletea/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -59,7 +59,7 @@ func TestConfirmationModalStateTransitions(t *testing.T) {
 		h.confirmationOverlay = overlay.NewConfirmationOverlay("Test confirmation")
 
 		// Simulate pressing 'y' using HandleKeyPress
-		keyMsg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")}
+		keyMsg := tea.KeyPressMsg{Code: 'y', Text: "y"}
 		shouldClose := h.confirmationOverlay.HandleKeyPress(keyMsg)
 		if shouldClose {
 			h.state = stateDefault
@@ -76,7 +76,7 @@ func TestConfirmationModalStateTransitions(t *testing.T) {
 		h.confirmationOverlay = overlay.NewConfirmationOverlay("Test confirmation")
 
 		// Simulate pressing 'n' using HandleKeyPress
-		keyMsg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")}
+		keyMsg := tea.KeyPressMsg{Code: 'n', Text: "n"}
 		shouldClose := h.confirmationOverlay.HandleKeyPress(keyMsg)
 		if shouldClose {
 			h.state = stateDefault
@@ -93,7 +93,7 @@ func TestConfirmationModalStateTransitions(t *testing.T) {
 		h.confirmationOverlay = overlay.NewConfirmationOverlay("Test confirmation")
 
 		// Simulate pressing ESC using HandleKeyPress
-		keyMsg := tea.KeyMsg{Type: tea.KeyEscape}
+		keyMsg := tea.KeyPressMsg{Code: tea.KeyEscape}
 		shouldClose := h.confirmationOverlay.HandleKeyPress(keyMsg)
 		if shouldClose {
 			h.state = stateDefault
@@ -165,11 +165,11 @@ func TestConfirmationModalKeyHandling(t *testing.T) {
 			h.confirmationOverlay = overlay.NewConfirmationOverlay("Kill session?")
 
 			// Create key message
-			var keyMsg tea.KeyMsg
+			var keyMsg tea.KeyPressMsg
 			if tc.key == "esc" {
-				keyMsg = tea.KeyMsg{Type: tea.KeyEscape}
+				keyMsg = tea.KeyPressMsg{Code: tea.KeyEscape}
 			} else {
-				keyMsg = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(tc.key)}
+				keyMsg = tea.KeyPressMsg{Code: rune(tc.key[0]), Text: tc.key}
 			}
 
 			// Call handleKeyPress
@@ -390,7 +390,7 @@ func TestMultipleConfirmationsDontInterfere(t *testing.T) {
 	assert.NotNil(t, h.confirmationOverlay.OnConfirm)
 
 	// Cancel first confirmation (simulate pressing 'n')
-	keyMsg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")}
+	keyMsg := tea.KeyPressMsg{Code: 'n', Text: "n"}
 	shouldClose := h.confirmationOverlay.HandleKeyPress(keyMsg)
 	if shouldClose {
 		h.state = stateDefault
