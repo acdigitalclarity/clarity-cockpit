@@ -1,0 +1,630 @@
+// Package clarity: this file reads the tail of a lane's own Claude Code
+// transcript (~/.claude/projects/<encoded>/<session>.jsonl) and turns it
+// into a typed stream of Turn values plus a derived working/waiting/idle/
+// stalled state word - the foundation the cockpit's right pane (Session and
+// Needs-you tabs) reads from. It never scans a whole multi-megabyte
+// transcript: ReadLaneTail seeks to the last maxBytes of the file first, so
+// cost stays bounded no matter how old or long the session is.
+package clarity
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"time"
+)
+
+// Turn kinds.
+const (
+	TurnOwner     = "owner"
+	TurnAssistant = "assistant"
+	TurnTool      = "tool"
+)
+
+// Tool result outcomes.
+const (
+	ResultOK      = "ok"
+	ResultError   = "error"
+	ResultDenied  = "denied"
+	ResultRunning = "running"
+)
+
+// State words ClassifyState produces - the only four the cockpit renders.
+const (
+	StateWorking    = "working"
+	StateWaitingYou = "waiting on you"
+	StateIdle       = "idle"
+	StateStalled    = "stalled"
+)
+
+// DefaultTailMaxBytes is ReadLaneTail's default read window: the last
+// 256 KiB of the transcript, which comfortably covers several turns of a
+// normal working session without paying to scan the whole file.
+const DefaultTailMaxBytes = 256 * 1024
+
+// DefaultTailTurns is ReadLaneTail's default turn count when the caller
+// passes maxTurns <= 0.
+const DefaultTailTurns = 20
+
+// scannerMaxLine bounds a single transcript line's size. A tail read is
+// already bounded to roughly maxBytes total, but one assistant message
+// (embedded thinking signature, a large tool result) can still be a long
+// single line; this keeps that case from panicking bufio.Scanner instead
+// of silently truncating the read window further.
+const scannerMaxLine = 8 * 1024 * 1024
+
+// Turn is one rendered unit of a lane's conversation: an owner message, an
+// assistant prose reply, or one tool call. Kind selects which of the
+// remaining fields apply.
+type Turn struct {
+	Kind     string // owner | assistant | tool
+	At       time.Time
+	Text     string        // owner or assistant prose; thinking is dropped
+	Tool     string        // tool name, Kind == tool only
+	Summary  string        // the tool call's description or first input line
+	Result   string        // ok | error | denied | running, Kind == tool only
+	Duration time.Duration // tool_use -> tool_result gap, where derivable
+}
+
+// LaneTail is ReadLaneTail's result: the lane's derived state plus its last
+// few turns, oldest first.
+type LaneTail struct {
+	Lane           string
+	Transcript     string
+	State          string // working | waiting on you | idle | stalled
+	StateReason    string // one short sentence naming the record and age
+	LastWrite      time.Time
+	LastTurn       time.Time // last TIMESTAMPED record, not necessarily a rendered Turn
+	OpenTurn       bool
+	PendingAgents  int
+	Mode           string
+	Model          string
+	Messages       int
+	TurnDuration   time.Duration
+	Turns          []Turn
+	MalformedLines int // lines that failed to parse as JSON, skipped
+}
+
+// rawRecord is the union of the transcript record fields tail.go relies on,
+// confirmed against a real transcript under
+// /Users/allencoates/.claude/projects/-Users-allencoates-projects-Clarity-sessions-ways-of-working/
+// before this file was written (see the leg's report for the quoted
+// samples). Fields absent on a given record type simply decode to zero
+// values - json.Unmarshal never errors for that reason alone.
+type rawRecord struct {
+	Type                        string      `json:"type"`
+	Subtype                     string      `json:"subtype"`
+	Timestamp                   string      `json:"timestamp"`
+	Mode                        string      `json:"mode"`
+	ToolDenialKind              string      `json:"toolDenialKind"`
+	DurationMs                  int64       `json:"durationMs"`
+	MessageCount                int         `json:"messageCount"`
+	PendingBackgroundAgentCount int         `json:"pendingBackgroundAgentCount"`
+	Message                     *rawMessage `json:"message"`
+}
+
+// rawMessage mirrors the .message block on assistant/user records.
+// Content is left as raw JSON because it is a plain string for an owner
+// turn and an array of content items for everything else (assistant
+// content, or a user record carrying tool_result plumbing).
+type rawMessage struct {
+	Role    string          `json:"role"`
+	Model   string          `json:"model"`
+	Content json.RawMessage `json:"content"`
+}
+
+// rawContentItem is one element of an assistant/user content array: a text
+// block, a tool_use call, or a tool_result reply.
+type rawContentItem struct {
+	Type      string          `json:"type"`
+	Text      string          `json:"text"`
+	ID        string          `json:"id"`          // tool_use
+	Name      string          `json:"name"`        // tool_use
+	Input     json.RawMessage `json:"input"`       // tool_use
+	ToolUseID string          `json:"tool_use_id"` // tool_result
+	IsError   bool            `json:"is_error"`    // tool_result
+}
+
+// untimestampedBookkeepingTypes are the record types ClassifyState's
+// backward walk steps past, verified on 2 Sep against five live lanes by
+// the design leg (DECISIONS.md, slice 1). A record of one of these types is
+// never the anchor ClassifyState reads its age from, even on the rare
+// occasion it happens to carry its own timestamp field (pr-link and
+// queue-operation both do, in practice) - the rule is by type, not by
+// field presence, so it never depends on that detail staying true.
+var untimestampedBookkeepingTypes = map[string]bool{
+	"artifact-autoreact-ledger": true,
+	"artifact-comment-monitor":  true,
+	"mode":                      true,
+	"custom-title":              true,
+	"agent-name":                true,
+	"last-prompt":               true,
+	"atis-latch":                true,
+	"pr-link":                   true,
+	"file-history-snapshot":     true,
+	"queue-operation":           true,
+}
+
+// TranscriptForLane resolves the transcript path for a lane name, reusing
+// this package's existing discovery rather than re-deriving it: first the
+// live external-lane scan (discover.go), which already finds a session
+// lane like "ways-of-working" under its encoded "sessions-" name, then a
+// direct lookup under the Clarity sessions root for a lane that exists but
+// is not currently live enough to appear in the external scan.
+func TranscriptForLane(lane string) (string, error) {
+	if external, err := DiscoverExternalLanes(nil); err == nil {
+		for _, ext := range external {
+			if MatchesQueriedLane(ext, lane) {
+				return ext.TranscriptPath, nil
+			}
+		}
+	}
+	if lanePath, err := ResolveExistingLaneDir(lane); err == nil {
+		if path, ok := NewestTranscript(lanePath); ok {
+			return path, nil
+		}
+	}
+	return "", fmt.Errorf("no live or resolvable transcript found for lane %q", lane)
+}
+
+// ReadLaneTail reads the last maxBytes (default DefaultTailMaxBytes) of
+// transcriptPath, parsing forward line by line as JSON from the seek
+// point. The first line after a mid-file seek is always a partial line
+// straddling the cut and is discarded before parsing, never counted as
+// malformed. Any other line that fails to parse as JSON is skipped and
+// counted in MalformedLines. maxTurns <= 0 uses DefaultTailTurns.
+func ReadLaneTail(transcriptPath string, maxBytes int, maxTurns int, now time.Time) (LaneTail, error) {
+	if maxBytes <= 0 {
+		maxBytes = DefaultTailMaxBytes
+	}
+	if maxTurns <= 0 {
+		maxTurns = DefaultTailTurns
+	}
+
+	f, err := os.Open(transcriptPath)
+	if err != nil {
+		return LaneTail{}, err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return LaneTail{}, err
+	}
+
+	truncated := info.Size() > int64(maxBytes)
+	if truncated {
+		if _, err := f.Seek(info.Size()-int64(maxBytes), io.SeekStart); err != nil {
+			return LaneTail{}, err
+		}
+	}
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), scannerMaxLine)
+
+	var records []rawRecord
+	malformed := 0
+	discardNext := truncated
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if discardNext {
+			discardNext = false
+			continue
+		}
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var rec rawRecord
+		if err := json.Unmarshal(line, &rec); err != nil {
+			malformed++
+			continue
+		}
+		records = append(records, rec)
+	}
+	if err := scanner.Err(); err != nil {
+		return LaneTail{}, err
+	}
+
+	state := ClassifyState(records, now)
+	mode, model, messages := deriveMeta(records)
+
+	return LaneTail{
+		Transcript:     transcriptPath,
+		State:          state.State,
+		StateReason:    state.Reason,
+		LastWrite:      info.ModTime(),
+		LastTurn:       state.LastTurn,
+		OpenTurn:       state.OpenTurn,
+		PendingAgents:  state.PendingAgents,
+		Mode:           mode,
+		Model:          model,
+		Messages:       messages,
+		TurnDuration:   state.TurnDuration,
+		Turns:          buildTurns(records, maxTurns),
+		MalformedLines: malformed,
+	}, nil
+}
+
+// stateResult is ClassifyState's return value.
+type stateResult struct {
+	State         string
+	Reason        string
+	LastTurn      time.Time
+	OpenTurn      bool
+	PendingAgents int
+	TurnDuration  time.Duration
+}
+
+// ClassifyState applies the state rule ruled by the design leg (2 Sep,
+// DECISIONS.md slice 1) EXACTLY: walk backwards past
+// untimestampedBookkeepingTypes to the last timestamped record. If it is
+// type system/turn_duration the turn is CLOSED: pendingBackgroundAgentCount
+// > 0 -> working; closed under 30 minutes ago -> "waiting on you";
+// otherwise -> idle. Any other record type is an OPEN turn: written within
+// 10 minutes -> working (the rule's "within 3" and "3 to 10" bands both
+// resolve to the same word); over 10 minutes -> stalled.
+func ClassifyState(records []rawRecord, now time.Time) stateResult {
+	anchor, ok := lastTimestampedRecord(records)
+	if !ok {
+		return stateResult{State: StateIdle, Reason: "no timestamped record found in the tail window"}
+	}
+	anchorAt, err := parseTimestamp(anchor.Timestamp)
+	if err != nil {
+		return stateResult{State: StateIdle, Reason: "no timestamped record found in the tail window"}
+	}
+	age := now.Sub(anchorAt)
+
+	if anchor.Type == "system" && anchor.Subtype == "turn_duration" {
+		duration := time.Duration(anchor.DurationMs) * time.Millisecond
+		pending := anchor.PendingBackgroundAgentCount
+		switch {
+		case pending > 0:
+			return stateResult{
+				State:         StateWorking,
+				Reason:        fmt.Sprintf("turn closed %s ago with %d background agent(s) still pending", roundAge(age), pending),
+				LastTurn:      anchorAt,
+				PendingAgents: pending,
+				TurnDuration:  duration,
+			}
+		case age < 30*time.Minute:
+			return stateResult{
+				State:        StateWaitingYou,
+				Reason:       fmt.Sprintf("turn closed %s ago, no pending agents", roundAge(age)),
+				LastTurn:     anchorAt,
+				TurnDuration: duration,
+			}
+		default:
+			return stateResult{
+				State:        StateIdle,
+				Reason:       fmt.Sprintf("turn closed %s ago", roundAge(age)),
+				LastTurn:     anchorAt,
+				TurnDuration: duration,
+			}
+		}
+	}
+
+	if age <= 10*time.Minute {
+		return stateResult{
+			State:    StateWorking,
+			Reason:   fmt.Sprintf("open turn last written %s ago", roundAge(age)),
+			LastTurn: anchorAt,
+			OpenTurn: true,
+		}
+	}
+	return stateResult{
+		State:    StateStalled,
+		Reason:   fmt.Sprintf("open turn last written %s ago, over 10m with no close", roundAge(age)),
+		LastTurn: anchorAt,
+		OpenTurn: true,
+	}
+}
+
+// lastTimestampedRecord walks records backward, skipping any record of an
+// untimestampedBookkeepingTypes type or one that carries no parseable
+// timestamp, and returns the first (i.e. chronologically last) one found.
+func lastTimestampedRecord(records []rawRecord) (rawRecord, bool) {
+	for i := len(records) - 1; i >= 0; i-- {
+		r := records[i]
+		if untimestampedBookkeepingTypes[r.Type] {
+			continue
+		}
+		if r.Type == "system" && r.Subtype != "turn_duration" {
+			// away_summary, stop_hook_summary, local_command: harness notes,
+			// not conversation; they never open or close a turn.
+			continue
+		}
+		if strings.TrimSpace(r.Timestamp) == "" {
+			continue
+		}
+		if _, err := parseTimestamp(r.Timestamp); err != nil {
+			continue
+		}
+		return r, true
+	}
+	return rawRecord{}, false
+}
+
+// parseTimestamp parses a transcript record's timestamp field, which is
+// always RFC 3339 with a "Z" suffix and millisecond fraction in practice
+// (e.g. "2026-09-02T18:34:33.207Z") - RFC3339Nano accepts that fraction
+// being present or absent.
+func parseTimestamp(s string) (time.Time, error) {
+	return time.Parse(time.RFC3339Nano, s)
+}
+
+// roundAge renders a duration the way the header line's reason wants it:
+// whole seconds under a minute, whole minutes under an hour, hours and
+// minutes beyond that.
+func roundAge(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	d = d.Round(time.Second)
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	default:
+		h := int(d.Hours())
+		m := int(d.Minutes()) - h*60
+		return fmt.Sprintf("%dh%dm", h, m)
+	}
+}
+
+// deriveMeta scans the whole tail window (not just the classification
+// anchor) for the most recent mode, model and turn_duration message count,
+// so a lane mid-way through an open turn still reports the model and
+// message count its last closed turn established.
+func deriveMeta(records []rawRecord) (mode, model string, messages int) {
+	for _, r := range records {
+		switch {
+		case r.Type == "mode" && r.Mode != "":
+			mode = r.Mode
+		case r.Type == "assistant" && r.Message != nil && r.Message.Model != "":
+			model = r.Message.Model
+		case r.Type == "system" && r.Subtype == "turn_duration":
+			messages = r.MessageCount
+		}
+	}
+	return mode, model, messages
+}
+
+// parseContentItems decodes a message's .content field, which is either a
+// plain string (an owner turn) or an array of content items (assistant
+// prose/tool_use, or a user record's tool_result plumbing - never an owner
+// turn). isString distinguishes the two so a tool_result-only user record
+// is never mistaken for something the owner typed.
+func parseContentItems(raw json.RawMessage) (text string, items []rawContentItem, isString bool) {
+	if len(raw) == 0 {
+		return "", nil, false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s, nil, true
+	}
+	var arr []rawContentItem
+	if err := json.Unmarshal(raw, &arr); err == nil {
+		return "", arr, false
+	}
+	return "", nil, false
+}
+
+// toolOutcome is one tool_result matched back to its tool_use by ID.
+type toolOutcome struct {
+	Result string
+	At     time.Time
+}
+
+// indexToolResults builds a tool_use_id -> outcome map from every
+// tool_result in records, so buildTurns can attach the eventual result to
+// the tool_use call that produced it regardless of how far apart the two
+// records fall. toolDenialKind on the user record marks denied; is_error
+// on the content item marks error; anything else that resolved is ok.
+func indexToolResults(records []rawRecord) map[string]toolOutcome {
+	out := make(map[string]toolOutcome)
+	for _, r := range records {
+		if r.Type != "user" || r.Message == nil {
+			continue
+		}
+		_, items, isString := parseContentItems(r.Message.Content)
+		if isString {
+			continue
+		}
+		at, _ := parseTimestamp(r.Timestamp)
+		for _, item := range items {
+			if item.Type != "tool_result" || item.ToolUseID == "" {
+				continue
+			}
+			result := ResultOK
+			switch {
+			case r.ToolDenialKind != "":
+				result = ResultDenied
+			case item.IsError:
+				result = ResultError
+			}
+			out[item.ToolUseID] = toolOutcome{Result: result, At: at}
+		}
+	}
+	return out
+}
+
+// toolSummary renders a tool_use call's one-line description: the input's
+// "description" field when present (Bash and most other tools carry one),
+// otherwise the input's own compact JSON as a fallback first line.
+func toolSummary(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err == nil {
+		if descRaw, ok := fields["description"]; ok {
+			var desc string
+			if json.Unmarshal(descRaw, &desc) == nil && desc != "" {
+				return firstLine(desc)
+			}
+		}
+	}
+	return firstLine(string(raw))
+}
+
+// firstLine returns s's first line, trimmed.
+func firstLine(s string) string {
+	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
+		s = s[:idx]
+	}
+	return strings.TrimSpace(s)
+}
+
+// buildTurns walks records in file order (oldest first) and renders each
+// owner message, assistant text block and tool_use call as one Turn,
+// dropping thinking blocks and tool_result plumbing (the latter is folded
+// into its matching tool_use Turn via indexToolResults instead of
+// rendering as its own row). The result is trimmed to the last maxTurns.
+func buildTurns(records []rawRecord, maxTurns int) []Turn {
+	outcomes := indexToolResults(records)
+	var turns []Turn
+	for _, r := range records {
+		if r.Message == nil {
+			continue
+		}
+		at, _ := parseTimestamp(r.Timestamp)
+
+		switch r.Type {
+		case "user":
+			text, _, isString := parseContentItems(r.Message.Content)
+			if isString {
+				turns = append(turns, Turn{Kind: TurnOwner, At: at, Text: text})
+			}
+
+		case "assistant":
+			_, items, _ := parseContentItems(r.Message.Content)
+			for _, item := range items {
+				switch item.Type {
+				case "text":
+					turns = append(turns, Turn{Kind: TurnAssistant, At: at, Text: item.Text})
+				case "tool_use":
+					turn := Turn{
+						Kind:    TurnTool,
+						At:      at,
+						Tool:    item.Name,
+						Summary: toolSummary(item.Input),
+						Result:  ResultRunning,
+					}
+					if outcome, ok := outcomes[item.ID]; ok {
+						turn.Result = outcome.Result
+						if !at.IsZero() && !outcome.At.IsZero() && outcome.At.After(at) {
+							turn.Duration = outcome.At.Sub(at)
+						}
+					}
+					turns = append(turns, turn)
+				}
+			}
+		}
+	}
+
+	if maxTurns > 0 && len(turns) > maxTurns {
+		turns = turns[len(turns)-maxTurns:]
+	}
+	return turns
+}
+
+// turnLabel renders a Turn's kind as the fixed prefix the header/turn line
+// format uses: YOU, CLAUDE, or the tool marker "▪ <tool>".
+func turnLabel(t Turn) string {
+	switch t.Kind {
+	case TurnOwner:
+		return "YOU"
+	case TurnAssistant:
+		return "CLAUDE"
+	case TurnTool:
+		return "▪ " + t.Tool
+	default:
+		return t.Kind
+	}
+}
+
+// turnBody returns the text a turn line renders: prose for owner/assistant,
+// the tool call's summary for a tool turn.
+func turnBody(t Turn) string {
+	if t.Kind == TurnTool {
+		return t.Summary
+	}
+	return t.Text
+}
+
+// collapseWhitespace folds any run of whitespace (including newlines) into
+// a single space, so multi-line prose renders as one wrappable line.
+func collapseWhitespace(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// wrapWords greedily wraps words into lines no wider than width (a single
+// word longer than width still gets its own line, unbroken).
+func wrapWords(s string, width int) []string {
+	words := strings.Fields(s)
+	if len(words) == 0 {
+		return nil
+	}
+	lines := make([]string, 0, 4)
+	cur := words[0]
+	for _, w := range words[1:] {
+		if len(cur)+1+len(w) > width {
+			lines = append(lines, cur)
+			cur = w
+		} else {
+			cur += " " + w
+		}
+	}
+	return append(lines, cur)
+}
+
+// RenderHeaderLine renders a LaneTail's header line: "<lane>  <state>  last
+// turn <hh:mm:ss>  last write <hh:mm:ss>  <reason>" - lane is passed
+// separately from lt.Lane so a caller can print the bare name the owner
+// typed even when lt.Lane carries the encoded discovery form.
+func RenderHeaderLine(lane string, lt LaneTail) string {
+	return fmt.Sprintf("%s  %s  last turn %s  last write %s  %s",
+		lane, lt.State, lt.LastTurn.Format("15:04:05"), lt.LastWrite.Format("15:04:05"), lt.StateReason)
+}
+
+// RenderTurnLines renders one Turn as "hh:mm:ss  YOU|CLAUDE|▪ <tool>  <text
+// or summary>  [<result> <duration>]", word-wrapped to width columns with
+// continuation lines hanging-indented under the text column.
+func RenderTurnLines(t Turn, width int) []string {
+	label := turnLabel(t)
+	prefix := fmt.Sprintf("%s  %s  ", t.At.Format("15:04:05"), label)
+
+	body := collapseWhitespace(turnBody(t))
+	if t.Kind == TurnTool {
+		result := t.Result
+		if t.Duration > 0 {
+			result = fmt.Sprintf("%s %s", result, t.Duration.Round(time.Second))
+		}
+		body = strings.TrimSpace(body + fmt.Sprintf("  [%s]", result))
+	}
+
+	avail := width - len(prefix)
+	if avail < 20 {
+		avail = 20
+	}
+	wrapped := wrapWords(body, avail)
+	if len(wrapped) == 0 {
+		return []string{strings.TrimRight(prefix, " ")}
+	}
+
+	indent := strings.Repeat(" ", len(prefix))
+	lines := make([]string, len(wrapped))
+	for i, w := range wrapped {
+		if i == 0 {
+			lines[i] = prefix + w
+		} else {
+			lines[i] = indent + w
+		}
+	}
+	return lines
+}

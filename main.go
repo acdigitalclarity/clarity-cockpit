@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -302,6 +303,57 @@ var (
 	// caller sees it landed. A lane with no tracked tmux session (an
 	// external row - see discoverCmd) gets the fixed UNCONSTRUCTED line
 	// instead of a silently dropped or fabricated delivery.
+	laneTailTurnsFlag int
+	laneTailJSONFlag  bool
+
+	// laneTailCmd is a Digital Clarity workspace enhancement (not upstream).
+	// It prints a lane's transcript tail and the working/waiting on you/idle/
+	// stalled state word the cockpit's right pane reads (session/clarity/
+	// tail.go; design/cockpit-pane/DECISIONS.md slice 1). It resolves the
+	// lane the same way discoverCmd and msgCmd do - a live external lane
+	// first, then a Clarity session lane on disk - so it never disagrees
+	// with `cs-clarity discover` about which transcript it read.
+	laneTailCmd = &cobra.Command{
+		Use:   "lane-tail <lane>",
+		Short: "Print a lane's transcript tail and its derived state word",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			log.Initialize(false)
+			defer log.Close()
+
+			lane := args[0]
+			transcriptPath, err := clarity.TranscriptForLane(lane)
+			if err != nil {
+				fmt.Printf("lane-tail: no transcript for %q: %v\n", lane, err)
+				os.Exit(1)
+			}
+
+			tail, err := clarity.ReadLaneTail(transcriptPath, clarity.DefaultTailMaxBytes, laneTailTurnsFlag, time.Now())
+			if err != nil {
+				fmt.Printf("lane-tail: could not read %s: %v\n", transcriptPath, err)
+				os.Exit(1)
+			}
+			tail.Lane = lane
+
+			if laneTailJSONFlag {
+				enc, err := json.MarshalIndent(tail, "", "  ")
+				if err != nil {
+					return fmt.Errorf("failed to marshal lane tail for %q: %w", lane, err)
+				}
+				fmt.Println(string(enc))
+				return nil
+			}
+
+			fmt.Println(clarity.RenderHeaderLine(lane, tail))
+			for _, turn := range tail.Turns {
+				for _, line := range clarity.RenderTurnLines(turn, 100) {
+					fmt.Println(line)
+				}
+			}
+			return nil
+		},
+	}
+
 	msgCmd = &cobra.Command{
 		Use:   "msg <lane> <text>",
 		Short: "Send one line of text into a lane's live prompt, and print back the line that landed",
@@ -376,12 +428,18 @@ func init() {
 	clarityAttachCmd.Flags().StringVarP(&programFlag, "program", "p", "",
 		"Program to run in the attached instance (e.g. 'aider --model ollama_chat/gemma3:1b')")
 
+	laneTailCmd.Flags().IntVar(&laneTailTurnsFlag, "turns", clarity.DefaultTailTurns,
+		"Number of trailing turns to print")
+	laneTailCmd.Flags().BoolVar(&laneTailJSONFlag, "json", false,
+		"Print the full LaneTail as JSON instead of the header and turn lines")
+
 	rootCmd.AddCommand(debugCmd)
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(resetCmd)
 	rootCmd.AddCommand(clarityAttachCmd)
 	rootCmd.AddCommand(discoverCmd)
 	rootCmd.AddCommand(msgCmd)
+	rootCmd.AddCommand(laneTailCmd)
 }
 
 func main() {
