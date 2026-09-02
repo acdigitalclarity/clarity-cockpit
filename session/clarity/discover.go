@@ -12,6 +12,9 @@
 package clarity
 
 import (
+	"bufio"
+	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
@@ -33,6 +36,16 @@ type ExternalLane struct {
 	LastWrite      time.Time
 	Fill           Fill
 	FillOK         bool
+
+	// State, LastTurn and StateOK are the lane's clarity.ReadLaneTail
+	// classification (working/waiting on you/idle/stalled) - populated by
+	// the caller (app.go's feedTickMsg handler, via a LaneTailCache) on the
+	// same tick as Fill above, never by DiscoverExternalLanes itself, so a
+	// plain CLI caller (cs-clarity discover) that has no cache still works
+	// exactly as before with these left at their zero values.
+	State    string
+	LastTurn time.Time
+	StateOK  bool
 }
 
 // externalTranscriptRow is the pre-dedupe intermediate the discovery loop
@@ -41,6 +54,7 @@ type externalTranscriptRow struct {
 	lane string
 	path string
 	mod  time.Time
+	cwd  string // "" when the transcript's own cwd field could not be read
 }
 
 // laneNameFromTranscriptDir mirrors fleet_dashboard.py's lane derivation
@@ -56,47 +70,95 @@ func laneNameFromTranscriptDir(dir string) string {
 	return lane
 }
 
-// TrackedExclusionNames returns every external-lane name a tracked Claude
-// Squad instance titled `title` could plausibly correspond to, for building
-// the excludeTitles set DiscoverExternalLanes takes. A clarity-attach
-// instance's Title is the bare Clarity session lane name (e.g.
-// "ways-of-working"), but that same lane's transcript directory encodes its
-// full path under sessions/ - so laneNameFromTranscriptDir derives
-// "sessions-ways-of-working" for it, not the bare title (fleet_dashboard.py
-// keeps that "sessions-"/"repos-"/etc. prefix deliberately, to disambiguate
-// what kind of directory a lane lives in across the whole ecosystem - see
-// this file's doc comment). Without this, every already-tracked Clarity
-// session lane would ALSO show up as its own external row the moment it
-// went live, which is exactly the double-listing the brief's "never also
-// shown as an external row" requirement rules out. This covers the
-// Clarity-session-lane case (clarity new/open via clarity-attach); a
-// tracked instance backed by an ordinary git worktree elsewhere in the
-// ecosystem is a known gap this does not close.
-func TrackedExclusionNames(title string) []string {
-	return []string{title, "sessions-" + title}
+// TrackedExclusionPaths builds the excludeDirs set DiscoverExternalLanes
+// takes, from the working-directory paths of every tracked Claude Squad
+// instance (session.Instance.Path). Matching by path rather than by any
+// name derived from a transcript directory's encoding is the DEDUPE
+// defect's root-cause fix (board fit gate, 2 Sep): a tracked instance
+// titled "andy.e-bid" and its transcript directory
+// "...-sessions-andy-e-bid" disagree on whether the dot survives encoding,
+// so a name-derived exclusion set silently missed it while the lane's own
+// working directory - recorded verbatim in the transcript's "cwd" field -
+// never does. filepath.Clean normalises a trailing slash; an empty path is
+// skipped rather than excluding every lane with an empty cwd.
+func TrackedExclusionPaths(paths []string) map[string]bool {
+	out := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		out[filepath.Clean(p)] = true
+	}
+	return out
 }
 
 // MatchesQueriedLane reports whether ext is the lane a caller meant by
 // queried - either the exact discovered name, or queried with the same
 // "sessions-" prefix DiscoverExternalLanes' names carry for anything under
-// the Clarity sessions/ tree (see TrackedExclusionNames). This lets `cs-
-// clarity msg <lane> ...` and the bash `clarity msg <lane> ...` wrapper
-// accept the same bare lane name a human uses everywhere else in this
-// ecosystem (clarity attach <lane>, sessions/<lane>/), rather than forcing
-// the fleet_dashboard.py-style "sessions-<lane>" form onto the command line.
+// the Clarity sessions/ tree. This lets `cs-clarity msg <lane> ...` and the
+// bash `clarity msg <lane> ...` wrapper accept the same bare lane name a
+// human uses everywhere else in this ecosystem (clarity attach <lane>,
+// sessions/<lane>/), rather than forcing the fleet_dashboard.py-style
+// "sessions-<lane>" form onto the command line.
 func MatchesQueriedLane(ext ExternalLane, queried string) bool {
 	return ext.Name == queried || ext.Name == "sessions-"+queried
+}
+
+// cwdScanMaxLines and cwdScanMaxBytes bound readTranscriptCwd's forward
+// scan: a real transcript's "cwd" field appears on its first user/
+// assistant/system/attachment record, observed within the first ~50 lines
+// in practice (confirmed against a live transcript before this file was
+// written) - these budgets are comfortably wider than that without paying
+// to scan a whole multi-megabyte transcript when no cwd is ever found.
+const cwdScanMaxLines = 500
+const cwdScanMaxBytes = 256 * 1024
+
+// readTranscriptCwd reads forward from the start of transcriptPath looking
+// for the first record carrying a non-empty top-level "cwd" field - the
+// lane's actual working directory, exactly as Claude Code recorded it, and
+// so immune to any directory-name-encoding mismatch (see
+// TrackedExclusionPaths). ok is false when no such record turns up inside
+// the scan budget.
+func readTranscriptCwd(transcriptPath string) (cwd string, ok bool) {
+	f, err := os.Open(transcriptPath)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), scannerMaxLine)
+
+	read := 0
+	for line := 0; scanner.Scan() && line < cwdScanMaxLines && read < cwdScanMaxBytes; line++ {
+		b := scanner.Bytes()
+		read += len(b) + 1
+		if len(bytes.TrimSpace(b)) == 0 {
+			continue
+		}
+		var rec struct {
+			Cwd string `json:"cwd"`
+		}
+		if err := json.Unmarshal(b, &rec); err != nil {
+			continue
+		}
+		if rec.Cwd != "" {
+			return rec.Cwd, true
+		}
+	}
+	return "", false
 }
 
 // DiscoverExternalLanes derives the list of live external lanes: every
 // ~/.claude/projects/<encoded>/*.jsonl transcript whose mtime is within
 // ExternalLiveWindow, minus any path containing "memory", minus any lane
-// name starting with "subagents", minus any lane name already present in
-// excludeTitles (a lane Claude Squad already tracks as an instance is never
-// ALSO shown as an external row) - collapsed to the single newest
-// transcript per lane name, sorted newest-first. A nil or empty
-// excludeTitles is valid (no exclusions).
-func DiscoverExternalLanes(excludeTitles map[string]bool) ([]ExternalLane, error) {
+// name starting with "subagents", minus any lane whose transcript's own
+// "cwd" field is already present in excludeDirs (see TrackedExclusionPaths
+// - a lane Claude Squad already tracks as an instance is never ALSO shown
+// as an external row) - collapsed to the single newest transcript per lane
+// name, sorted newest-first. A nil or empty excludeDirs is valid (no
+// exclusions).
+func DiscoverExternalLanes(excludeDirs map[string]bool) ([]ExternalLane, error) {
 	pattern := filepath.Join(claudeProjectsRoot(), "*", "*.jsonl")
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
@@ -135,7 +197,7 @@ func DiscoverExternalLanes(excludeTitles map[string]bool) ([]ExternalLane, error
 			continue
 		}
 		seen[r.lane] = true
-		if excludeTitles[r.lane] {
+		if cwd, ok := readTranscriptCwd(r.path); ok && excludeDirs[filepath.Clean(cwd)] {
 			continue
 		}
 		fill, ok := ReadFill(r.path, "")
