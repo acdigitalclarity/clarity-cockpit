@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // FeedQueuePathEnvVar overrides the default queue file path. Set only for
@@ -199,4 +200,83 @@ func NeedsYou(path string, n int) []string {
 		lines = append(lines, FeedLine(item))
 	}
 	return lines
+}
+
+// builtLinePrefix is the literal prefix scripts/fleet_queue_build.py writes
+// as FLEET-QUEUE.md's first line: "built: <ISO time> source: board+lanes"
+// (board #280). ParseQueueMarkdown above already skips this line when
+// parsing rows - it does not start with "|" - so no change was needed there;
+// this half reads it back out on its own.
+const builtLinePrefix = "built: "
+
+// builtLineSourceSep marks where the ISO timestamp ends and the "source:"
+// tag begins on the built: line.
+const builtLineSourceSep = " source:"
+
+// StaleAfter is how old the built: timestamp may be before the feed reports
+// itself stale. The builder's timer fires every 5 minutes
+// (docs/ops/launchd/com.digitalclarity.fleet-queue.plist), so 10 minutes is
+// two missed ticks, not one - a single slow tick is not yet a problem worth
+// surfacing.
+const StaleAfter = 10 * time.Minute
+
+// ParseBuiltAt extracts the ISO-8601 (RFC 3339) timestamp from a
+// FLEET-QUEUE.md's first line. Returns ok=false when the line is absent,
+// does not carry the "built: " prefix, or does not parse as a timestamp -
+// a hand-edited or legacy queue file (no builder timestamp) reports the
+// same "line absent" state as a genuinely missing file, so the caller never
+// has to special-case which.
+func ParseBuiltAt(data []byte) (t time.Time, ok bool) {
+	first := string(data)
+	if nl := strings.IndexByte(first, '\n'); nl >= 0 {
+		first = first[:nl]
+	}
+	first = strings.TrimSpace(first)
+	if !strings.HasPrefix(first, builtLinePrefix) {
+		return time.Time{}, false
+	}
+	rest := strings.TrimPrefix(first, builtLinePrefix)
+	tsStr := rest
+	if idx := strings.Index(rest, builtLineSourceSep); idx >= 0 {
+		tsStr = rest[:idx]
+	}
+	tsStr = strings.TrimSpace(tsStr)
+	parsed, err := time.Parse(time.RFC3339, tsStr)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return parsed, true
+}
+
+// FeedHeaderStatus reports the "Needs you" section's age qualifier against
+// `now`: "" when the queue's built: timestamp is fresh (within StaleAfter),
+// "STALE <N>m" when it is older, "UNCONSTRUCTED" when the queue file is
+// missing or carries no built: line at all (never machinery-built, or a
+// read error other than not-exist).
+func FeedHeaderStatus(path string, now time.Time) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "UNCONSTRUCTED"
+	}
+	builtAt, ok := ParseBuiltAt(data)
+	if !ok {
+		return "UNCONSTRUCTED"
+	}
+	age := now.Sub(builtAt)
+	if age > StaleAfter {
+		return fmt.Sprintf("STALE %dm", int(age.Minutes()))
+	}
+	return ""
+}
+
+// NeedsYouTitle renders the "Needs you" section title with its age
+// qualifier appended in parentheses when the feed is not fresh:
+// "Needs you (STALE 23m)" / "Needs you (UNCONSTRUCTED)" / plain
+// "Needs you" when the last build is within StaleAfter.
+func NeedsYouTitle(path string, now time.Time) string {
+	status := FeedHeaderStatus(path, now)
+	if status == "" {
+		return "Needs you"
+	}
+	return fmt.Sprintf("Needs you (%s)", status)
 }

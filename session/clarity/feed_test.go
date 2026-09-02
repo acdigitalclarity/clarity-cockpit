@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -121,4 +122,80 @@ func TestNeedsYou_EmptyQueueIsNotAnEmptySlice(t *testing.T) {
 func TestDefaultFeedPath_EnvOverride(t *testing.T) {
 	t.Setenv(FeedQueuePathEnvVar, "/tmp/custom-queue.md")
 	require.Equal(t, "/tmp/custom-queue.md", DefaultFeedPath())
+}
+
+// --- built: line age (board #280) -------------------------------------
+
+func TestParseBuiltAt_ValidLine(t *testing.T) {
+	data := []byte("built: 2026-09-02T15:10:41Z source: board+lanes\n" + sampleQueue)
+	got, ok := ParseBuiltAt(data)
+	require.True(t, ok)
+	require.True(t, got.Equal(time.Date(2026, 9, 2, 15, 10, 41, 0, time.UTC)))
+}
+
+func TestParseBuiltAt_LineAbsentReturnsNotOK(t *testing.T) {
+	_, ok := ParseBuiltAt([]byte(sampleQueue)) // legacy queue, no built: line
+	require.False(t, ok)
+}
+
+func TestParseBuiltAt_UnparseableTimestampReturnsNotOK(t *testing.T) {
+	data := []byte("built: not-a-timestamp source: board+lanes\n" + sampleQueue)
+	_, ok := ParseBuiltAt(data)
+	require.False(t, ok)
+}
+
+func TestFeedHeaderStatus_FreshWithinTenMinutesIsBlank(t *testing.T) {
+	now := time.Date(2026, 9, 2, 15, 20, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "FLEET-QUEUE.md")
+	require.NoError(t, os.WriteFile(path,
+		[]byte("built: 2026-09-02T15:13:00Z source: board+lanes\n"+sampleQueue), 0644))
+
+	require.Equal(t, "", FeedHeaderStatus(path, now), "7 minutes old is inside StaleAfter")
+}
+
+// STALE state: built: line present but older than 10 minutes.
+func TestFeedHeaderStatus_StaleAfterTenMinutes(t *testing.T) {
+	now := time.Date(2026, 9, 2, 15, 33, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "FLEET-QUEUE.md")
+	require.NoError(t, os.WriteFile(path,
+		[]byte("built: 2026-09-02T15:10:00Z source: board+lanes\n"+sampleQueue), 0644))
+
+	require.Equal(t, "STALE 23m", FeedHeaderStatus(path, now))
+}
+
+// UNCONSTRUCTED state, absent-file variant: the queue was never built.
+func TestFeedHeaderStatus_UnconstructedOnMissingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "does-not-exist.md")
+	require.Equal(t, "UNCONSTRUCTED", FeedHeaderStatus(path, time.Now()))
+}
+
+// UNCONSTRUCTED state, no-built-line variant: a legacy/hand-edited queue.
+func TestFeedHeaderStatus_UnconstructedOnMissingBuiltLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "FLEET-QUEUE.md")
+	require.NoError(t, os.WriteFile(path, []byte(sampleQueue), 0644))
+
+	require.Equal(t, "UNCONSTRUCTED", FeedHeaderStatus(path, time.Now()))
+}
+
+func TestNeedsYouTitle_Fresh(t *testing.T) {
+	now := time.Date(2026, 9, 2, 15, 20, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "FLEET-QUEUE.md")
+	require.NoError(t, os.WriteFile(path,
+		[]byte("built: 2026-09-02T15:18:00Z source: board+lanes\n"+sampleQueue), 0644))
+
+	require.Equal(t, "Needs you", NeedsYouTitle(path, now))
+}
+
+func TestNeedsYouTitle_Stale(t *testing.T) {
+	now := time.Date(2026, 9, 2, 15, 33, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "FLEET-QUEUE.md")
+	require.NoError(t, os.WriteFile(path,
+		[]byte("built: 2026-09-02T15:10:00Z source: board+lanes\n"+sampleQueue), 0644))
+
+	require.Equal(t, "Needs you (STALE 23m)", NeedsYouTitle(path, now))
+}
+
+func TestNeedsYouTitle_Unconstructed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "does-not-exist.md")
+	require.Equal(t, "Needs you (UNCONSTRUCTED)", NeedsYouTitle(path, time.Now()))
 }
