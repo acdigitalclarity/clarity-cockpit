@@ -32,6 +32,11 @@ const (
 	// Reorder keybindings
 	KeyMoveUp
 	KeyMoveDown
+
+	// KeyMsg opens a one-line prompt that sends text into the selected
+	// row's live tmux prompt - a tracked instance or an external (cockpit-
+	// external) lane alike (Digital Clarity workspace enhancement).
+	KeyMsg
 )
 
 // GlobalKeyStringsMap is a global, immutable map string to keybinding.
@@ -55,6 +60,7 @@ var GlobalKeyStringsMap = map[string]KeyName{
 	"r":          KeyResume,
 	"p":          KeySubmit,
 	"?":          KeyHelp,
+	"m":          KeyMsg,
 }
 
 // GlobalkeyBindings is a global, immutable map of KeyName tot keybinding.
@@ -123,6 +129,10 @@ var GlobalkeyBindings = map[KeyName]key.Binding{
 	KeyMoveDown: key.NewBinding(
 		key.WithKeys("J"),
 		key.WithHelp("J", "move down"),
+	),
+	KeyMsg: key.NewBinding(
+		key.WithKeys("m"),
+		key.WithHelp("m", "message"),
 	),
 
 	// -- Special keybindings --
