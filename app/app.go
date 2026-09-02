@@ -374,6 +374,16 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tickUpdateMetadataCmd(m.snapshotActiveInstances(), m.list.GetSelectedInstance())
 	case feedTickMsg:
+		// Adopt any instance the store holds but this process's own list
+		// does not (defect 1's read-side half, see Storage.UntrackedInstances):
+		// a lane clarity-attach registers from outside the running cockpit
+		// (main.go, ~line 215) appears here within one feed tick, no
+		// restart needed. Runs before the external-lane scan below so a
+		// freshly-adopted lane's own transcript is excluded from that scan
+		// on this same tick, not shown as an external row for one tick
+		// first.
+		m.adoptUntrackedInstances()
+
 		if m.laneTailCache == nil {
 			m.laneTailCache = clarity.NewLaneTailCache()
 		}
@@ -1217,6 +1227,35 @@ func runInstanceStartCmd(instance *session.Instance) tea.Cmd {
 	return func() tea.Msg {
 		err := instance.Start(true)
 		return instanceStartDoneMsg{instance: instance, err: err}
+	}
+}
+
+// adoptUntrackedInstances folds any instance present in the store but not
+// yet in this process's own list into m.list - defect 1's read-side half
+// (see session.Storage.UntrackedInstances' doc comment for the write-side
+// merge this pairs with). Called once per feedTickMsg, so a lane the
+// clarity wrapper registers from outside the running cockpit shows up
+// within one feedRefreshInterval, with no restart.
+func (m *home) adoptUntrackedInstances() {
+	if m.storage == nil {
+		// A *home built directly in a test (skipping newHome, see the
+		// laneTailCache field's own doc comment) has no storage to read -
+		// nothing to adopt from.
+		return
+	}
+
+	known := make(map[string]bool, m.list.NumInstances())
+	for _, inst := range m.list.GetInstances() {
+		known[inst.Path] = true
+	}
+
+	adopted, err := m.storage.UntrackedInstances(known)
+	if err != nil {
+		log.WarningLog.Printf("adopt untracked instances: %v", err)
+		return
+	}
+	for _, inst := range adopted {
+		m.list.AddInstance(inst)()
 	}
 }
 

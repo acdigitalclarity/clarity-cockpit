@@ -37,8 +37,27 @@ func TestDiscoverExternalLanes_LiveWithinWindow(t *testing.T) {
 	lanes, err := DiscoverExternalLanes(nil)
 	require.NoError(t, err)
 	require.Len(t, lanes, 1)
-	require.Equal(t, "sessions-fixture-live", lanes[0].Name)
+	require.Equal(t, "fixture-live", lanes[0].Name, "the displayed Name drops the sessions- prefix (defect 3)")
+	require.Equal(t, "sessions-fixture-live", lanes[0].Key, "Key keeps the full form for matching")
 	require.True(t, lanes[0].FillOK)
+}
+
+// TestDiscoverExternalLanes_DropsSessionsPrefixFromDisplayName is defect
+// 3's own reproduction case: a lane whose transcript directory encodes to
+// "sessions-foo-bar" renders as "foo-bar" - the prefix wastes nine columns
+// on every external row and forces truncation that would otherwise not be
+// needed.
+func TestDiscoverExternalLanes_DropsSessionsPrefixFromDisplayName(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(ClaudeProjectsRootEnvVar, root)
+
+	mkTranscriptDir(t, root, "-Users-allencoates-projects-Clarity-sessions-foo-bar", "a.jsonl", time.Minute)
+
+	lanes, err := DiscoverExternalLanes(nil)
+	require.NoError(t, err)
+	require.Len(t, lanes, 1)
+	require.Equal(t, "foo-bar", lanes[0].Name)
+	require.Equal(t, "sessions-foo-bar", lanes[0].Key)
 }
 
 func TestDiscoverExternalLanes_ExcludesOlderThan90Minutes(t *testing.T) {
@@ -167,8 +186,8 @@ func TestDiscoverExternalLanes_SortedNewestFirst(t *testing.T) {
 	lanes, err := DiscoverExternalLanes(nil)
 	require.NoError(t, err)
 	require.Len(t, lanes, 2)
-	require.Equal(t, "sessions-fixture-newer-lane", lanes[0].Name)
-	require.Equal(t, "sessions-fixture-older-lane", lanes[1].Name)
+	require.Equal(t, "fixture-newer-lane", lanes[0].Name)
+	require.Equal(t, "fixture-older-lane", lanes[1].Name)
 }
 
 func TestDiscoverExternalLanes_NoMatches(t *testing.T) {
@@ -204,9 +223,12 @@ func TestDiscoverExternalLanes_ExcludesTrackedPathViaSessionsFolder(t *testing.T
 }
 
 func TestMatchesQueriedLane_BareAndSessionsPrefixed(t *testing.T) {
-	ext := ExternalLane{Name: "sessions-ways-of-working"}
-	require.True(t, MatchesQueriedLane(ext, "ways-of-working"))
-	require.True(t, MatchesQueriedLane(ext, "sessions-ways-of-working"))
+	// The shape DiscoverExternalLanes actually produces: Name stripped of
+	// the "sessions-" prefix for display, Key keeping the full form for
+	// matching (defect 3).
+	ext := ExternalLane{Name: "ways-of-working", Key: "sessions-ways-of-working"}
+	require.True(t, MatchesQueriedLane(ext, "ways-of-working"), "the displayed (stripped) Name must still match")
+	require.True(t, MatchesQueriedLane(ext, "sessions-ways-of-working"), "the full Key must still match")
 	require.False(t, MatchesQueriedLane(ext, "some-other-lane"))
 }
 
