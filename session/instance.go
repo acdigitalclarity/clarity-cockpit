@@ -52,6 +52,11 @@ type Instance struct {
 	AutoYes bool
 	// Prompt is the initial prompt to pass to the instance on startup
 	Prompt string
+	// NoWorktree is true for instances that run directly in Path with no git
+	// worktree of their own (e.g. clarity-attach, which points at a Clarity
+	// session lane's own working directory). Such instances have no branch,
+	// no diff, and cannot be paused/resumed/pushed/checked out.
+	NoWorktree bool
 
 	// DiffStats stores the current git diff statistics
 	diffStats *git.DiffStats
@@ -71,16 +76,17 @@ type Instance struct {
 // ToInstanceData converts an Instance to its serializable form
 func (i *Instance) ToInstanceData() InstanceData {
 	data := InstanceData{
-		Title:     i.Title,
-		Path:      i.Path,
-		Branch:    i.Branch,
-		Status:    i.Status,
-		Height:    i.Height,
-		Width:     i.Width,
-		CreatedAt: i.CreatedAt,
-		UpdatedAt: time.Now(),
-		Program:   i.Program,
-		AutoYes:   i.AutoYes,
+		Title:      i.Title,
+		Path:       i.Path,
+		Branch:     i.Branch,
+		Status:     i.Status,
+		Height:     i.Height,
+		Width:      i.Width,
+		CreatedAt:  i.CreatedAt,
+		UpdatedAt:  time.Now(),
+		Program:    i.Program,
+		AutoYes:    i.AutoYes,
+		NoWorktree: i.NoWorktree,
 	}
 
 	// Only include worktree data if gitWorktree is initialized
@@ -110,28 +116,35 @@ func (i *Instance) ToInstanceData() InstanceData {
 // FromInstanceData creates a new Instance from serialized data
 func FromInstanceData(data InstanceData) (*Instance, error) {
 	instance := &Instance{
-		Title:     data.Title,
-		Path:      data.Path,
-		Branch:    data.Branch,
-		Status:    data.Status,
-		Height:    data.Height,
-		Width:     data.Width,
-		CreatedAt: data.CreatedAt,
-		UpdatedAt: data.UpdatedAt,
-		Program:   data.Program,
-		gitWorktree: git.NewGitWorktreeFromStorage(
+		Title:      data.Title,
+		Path:       data.Path,
+		Branch:     data.Branch,
+		Status:     data.Status,
+		Height:     data.Height,
+		Width:      data.Width,
+		CreatedAt:  data.CreatedAt,
+		UpdatedAt:  data.UpdatedAt,
+		Program:    data.Program,
+		NoWorktree: data.NoWorktree,
+		diffStats: &git.DiffStats{
+			Added:   data.DiffStats.Added,
+			Removed: data.DiffStats.Removed,
+			Content: data.DiffStats.Content,
+		},
+	}
+
+	// A NoWorktree instance (e.g. clarity-attach) has no git worktree to
+	// reconstruct - it runs directly in Path, which is not managed by git
+	// worktree add/remove at all.
+	if !data.NoWorktree {
+		instance.gitWorktree = git.NewGitWorktreeFromStorage(
 			data.Worktree.RepoPath,
 			data.Worktree.WorktreePath,
 			data.Worktree.SessionName,
 			data.Worktree.BranchName,
 			data.Worktree.BaseCommitSHA,
 			data.Worktree.IsExistingBranch,
-		),
-		diffStats: &git.DiffStats{
-			Added:   data.DiffStats.Added,
-			Removed: data.DiffStats.Removed,
-			Content: data.DiffStats.Content,
-		},
+		)
 	}
 
 	if instance.Paused() {
@@ -158,6 +171,9 @@ type InstanceOptions struct {
 	AutoYes bool
 	// Branch is an existing branch name to start the session on (empty = new branch from HEAD)
 	Branch string
+	// NoWorktree is true for instances that run directly in Path with no git
+	// worktree of their own. See Instance.NoWorktree.
+	NoWorktree bool
 }
 
 func NewInstance(opts InstanceOptions) (*Instance, error) {
@@ -180,6 +196,7 @@ func NewInstance(opts InstanceOptions) (*Instance, error) {
 		UpdatedAt:      t,
 		AutoYes:        false,
 		selectedBranch: opts.Branch,
+		NoWorktree:     opts.NoWorktree,
 	}, nil
 }
 
@@ -187,7 +204,16 @@ func (i *Instance) RepoName() (string, error) {
 	if !i.started {
 		return "", fmt.Errorf("cannot get repo name for instance that has not been started")
 	}
+	if i.gitWorktree == nil {
+		return "", fmt.Errorf("instance has no git worktree")
+	}
 	return i.gitWorktree.GetRepoName(), nil
+}
+
+// HasWorktree returns true if this instance has its own git worktree.
+// clarity-attach instances (NoWorktree) do not.
+func (i *Instance) HasWorktree() bool {
+	return i.gitWorktree != nil
 }
 
 func (i *Instance) SetStatus(status Status) {
@@ -215,7 +241,7 @@ func (i *Instance) Start(firstTimeSetup bool) error {
 	}
 	i.tmuxSession = tmuxSession
 
-	if firstTimeSetup {
+	if firstTimeSetup && !i.NoWorktree {
 		if i.selectedBranch != "" {
 			gitWorktree, err := git.NewGitWorktreeFromBranch(i.Path, i.selectedBranch, i.Title)
 			if err != nil {
@@ -259,6 +285,13 @@ func (i *Instance) Start(firstTimeSetup bool) error {
 				return nil
 			}
 			setupErr = fmt.Errorf("failed to restore existing session: %w", err)
+			return setupErr
+		}
+	} else if i.NoWorktree {
+		// No git worktree: run the tmux session directly in the instance's
+		// own working directory (a clarity-attach lane's existing worktree).
+		if err := i.tmuxSession.Start(i.Path); err != nil {
+			setupErr = fmt.Errorf("failed to start new session: %w", err)
 			return setupErr
 		}
 	} else {
@@ -424,6 +457,9 @@ func (i *Instance) Pause() error {
 	if !i.started {
 		return fmt.Errorf("cannot pause instance that has not been started")
 	}
+	if i.NoWorktree {
+		return fmt.Errorf("cannot pause %q: it has no git worktree to preserve (clarity-attach instance)", i.Title)
+	}
 	if i.Status == Paused {
 		return fmt.Errorf("instance is already paused")
 	}
@@ -511,6 +547,9 @@ func (i *Instance) Resume() error {
 	if !i.started {
 		return fmt.Errorf("cannot resume instance that has not been started")
 	}
+	if i.NoWorktree {
+		return fmt.Errorf("cannot resume %q: it has no git worktree (clarity-attach instance)", i.Title)
+	}
 	if i.Status != Paused {
 		return fmt.Errorf("can only resume paused instances")
 	}
@@ -583,6 +622,12 @@ func (i *Instance) UpdateDiffStats() error {
 		return nil
 	}
 
+	if i.NoWorktree {
+		// No git worktree, so no diff to compute.
+		i.diffStats = nil
+		return nil
+	}
+
 	stats := i.gitWorktree.Diff()
 	if stats.Error != nil {
 		if strings.Contains(stats.Error.Error(), "base commit SHA not set") {
@@ -600,7 +645,7 @@ func (i *Instance) UpdateDiffStats() error {
 // ComputeDiff runs the expensive git diff I/O and returns the result without
 // mutating instance state. Safe to call from a background goroutine.
 func (i *Instance) ComputeDiff() *git.DiffStats {
-	if !i.started || i.Status == Paused {
+	if !i.started || i.Status == Paused || i.NoWorktree {
 		return nil
 	}
 	return i.gitWorktree.Diff()
@@ -611,7 +656,7 @@ func (i *Instance) ComputeDiff() *git.DiffStats {
 // background goroutine. Use this for instances whose full diff content is not
 // currently needed so we avoid keeping large diffs in memory.
 func (i *Instance) ComputeDiffNumstat() *git.DiffStats {
-	if !i.started || i.Status == Paused {
+	if !i.started || i.Status == Paused || i.NoWorktree {
 		return nil
 	}
 	return i.gitWorktree.DiffNumstat()

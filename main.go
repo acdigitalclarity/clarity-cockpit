@@ -7,6 +7,7 @@ import (
 	"claude-squad/daemon"
 	"claude-squad/log"
 	"claude-squad/session"
+	"claude-squad/session/clarity"
 	"claude-squad/session/git"
 	"claude-squad/session/tmux"
 	"context"
@@ -16,6 +17,7 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 var (
@@ -143,6 +145,96 @@ var (
 			fmt.Printf("https://github.com/smtg-ai/claude-squad/releases/tag/v%s\n", version)
 		},
 	}
+
+	// clarityAttachCmd is a Digital Clarity workspace enhancement (not upstream).
+	// A Clarity session lane (sessions/<lane>/) is already an isolated working
+	// directory under its own worktree-per-lane discipline. clarity-attach
+	// registers a Claude Squad instance pointed straight at that directory -
+	// no new git worktree is created, so the lane's own worktrees are
+	// untouched - and attaches to it immediately.
+	clarityAttachCmd = &cobra.Command{
+		Use:   "clarity-attach <lane>",
+		Short: "Attach a Claude Squad instance to a Clarity session lane's own working directory (no new git worktree)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			log.Initialize(false)
+			defer log.Close()
+
+			lane := args[0]
+			lanePath, err := clarity.ResolveExistingLaneDir(lane)
+			if err != nil {
+				return err
+			}
+
+			cfg := config.LoadConfig()
+			program := cfg.GetProgram()
+			if programFlag != "" {
+				program = programFlag
+			}
+
+			state := config.LoadState()
+			storage, err := session.NewStorage(state)
+			if err != nil {
+				return fmt.Errorf("failed to initialize storage: %w", err)
+			}
+
+			instances, err := storage.LoadInstances()
+			if err != nil {
+				return fmt.Errorf("failed to load instances: %w", err)
+			}
+			for _, existing := range instances {
+				if existing.Title == lane {
+					return fmt.Errorf("an instance named %q already exists (status %v) - kill it first, or reattach to it from cs", lane, existing.Status)
+				}
+			}
+
+			inst, err := session.NewInstance(session.InstanceOptions{
+				Title:      lane,
+				Path:       lanePath,
+				Program:    program,
+				NoWorktree: true,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to create instance: %w", err)
+			}
+
+			if err := inst.Start(true); err != nil {
+				return fmt.Errorf("failed to start instance: %w", err)
+			}
+
+			instances = append(instances, inst)
+			if err := storage.SaveInstances(instances); err != nil {
+				return fmt.Errorf("failed to save instance %q: %w", lane, err)
+			}
+
+			fmt.Printf("clarity-attach: %q running %s in %s (no git worktree)\n", lane, program, lanePath)
+			fmt.Println("Attaching now - press ctrl-q to detach (the instance keeps running; `cs` lists it by lane name).")
+
+			// Put our own stdin/stdout into raw mode for the duration of the
+			// attach so keystrokes (including ctrl-q to detach) pass straight
+			// through to the tmux session, the same way they do inside the
+			// full `cs` TUI (which runs its whole event loop in raw mode).
+			if term.IsTerminal(int(os.Stdin.Fd())) {
+				oldState, rawErr := term.MakeRaw(int(os.Stdin.Fd()))
+				if rawErr != nil {
+					log.WarningLog.Printf("could not set stdin to raw mode: %v", rawErr)
+				} else {
+					defer func() {
+						_ = term.Restore(int(os.Stdin.Fd()), oldState)
+					}()
+				}
+			}
+
+			doneCh, err := inst.Attach()
+			if err != nil {
+				return fmt.Errorf("failed to attach to instance %q: %w", lane, err)
+			}
+			<-doneCh
+
+			fmt.Printf("\nclarity-attach: detached from %q\n", lane)
+			return nil
+		},
+	}
 )
 
 func init() {
@@ -159,9 +251,13 @@ func init() {
 		panic(err)
 	}
 
+	clarityAttachCmd.Flags().StringVarP(&programFlag, "program", "p", "",
+		"Program to run in the attached instance (e.g. 'aider --model ollama_chat/gemma3:1b')")
+
 	rootCmd.AddCommand(debugCmd)
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(resetCmd)
+	rootCmd.AddCommand(clarityAttachCmd)
 }
 
 func main() {
