@@ -42,6 +42,12 @@ const (
 	StateEmpty
 	StateNewInstance
 	StatePrompt
+	// StateMsg is the composer's own menu state (board #280, slice 5b,
+	// DEFECT 3) - distinct from StatePrompt (upstream's "enter prompt"
+	// instance-start overlay), which the composer previously borrowed and
+	// so wrongly showed "enter submit name" while a message was being
+	// typed.
+	StateMsg
 )
 
 type Menu struct {
@@ -85,8 +91,11 @@ func (m *Menu) SetState(state MenuState) {
 // SetInstance updates the current instance and refreshes menu options
 func (m *Menu) SetInstance(instance *session.Instance) {
 	m.instance = instance
-	// Only change the state if we're not in a special state (NewInstance or Prompt)
-	if m.state != StateNewInstance && m.state != StatePrompt {
+	// Only change the state if we're not in a special state (NewInstance,
+	// Prompt or the composer's own Msg) - a feed tick's instanceChanged()
+	// must never kick the footer out of "enter send · esc cancel" while a
+	// message is being typed.
+	if m.state != StateNewInstance && m.state != StatePrompt && m.state != StateMsg {
 		if m.instance != nil {
 			m.state = StateDefault
 		} else {
@@ -119,6 +128,10 @@ func (m *Menu) updateOptions() {
 		m.options = newInstanceMenuOptions
 	case StatePrompt:
 		m.options = promptMenuOptions
+	case StateMsg:
+		// String() short-circuits StateMsg before m.options is ever read
+		// (the composer's own foot text, not the key-binding groups below).
+		m.options = nil
 	}
 }
 
@@ -161,7 +174,20 @@ func (m *Menu) SetSize(width, height int) {
 	m.height = height
 }
 
+// composerFootMenuText is the footer shown for the whole width of StateMsg
+// (board #280, slice 5b, DEFECT 3) - the composer's own box already draws
+// this same text on its own border (ComposerFootEditing, ui/composer.go);
+// the bottom bar must read identically while the composer is open, never
+// the "enter submit name" text StatePrompt's own KeySubmitName binding
+// carries for the unrelated "enter prompt" instance-start flow.
+const composerFootMenuText = ComposerFootEditing
+
 func (m *Menu) String() string {
+	if m.state == StateMsg {
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
+			menuStyle.Render(composerFootMenuText))
+	}
+
 	var s strings.Builder
 
 	// Define group boundaries

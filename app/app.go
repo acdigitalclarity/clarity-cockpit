@@ -881,6 +881,18 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 		}
 		switch msg.Code {
 		case tea.KeyEnter:
+			lane, isExternal := m.composer.Lane(), m.composer.IsExternal()
+			if lane == "" {
+				// Neither the board card's own Lane field nor the issue's
+				// lane: label resolved (board #280, slice 5b, DEFECT 2) -
+				// enter delivers nothing; the composer stays visible and
+				// shows why, the same way a successful send shows its own
+				// landed foot.
+				m.composer.SetResult("no lane to send to")
+				m.state = stateDefault
+				m.menu.SetState(ui.StateDefault)
+				return m, nil
+			}
 			text := m.composer.Value()
 			if strings.TrimSpace(text) == "" {
 				m.composer.Close()
@@ -888,7 +900,6 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 				m.menu.SetState(ui.StateDefault)
 				return m, nil
 			}
-			lane, isExternal := m.composer.Lane(), m.composer.IsExternal()
 			return m, m.sendComposerCmd(lane, isExternal, text)
 		case tea.KeyBackspace:
 			m.composer.Backspace()
@@ -1109,7 +1120,7 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 		}
 		m.composer.Open(lane, isExternal)
 		m.state = stateMsg
-		m.menu.SetState(ui.StatePrompt)
+		m.menu.SetState(ui.StateMsg)
 		return m, nil
 	case keys.KeyResume:
 		selected := m.list.GetSelectedInstance()
@@ -1180,16 +1191,22 @@ func (m *home) instanceChanged() tea.Cmd {
 // lane name and whether the composer must use the clipboard-copy path (no
 // tracked tmux session to deliver into). A tracked or external row
 // resolves directly via the list's own SelectedMsgTarget; a Needs-you
-// row's raising lane (item.Lane) is looked up against the tracked
-// instances and external lanes the list currently holds instead, since the
-// row names no group at all and may not resolve to either (a board-
-// sourced row's Lane is the issue number itself, "#277" -
-// clarity.BoardIssueNumber's own doc comment, session/clarity/feed.go) -
-// an unresolved lane falls back to isExternal=true (copy), the safe
-// default: never claim a delivery this cockpit cannot confirm.
+// row's own RESOLVED raising lane (needsYouRowLane, board #280 slice 5b
+// DEFECT 2) is looked up against the tracked instances and external lanes
+// the list currently holds instead, since the row names no group at all
+// and may not resolve to either - an unresolved match falls back to
+// isExternal=true (copy), the safe default: never claim a delivery this
+// cockpit cannot confirm. A row whose lane did not resolve AT ALL (neither
+// the board card's Lane field nor its lane: label, nor - for a lane-file
+// row, which always resolves - anything at all) returns lane="",
+// isExternal=true, ok=true: the composer still opens (its own "no lane on
+// this row" state), it simply names no target.
 func (m *home) composerTarget() (lane string, isExternal bool, ok bool) {
 	if item, isNeedsYou := m.list.GetSelectedNeedsYou(); isNeedsYou {
-		lane = item.Lane
+		lane = m.needsYouRowLane(item)
+		if lane == "" {
+			return "", true, true
+		}
 		for _, inst := range m.list.GetInstances() {
 			if inst.Title == lane {
 				return lane, false, true
@@ -1203,6 +1220,29 @@ func (m *home) composerTarget() (lane string, isExternal bool, ok bool) {
 		return lane, true, true
 	}
 	return m.list.SelectedMsgTarget()
+}
+
+// needsYouRowLane resolves one Needs-you row's own raising lane (board
+// #280, slice 5b, DEFECT 2): a lane-file-sourced row's own item.Lane
+// (laneFromSource, session/clarity/feed.go - this always resolves, the
+// directory a STATUS.md/TASKS.md lives in); a board-sourced row's fetched
+// card Lane field instead (its own "## Lane" section, falling back to the
+// issue's "lane:" label - clarity.ParseBoardBody), "" when that fetch has
+// not landed yet, failed, or resolved to nothing at all. Never the raw
+// "#<n>" board reference item.Lane itself carries for a board row.
+func (m *home) needsYouRowLane(item clarity.FeedItem) string {
+	n, isBoard := clarity.BoardIssueNumber(item.Source)
+	if !isBoard {
+		return item.Lane
+	}
+	if m.boardCache == nil {
+		return ""
+	}
+	cached, ok := m.boardCache.Peek(n)
+	if !ok || cached.Err != "" {
+		return ""
+	}
+	return cached.Lane
 }
 
 // selectionChanged is the Up/Down keys' own follow-up to list.Up()/Down():
@@ -1272,8 +1312,9 @@ func (m *home) refreshNeedsYouTab() tea.Cmd {
 		// A lane-file-sourced row (fleet_queue_build.py's lane_rows()) names
 		// no board issue at all - there is nothing to fetch a recommendation
 		// from, and the feed item itself carries no body/recommendation
-		// fields either (session/clarity/feed.go's own FeedItem shape).
-		info.Recommendation = "no recommendation on the row"
+		// fields either (session/clarity/feed.go's own FeedItem shape). Its
+		// own Lane always resolves (laneFromSource never returns "").
+		info.Lane = item.Lane
 		m.tabbedWindow.SetNeedsYouInfo(info)
 		return nil
 	}
@@ -1284,8 +1325,11 @@ func (m *home) refreshNeedsYouTab() tea.Cmd {
 		if cached.Err != "" {
 			info.BoardUnreachable = cached.Err
 		} else {
+			info.Lane = cached.Lane
 			info.Explanation = cached.Explanation
-			info.Recommendation = cached.Recommendation
+			info.Options = cached.Options
+			info.ExpectedReply = cached.ExpectedReply
+			info.Also = cached.Also
 		}
 		m.tabbedWindow.SetNeedsYouInfo(info)
 		return nil

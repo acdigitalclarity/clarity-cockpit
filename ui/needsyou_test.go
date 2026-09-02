@@ -22,17 +22,86 @@ func TestNeedsYouPane_RendersRankTitleLaneAndPriority(t *testing.T) {
 	p := NewNeedsYouPane()
 	p.SetSize(80, 20)
 	p.SetInfo(&NeedsYouInfo{
-		Item:           clarity.FeedItem{Rank: 1, Class: "blocked-on-owner", Source: "#277", Lane: "#277", Title: "Owner: one settings act"},
-		Explanation:    "the plain-words explanation",
-		Recommendation: "do the thing",
+		Item:        clarity.FeedItem{Rank: 1, Class: "blocked-on-owner", Source: "#277", Lane: "#277", Title: "Owner: one settings act"},
+		Lane:        "ways-of-working",
+		Explanation: []clarity.BoardSection{{Text: "the plain-words explanation"}},
+		Options:     []clarity.BoardOption{{Text: "do the thing", Recommended: true}},
 	})
 
 	out := ansi.Strip(p.String())
 	require.Contains(t, out, "1. Owner: one settings act", "line 1: row number and title")
-	require.Contains(t, out, "#277 · blocked-on-owner", "line 2: the raising lane and its priority")
+	require.Contains(t, out, "ways-of-working · blocked-on-owner", "line 2: the RESOLVED raising lane and its priority, never the raw \"#277\"")
 	require.Contains(t, out, "the plain-words explanation")
 	require.Contains(t, out, "Recommended response:")
 	require.Contains(t, out, "do the thing")
+}
+
+// TestNeedsYouPane_UnresolvedLane_HeaderShowsNoLaneLabel is board #280's
+// slice 5b DEFECT 2 half seen on the tab's own header line, not just the
+// composer: a board row whose Lane never resolved never falls back to the
+// raw issue-number source string either.
+func TestNeedsYouPane_UnresolvedLane_HeaderShowsNoLaneLabel(t *testing.T) {
+	p := NewNeedsYouPane()
+	p.SetSize(80, 20)
+	p.SetInfo(&NeedsYouInfo{
+		Item: clarity.FeedItem{Rank: 1, Class: "blocked-on-owner", Source: "#277", Lane: "#277", Title: "t"},
+	})
+
+	out := ansi.Strip(p.String())
+	require.Contains(t, out, NoLaneLabel+" · blocked-on-owner")
+	require.NotContains(t, out, "#277")
+}
+
+// TestNeedsYouPane_ExplanationLabelsWhatWhereWhy is board #280's slice 5b
+// DEFECT 1: the What/Where/Why sections render as small plain-word labels
+// over their own wrapped text, and a marked option is visibly distinct
+// from an unmarked one.
+func TestNeedsYouPane_ExplanationLabelsWhatWhereWhy(t *testing.T) {
+	p := NewNeedsYouPane()
+	p.SetSize(80, 30)
+	p.SetInfo(&NeedsYouInfo{
+		Item: clarity.FeedItem{Rank: 1, Class: "blocked-on-owner", Title: "t"},
+		Lane: "ways-of-working",
+		Explanation: []clarity.BoardSection{
+			{Label: "What", Text: "do the thing"},
+			{Label: "Where", Text: "over there"},
+			{Label: "Why", Text: "because reasons"},
+		},
+		Options: []clarity.BoardOption{
+			{Text: "option a", Recommended: true},
+			{Text: "option b", Recommended: false},
+		},
+		ExpectedReply: "a yes or no",
+	})
+
+	out := ansi.Strip(p.String())
+	require.Contains(t, out, "What")
+	require.Contains(t, out, "do the thing")
+	require.Contains(t, out, "Where")
+	require.Contains(t, out, "over there")
+	require.Contains(t, out, "Why")
+	require.Contains(t, out, "because reasons")
+	require.Contains(t, out, optionMarker+"option a", "the recommended option is marked")
+	require.Contains(t, out, optionIndent+"option b", "an unmarked option lines up under the marked one")
+	require.Contains(t, out, "Expected reply:")
+	require.Contains(t, out, "a yes or no")
+}
+
+// TestNeedsYouPane_AlsoOnTheRow_NeverDropsUnclassifiedText is the other
+// half of DEFECT 1's rule: text the parser could not classify is never
+// silently dropped.
+func TestNeedsYouPane_AlsoOnTheRow_NeverDropsUnclassifiedText(t *testing.T) {
+	p := NewNeedsYouPane()
+	p.SetSize(80, 20)
+	p.SetInfo(&NeedsYouInfo{
+		Item: clarity.FeedItem{Rank: 1, Class: "blocked-on-owner", Title: "t"},
+		Lane: "ways-of-working",
+		Also: "Notes: a stray note the card carries",
+	})
+
+	out := ansi.Strip(p.String())
+	require.Contains(t, out, "Also on the row:")
+	require.Contains(t, out, "a stray note the card carries")
 }
 
 func TestNeedsYouPane_BoardUnreachable_RendersOnlyThatLine(t *testing.T) {
@@ -64,9 +133,10 @@ func TestNeedsYouPane_WrapsExplanationToWidth(t *testing.T) {
 	p := NewNeedsYouPane()
 	p.SetSize(20, 20)
 	p.SetInfo(&NeedsYouInfo{
-		Item:           clarity.FeedItem{Rank: 1, Title: "t", Lane: "#1", Class: "blocked-on-owner"},
-		Explanation:    strings.Repeat("word ", 30),
-		Recommendation: "ok",
+		Item:        clarity.FeedItem{Rank: 1, Title: "t", Lane: "#1", Class: "blocked-on-owner"},
+		Lane:        "lane-a",
+		Explanation: []clarity.BoardSection{{Text: strings.Repeat("word ", 30)}},
+		Options:     []clarity.BoardOption{{Text: "ok"}},
 	})
 
 	for i, line := range strings.Split(ansi.Strip(p.String()), "\n") {
@@ -77,7 +147,7 @@ func TestNeedsYouPane_WrapsExplanationToWidth(t *testing.T) {
 func TestNeedsYouPane_ClearShowsNothingSelectedAgain(t *testing.T) {
 	p := NewNeedsYouPane()
 	p.SetSize(80, 20)
-	p.SetInfo(&NeedsYouInfo{Item: clarity.FeedItem{Rank: 1, Title: "t"}, Recommendation: "r"})
+	p.SetInfo(&NeedsYouInfo{Item: clarity.FeedItem{Rank: 1, Title: "t"}, Options: []clarity.BoardOption{{Text: "r"}}})
 	p.Clear()
 
 	require.Contains(t, p.String(), "select a Needs-you row")
@@ -87,9 +157,10 @@ func TestNeedsYouPane_ScrollPreservedAcrossSameRowRefresh(t *testing.T) {
 	p := NewNeedsYouPane()
 	p.SetSize(20, 8) // narrow/short pane so the content overflows and scrolling matters
 	info := &NeedsYouInfo{
-		Item:           clarity.FeedItem{Rank: 1, Source: "#1", Title: "t"},
-		Explanation:    strings.Repeat("word ", 40),
-		Recommendation: "ok",
+		Item:        clarity.FeedItem{Rank: 1, Source: "#1", Title: "t"},
+		Lane:        "lane-a",
+		Explanation: []clarity.BoardSection{{Text: strings.Repeat("word ", 40)}},
+		Options:     []clarity.BoardOption{{Text: "ok"}},
 	}
 	p.SetInfo(info)
 	p.ScrollDown()
@@ -108,7 +179,7 @@ func TestNeedsYouPane_ScrollResetsOnDifferentRow(t *testing.T) {
 	p.SetSize(20, 8)
 	p.SetInfo(&NeedsYouInfo{
 		Item:        clarity.FeedItem{Rank: 1, Source: "#1", Title: "t"},
-		Explanation: strings.Repeat("word ", 40),
+		Explanation: []clarity.BoardSection{{Text: strings.Repeat("word ", 40)}},
 	})
 	p.ScrollDown()
 	p.ScrollDown()
@@ -116,7 +187,7 @@ func TestNeedsYouPane_ScrollResetsOnDifferentRow(t *testing.T) {
 
 	p.SetInfo(&NeedsYouInfo{
 		Item:        clarity.FeedItem{Rank: 2, Source: "#2", Title: "different row"},
-		Explanation: strings.Repeat("word ", 40),
+		Explanation: []clarity.BoardSection{{Text: strings.Repeat("word ", 40)}},
 	})
 	require.Equal(t, 0, p.viewport.YOffset(), "a genuinely different row starts scrolled to the top")
 }
@@ -139,8 +210,12 @@ func TestNeedsYouPane_FitsAt120x36And164x45And200x55(t *testing.T) {
 					Rank: 1, Class: "blocked-on-owner", Source: "#277", Lane: "#277",
 					Title: "Owner: one settings act - move state-claim-warn to Stop and add the specialist boot line",
 				},
-				Explanation:    "Two edits in a settings file, described in plain words across several sentences that will need to wrap.",
-				Recommendation: "Make both edits yourself, two minutes. Recommended.",
+				Lane: "ways-of-working",
+				Explanation: []clarity.BoardSection{
+					{Label: "What", Text: "Two edits in a settings file, described in plain words across several sentences that will need to wrap."},
+				},
+				Options:       []clarity.BoardOption{{Text: "Make both edits yourself, two minutes.", Recommended: true}},
+				ExpectedReply: "\"done\" on this row, or \"apply it\".",
 			})
 
 			out := w.String()

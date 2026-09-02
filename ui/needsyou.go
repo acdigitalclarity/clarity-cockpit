@@ -32,19 +32,28 @@ const needsYouFixedBottomRows = 3
 // handed to NeedsYouPane.SetInfo. nil means the cursor is not currently on
 // a Needs-you row.
 type NeedsYouInfo struct {
-	// Item is the selected row itself - Rank/Title for line 1, Lane/Class
-	// (there is no separate "priority" field on the feed item; Class fills
-	// that role - session/clarity/feed.go) for line 2.
+	// Item is the selected row itself - Rank/Title for line 1, Class fills
+	// line 2's "priority" role (session/clarity/feed.go).
 	Item clarity.FeedItem
-	// Explanation/Recommendation are the plain-words body and recommended
-	// response - from the board fetch (clarity.BoardCache) when Item names
-	// a board issue (clarity.BoardIssueNumber), or the lane-file fallback
-	// text ("no recommendation on the row") when it does not.
-	Explanation    string
-	Recommendation string
+	// Lane is the row's own RESOLVED raising lane - the composer's send
+	// target and line 2's own lane name (board #280, slice 5b, DEFECT 2):
+	// for a lane-file-sourced row this is Item.Lane itself (always
+	// resolves); for a board-sourced row it is the fetched card's own Lane
+	// field (its "## Lane" section, falling back to the issue's "lane:"
+	// label) - "" when neither resolves, never the raw "#<n>" source
+	// string.
+	Lane string
+	// Explanation/Options/ExpectedReply/Also are the board fetch's own
+	// classified fields (clarity.BoardCache, clarity.ParseBoardBody) when
+	// Item names a board issue (clarity.BoardIssueNumber); a lane-file row
+	// carries none of these (the feed item itself has no body to parse).
+	Explanation   []clarity.BoardSection
+	Options       []clarity.BoardOption
+	ExpectedReply string
+	Also          string
 	// BoardUnreachable carries the fetch failure reason - rendered as the
-	// tab's ENTIRE content instead of Explanation/Recommendation when set,
-	// per the brief ("render one plain line").
+	// tab's ENTIRE content instead of the fields above when set, per the
+	// brief ("render one plain line").
 	BoardUnreachable string
 	// Loading is true for the one tick between selecting a row whose board
 	// fetch has not resolved yet and the background fetch completing - the
@@ -221,29 +230,41 @@ func (p *NeedsYouPane) renderHeaderLine1() string {
 	return sessionTextStyle.Render(ansiTruncateRow(fmt.Sprintf("%d. %s", item.Rank, item.Title), p.width))
 }
 
-// renderHeaderLine2 is "<lane> · <priority>" - Lane is the row's raising
-// lane (for a board-sourced row this is the issue number string itself,
-// "#277" - laneFromSource's own fallback, session/clarity/feed.go; there is
-// no separate lane name to derive from a bare issue reference), Class fills
-// the "priority" role the feed item itself has no dedicated field for.
+// renderHeaderLine2 is "<lane> · <priority>" - Lane is the row's own
+// RESOLVED raising lane (info.Lane, board #280 slice 5b DEFECT 2), never
+// the raw "#<n>" board reference; NoLaneLabel when it did not resolve.
+// Class fills the "priority" role the feed item itself has no dedicated
+// field for.
 func (p *NeedsYouPane) renderHeaderLine2() string {
-	item := p.info.Item
-	return sessionMutedStyle.Render(ansiTruncateRow(fmt.Sprintf("%s · %s", item.Lane, item.Class), p.width))
+	lane := p.info.Lane
+	if lane == "" {
+		lane = NoLaneLabel
+	}
+	return sessionMutedStyle.Render(ansiTruncateRow(fmt.Sprintf("%s · %s", lane, p.info.Item.Class), p.width))
 }
 
 // renderComposerLines draws the composer box, targeted at this row's own
-// raising lane whenever the composer is not already open on a captured
-// target.
+// RESOLVED raising lane (info.Lane) whenever the composer is not already
+// open on a captured target.
 func (p *NeedsYouPane) renderComposerLines() []string {
-	return p.composer.Render(p.width, p.info.Item.Lane)
+	return p.composer.Render(p.width, p.info.Lane)
 }
 
+// optionMarker/optionIndent are the "recommended option marked" glyph
+// (board #280 slice 5b DEFECT 1) and the matching blank indent every other
+// option, and every wrapped continuation line, lines up under.
+const optionMarker = "→ "
+
+var optionIndent = strings.Repeat(" ", lipgloss.Width(optionMarker))
+
 // buildNeedsYouContentLines renders the scrollable region: a rule, the
-// explanation, another rule, "Recommended response:" and the
-// recommendation - or, on a board fetch failure, the single "board
-// unreachable" line the brief names, with nothing else (RECOMMEND
-// response omitted, never left dangling above an empty answer). A pending
-// fetch (Loading) shows one plain line instead of stalling.
+// explanation (the card's own What/Where/Why sections, plain-labeled, or
+// its free-prose paragraphs when it has no headings), another rule,
+// "Recommended response:" and the card's own Options (the recommended one
+// marked), then "Expected reply:" and "Also on the row:" when the card
+// carries either - or, on a board fetch failure, the single "board
+// unreachable" line the brief names, with nothing else. A pending fetch
+// (Loading) shows one plain line instead of stalling.
 func buildNeedsYouContentLines(info NeedsYouInfo, width int) []string {
 	if info.Loading {
 		return []string{muteRule(width), "fetching the board row…"}
@@ -254,9 +275,65 @@ func buildNeedsYouContentLines(info NeedsYouInfo, width int) []string {
 	}
 	var lines []string
 	lines = append(lines, muteRule(width))
-	lines = append(lines, wrapPlain(collapseWS(info.Explanation), width)...)
+	lines = append(lines, renderExplanationLines(info.Explanation, width)...)
 	lines = append(lines, muteRule(width))
 	lines = append(lines, "Recommended response:")
-	lines = append(lines, wrapPlain(collapseWS(info.Recommendation), width)...)
+	lines = append(lines, renderOptionLines(info.Options, width)...)
+	if info.ExpectedReply != "" {
+		lines = append(lines, "", "Expected reply:")
+		lines = append(lines, wrapPlain(collapseWS(info.ExpectedReply), width)...)
+	}
+	if info.Also != "" {
+		lines = append(lines, "", "Also on the row:")
+		lines = append(lines, wrapPlain(collapseWS(info.Also), width)...)
+	}
+	return lines
+}
+
+// renderExplanationLines renders the What/Where/Why sections in order,
+// each a small plain-word label followed by its own wrapped text, blank-
+// line separated - or, for the no-headings free-prose fallback (a single
+// section with an empty Label), just the wrapped text on its own.
+func renderExplanationLines(sections []clarity.BoardSection, width int) []string {
+	if len(sections) == 0 {
+		return []string{"no explanation on the row"}
+	}
+	var lines []string
+	for i, s := range sections {
+		if i > 0 {
+			lines = append(lines, "")
+		}
+		if s.Label != "" {
+			lines = append(lines, s.Label)
+		}
+		lines = append(lines, wrapPlain(collapseWS(s.Text), width)...)
+	}
+	return lines
+}
+
+// renderOptionLines renders the card's own Options, one per line (wrapped
+// and continuation-indented when an option overruns width), the
+// recommended one prefixed with optionMarker and every other line - marked
+// or not - left-padded to the same column so the list stays aligned.
+func renderOptionLines(opts []clarity.BoardOption, width int) []string {
+	if len(opts) == 0 {
+		return []string{"no recommendation on the row"}
+	}
+	indentWidth := lipgloss.Width(optionMarker)
+	var lines []string
+	for _, o := range opts {
+		marker := optionIndent
+		if o.Recommended {
+			marker = optionMarker
+		}
+		wrapped := wrapPlain(collapseWS(o.Text), maxInt0(width-indentWidth))
+		for i, w := range wrapped {
+			if i == 0 {
+				lines = append(lines, marker+w)
+			} else {
+				lines = append(lines, optionIndent+w)
+			}
+		}
+	}
 	return lines
 }
