@@ -11,11 +11,12 @@ import (
 )
 
 // cachedTail is one LaneTailCache entry: the LaneTail last computed for a
-// path, plus the file stat it was computed from.
+// path, plus the file stat and maxTurns it was computed from.
 type cachedTail struct {
-	modTime time.Time
-	size    int64
-	tail    LaneTail
+	modTime  time.Time
+	size     int64
+	maxTurns int
+	tail     LaneTail
 }
 
 // LaneTailCache memoizes ReadLaneTail per transcript path, keyed by the
@@ -34,29 +35,38 @@ func NewLaneTailCache() *LaneTailCache {
 }
 
 // Get returns the LaneTail for transcriptPath, re-reading it (via
-// ReadLaneTail's default bounded tail) only when the file's mtime or size
-// differs from the last read. now is passed through to ReadLaneTail's own
-// age-based classification, not used for cache freshness itself.
-func (c *LaneTailCache) Get(transcriptPath string, now time.Time) (LaneTail, error) {
+// ReadLaneTail) only when the file's mtime or size differs from the last
+// read, OR the cached entry was computed with fewer turns than maxTurns now
+// asks for (a caller that needs more history than the last one, e.g. the
+// Session pane's 40 versus the list rows' bare default, must not be served
+// a narrower cached slice). maxTurns <= 0 means ReadLaneTail's own
+// DefaultTailTurns, same as passing it straight through. now is passed
+// through to ReadLaneTail's own age-based classification, not used for
+// cache freshness itself.
+func (c *LaneTailCache) Get(transcriptPath string, maxTurns int, now time.Time) (LaneTail, error) {
 	info, err := os.Stat(transcriptPath)
 	if err != nil {
 		return LaneTail{}, err
+	}
+	wantTurns := maxTurns
+	if wantTurns <= 0 {
+		wantTurns = DefaultTailTurns
 	}
 
 	c.mu.Lock()
 	entry, ok := c.entries[transcriptPath]
 	c.mu.Unlock()
-	if ok && entry.modTime.Equal(info.ModTime()) && entry.size == info.Size() {
+	if ok && entry.modTime.Equal(info.ModTime()) && entry.size == info.Size() && entry.maxTurns >= wantTurns {
 		return entry.tail, nil
 	}
 
-	tail, err := ReadLaneTail(transcriptPath, 0, 0, now)
+	tail, err := ReadLaneTail(transcriptPath, 0, maxTurns, now)
 	if err != nil {
 		return LaneTail{}, err
 	}
 
 	c.mu.Lock()
-	c.entries[transcriptPath] = cachedTail{modTime: info.ModTime(), size: info.Size(), tail: tail}
+	c.entries[transcriptPath] = cachedTail{modTime: info.ModTime(), size: info.Size(), maxTurns: wantTurns, tail: tail}
 	c.mu.Unlock()
 	return tail, nil
 }

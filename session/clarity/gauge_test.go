@@ -174,3 +174,25 @@ func TestPyRound_HalfToEven(t *testing.T) {
 	require.Equal(t, 0, pyRound(0.4))
 	require.Equal(t, 1, pyRound(0.6))
 }
+
+// TestModelWindowLabel_FableNamesGet1M is the Session pane header's own
+// requirement (design/cockpit-pane/DECISIONS.md slice 3, "fable-5-1 · 1M
+// window"): a fable/1m/opus-named model derives the 1M word.
+func TestModelWindowLabel_FableNamesGet1M(t *testing.T) {
+	for _, model := range []string{"claude-fable-5-1", "claude-opus-4", "claude-1m-preview"} {
+		label, ok := ModelWindowLabel(model)
+		require.True(t, ok, model)
+		require.Equal(t, "1M window", label, model)
+	}
+}
+
+func TestModelWindowLabel_OtherNamesGet200k(t *testing.T) {
+	label, ok := ModelWindowLabel("claude-sonnet-5")
+	require.True(t, ok)
+	require.Equal(t, "200k window", label)
+}
+
+func TestModelWindowLabel_EmptyModel_NotDerivable(t *testing.T) {
+	_, ok := ModelWindowLabel("")
+	require.False(t, ok, "an empty model name has nothing to derive a window word from")
+}

@@ -31,8 +31,13 @@ var (
 			Border(lipgloss.NormalBorder(), false, true, true, true)
 )
 
+// SessionTab replaces the old PreviewTab (design/cockpit-pane/DECISIONS.md
+// slice 3): it is still tab index 0 and still the default, but now shows
+// the selected lane's own conversation (ui/session.go) rather than a raw
+// tmux capture. The old PreviewPane type is left in the tree, unused by
+// this window for now - see NewTabbedWindow's own comment.
 const (
-	PreviewTab int = iota
+	SessionTab int = iota
 	DiffTab
 	TerminalTab
 )
@@ -50,28 +55,34 @@ type TabbedWindow struct {
 	activeTab int
 	height    int
 	width     int
+	// contentWidth/contentHeight is the content area SetSize computes and
+	// hands identically to every tab's own pane - see GetContentSize.
+	contentWidth  int
+	contentHeight int
 
-	preview  *PreviewPane
+	session  *SessionPane
 	diff     *DiffPane
 	terminal *TerminalPane
-	instance *session.Instance
 }
 
-func NewTabbedWindow(preview *PreviewPane, diff *DiffPane, terminal *TerminalPane) *TabbedWindow {
+// NewTabbedWindow wires the three tabs: Session (this fork's slice-3
+// replacement for the old tmux-capture Preview pane), Diff and Terminal
+// (both untouched in this slice - see DECISIONS.md's build-slice list,
+// items 5 and 6). PreviewPane's own type/tests are kept in the tree,
+// dormant, for a later slice to relocate its tmux-mirror capability under
+// the Terminal tab per DECISIONS.md's tab-3 definition - nothing upstream
+// is thrown away, it simply has no tab slot pointed at it right now.
+func NewTabbedWindow(session *SessionPane, diff *DiffPane, terminal *TerminalPane) *TabbedWindow {
 	return &TabbedWindow{
 		tabs: []string{
-			"Preview",
+			"Session",
 			"Diff",
 			"Terminal",
 		},
-		preview:  preview,
+		session:  session,
 		diff:     diff,
 		terminal: terminal,
 	}
-}
-
-func (w *TabbedWindow) SetInstance(instance *session.Instance) {
-	w.instance = instance
 }
 
 // AdjustPreviewWidth adjusts the width of the preview pane to be 90% of the provided width.
@@ -100,25 +111,39 @@ func (w *TabbedWindow) SetSize(width, height int) {
 	contentHeight := height - tabHeight - windowStyle.GetVerticalFrameSize() - 2
 	contentWidth := w.width - windowStyle.GetHorizontalFrameSize()
 
-	w.preview.SetSize(contentWidth, contentHeight)
+	w.contentWidth, w.contentHeight = contentWidth, contentHeight
+	w.session.SetSize(contentWidth, contentHeight)
 	w.diff.SetSize(contentWidth, contentHeight)
 	w.terminal.SetSize(contentWidth, contentHeight)
 }
 
-func (w *TabbedWindow) GetPreviewSize() (width, height int) {
-	return w.preview.width, w.preview.height
+// GetContentSize returns the content area every tab shares - Session, Diff
+// and Terminal are all sized identically by SetSize above, so this used to
+// read PreviewPane's own width/height specifically; now it reads the
+// dimensions SetSize itself computed, which is exactly the same number
+// regardless of which pane it came from.
+func (w *TabbedWindow) GetContentSize() (width, height int) {
+	return w.contentWidth, w.contentHeight
 }
 
 func (w *TabbedWindow) Toggle() {
 	w.activeTab = (w.activeTab + 1) % len(w.tabs)
 }
 
-// UpdatePreview updates the content of the preview pane. instance may be nil.
-func (w *TabbedWindow) UpdatePreview(instance *session.Instance) error {
-	if w.activeTab != PreviewTab {
-		return nil
-	}
-	return w.preview.UpdateContent(instance)
+// SetSessionInfo replaces the Session tab's data for the selected lane (nil
+// when nothing is selected - the pane then shows the resting frame).
+// Unlike UpdateDiff/UpdateTerminal below, this is never gated on the active
+// tab: the data comes from the feed tick's already-cached LaneTail (cheap),
+// and gating it would show stale turns for a beat after switching onto the
+// tab.
+func (w *TabbedWindow) SetSessionInfo(info *SessionInfo) {
+	w.session.SetInfo(info)
+}
+
+// SetSessionFleetCounts passes the resting frame's "lanes live"/"needs you"
+// counters through to the Session pane.
+func (w *TabbedWindow) SetSessionFleetCounts(live, waiting int) {
+	w.session.SetFleetCounts(live, waiting)
 }
 
 func (w *TabbedWindow) UpdateDiff(instance *session.Instance) {
@@ -136,19 +161,11 @@ func (w *TabbedWindow) UpdateTerminal(instance *session.Instance) error {
 	return w.terminal.UpdateContent(instance)
 }
 
-// ResetPreviewToNormalMode resets the preview pane to normal mode
-func (w *TabbedWindow) ResetPreviewToNormalMode(instance *session.Instance) error {
-	return w.preview.ResetToNormalMode(instance)
-}
-
 // Add these new methods for handling scroll events
 func (w *TabbedWindow) ScrollUp() {
 	switch w.activeTab {
-	case PreviewTab:
-		err := w.preview.ScrollUp(w.instance)
-		if err != nil {
-			log.InfoLog.Printf("tabbed window failed to scroll up: %v", err)
-		}
+	case SessionTab:
+		w.session.ScrollUp()
 	case DiffTab:
 		w.diff.ScrollUp()
 	case TerminalTab:
@@ -160,11 +177,8 @@ func (w *TabbedWindow) ScrollUp() {
 
 func (w *TabbedWindow) ScrollDown() {
 	switch w.activeTab {
-	case PreviewTab:
-		err := w.preview.ScrollDown(w.instance)
-		if err != nil {
-			log.InfoLog.Printf("tabbed window failed to scroll down: %v", err)
-		}
+	case SessionTab:
+		w.session.ScrollDown()
 	case DiffTab:
 		w.diff.ScrollDown()
 	case TerminalTab:
@@ -174,9 +188,9 @@ func (w *TabbedWindow) ScrollDown() {
 	}
 }
 
-// IsInPreviewTab returns true if the preview tab is currently active
-func (w *TabbedWindow) IsInPreviewTab() bool {
-	return w.activeTab == PreviewTab
+// IsInSessionTab returns true if the Session tab is currently active
+func (w *TabbedWindow) IsInSessionTab() bool {
+	return w.activeTab == SessionTab
 }
 
 // IsInDiffTab returns true if the diff tab is currently active
@@ -207,11 +221,6 @@ func (w *TabbedWindow) CleanupTerminal() {
 // CleanupTerminalForInstance closes the cached terminal session for the given instance title.
 func (w *TabbedWindow) CleanupTerminalForInstance(title string) {
 	w.terminal.CloseForInstance(title)
-}
-
-// IsPreviewInScrollMode returns true if the preview pane is in scroll mode
-func (w *TabbedWindow) IsPreviewInScrollMode() bool {
-	return w.preview.isScrolling
 }
 
 // IsTerminalInScrollMode returns true if the terminal pane is in scroll mode
@@ -267,8 +276,8 @@ func (w *TabbedWindow) String() string {
 	row := lipgloss.JoinHorizontal(lipgloss.Top, renderedTabs...)
 	var content string
 	switch w.activeTab {
-	case PreviewTab:
-		content = w.preview.String()
+	case SessionTab:
+		content = w.session.String()
 	case DiffTab:
 		content = w.diff.String()
 	case TerminalTab:

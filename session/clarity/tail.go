@@ -90,6 +90,14 @@ type LaneTail struct {
 	TurnDuration   time.Duration
 	Turns          []Turn
 	MalformedLines int // lines that failed to parse as JSON, skipped
+
+	// Truncated is true when there is conversation before the returned Turns
+	// that this read never rendered - either because the byte-window seek
+	// (maxBytes) started past the file's beginning, or because buildTurns
+	// itself dropped older turns to fit maxTurns. The Session pane's "⋯
+	// earlier in this session" divider (design/cockpit-pane/DECISIONS.md
+	// slice 3) reads this rather than re-deriving it from Turns/Messages.
+	Truncated bool
 }
 
 // rawRecord is the union of the transcript record fields tail.go relies on,
@@ -234,6 +242,7 @@ func ReadLaneTail(transcriptPath string, maxBytes int, maxTurns int, now time.Ti
 
 	state := ClassifyState(records, now)
 	mode, model, messages := deriveMeta(records)
+	turns, turnsTrimmed := buildTurns(records, maxTurns)
 
 	return LaneTail{
 		Transcript:     transcriptPath,
@@ -247,8 +256,9 @@ func ReadLaneTail(transcriptPath string, maxBytes int, maxTurns int, now time.Ti
 		Model:          model,
 		Messages:       messages,
 		TurnDuration:   state.TurnDuration,
-		Turns:          buildTurns(records, maxTurns),
+		Turns:          turns,
 		MalformedLines: malformed,
+		Truncated:      truncated || turnsTrimmed,
 	}, nil
 }
 
@@ -547,10 +557,12 @@ func firstLine(s string) string {
 // owner message, assistant text block and tool_use call as one Turn,
 // dropping thinking blocks and tool_result plumbing (the latter is folded
 // into its matching tool_use Turn via indexToolResults instead of
-// rendering as its own row). The result is trimmed to the last maxTurns.
-func buildTurns(records []rawRecord, maxTurns int) []Turn {
+// rendering as its own row). The result is trimmed to the last maxTurns;
+// trimmed reports whether that trim actually dropped anything, so a caller
+// (ReadLaneTail) can tell its own Truncated flag apart from "the whole
+// session fit".
+func buildTurns(records []rawRecord, maxTurns int) (turns []Turn, trimmed bool) {
 	outcomes := indexToolResults(records)
-	var turns []Turn
 	for _, r := range records {
 		if r.Message == nil {
 			continue
@@ -592,8 +604,9 @@ func buildTurns(records []rawRecord, maxTurns int) []Turn {
 
 	if maxTurns > 0 && len(turns) > maxTurns {
 		turns = turns[len(turns)-maxTurns:]
+		trimmed = true
 	}
-	return turns
+	return turns, trimmed
 }
 
 // turnLabel renders a Turn's kind as the fixed prefix the header/turn line
