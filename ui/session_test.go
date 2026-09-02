@@ -179,6 +179,79 @@ func TestSessionPane_ScrollUp_RevealsEarlierTurns(t *testing.T) {
 	require.Contains(t, s.String(), "turn number 0", "scrolling all the way up must reveal the earliest turn")
 }
 
+// TestSessionPane_ScrollPosition_SurvivesInfoRefreshWhenNotAtBottom
+// reproduces defect 3 (design/cockpit-pane/DECISIONS.md slice 3b): every
+// SetInfo call used to re-pin the viewport to the bottom unconditionally, so
+// a mid-scroll read - the exact thing shift+up exists for - was thrown away
+// on the next 3-second feed tick. Scrolling away from the bottom, then
+// feeding the pane a fresh SetInfo (as app.go's feed tick does every 3s),
+// must leave the scrolled-to line offset exactly where it was.
+func TestSessionPane_ScrollPosition_SurvivesInfoRefreshWhenNotAtBottom(t *testing.T) {
+	base := time.Date(2026, 9, 2, 18, 0, 0, 0, time.Local)
+	var turns []clarity.Turn
+	for i := 0; i < 60; i++ {
+		turns = append(turns, clarity.Turn{
+			Kind: clarity.TurnOwner,
+			At:   base.Add(time.Duration(i) * time.Minute),
+			Text: fmt.Sprintf("turn number %d", i),
+		})
+	}
+	info := fixtureInfo()
+	info.Tail.Turns = turns
+
+	s := NewSessionPane()
+	s.SetSize(80, 20)
+	s.SetInfo(info)
+
+	for i := 0; i < 20; i++ {
+		s.ScrollUp()
+	}
+	require.False(t, s.viewport.AtBottom(), "test setup must actually be scrolled away from the bottom")
+	offsetBefore := s.viewport.YOffset()
+
+	// Simulate the 3s feed tick: the same lane's info refreshes (message
+	// count ticks up), turns unchanged.
+	info2 := fixtureInfo()
+	info2.Tail.Turns = turns
+	info2.Tail.Messages = info.Tail.Messages + 1
+	s.SetInfo(info2)
+
+	require.Equal(t, offsetBefore, s.viewport.YOffset(),
+		"a refresh while scrolled away from the bottom must keep the same line offset, clamped, never snap back to the bottom")
+}
+
+// TestSessionPane_AtBottom_StaysAtBottomAcrossInfoRefreshWithNewTurn is
+// defect 3's other half: when the viewport WAS at the bottom, a refresh that
+// appends a new turn (a live tick with fresh conversation) must still pin to
+// the bottom, showing the newest turn.
+func TestSessionPane_AtBottom_StaysAtBottomAcrossInfoRefreshWithNewTurn(t *testing.T) {
+	base := time.Date(2026, 9, 2, 18, 0, 0, 0, time.Local)
+	var turns []clarity.Turn
+	for i := 0; i < 60; i++ {
+		turns = append(turns, clarity.Turn{
+			Kind: clarity.TurnOwner,
+			At:   base.Add(time.Duration(i) * time.Minute),
+			Text: fmt.Sprintf("turn number %d", i),
+		})
+	}
+	info := fixtureInfo()
+	info.Tail.Turns = turns
+
+	s := NewSessionPane()
+	s.SetSize(80, 20)
+	s.SetInfo(info)
+	require.True(t, s.viewport.AtBottom(), "test setup must start pinned to the bottom")
+
+	turns2 := append(append([]clarity.Turn{}, turns...), clarity.Turn{
+		Kind: clarity.TurnOwner, At: base.Add(60 * time.Minute), Text: "turn number 60",
+	})
+	info2 := fixtureInfo()
+	info2.Tail.Turns = turns2
+	s.SetInfo(info2)
+
+	require.Contains(t, s.String(), "turn number 60", "still pinned to bottom, the newest turn appended by a live tick must be visible")
+}
+
 // TestSessionPane_EarlierDivider_ShownOnlyWhenTruncated is the header's own
 // conditional row.
 func TestSessionPane_EarlierDivider_ShownOnlyWhenTruncated(t *testing.T) {
@@ -212,6 +285,32 @@ func TestSessionPane_HeaderLine1_LaneNameSurvivesNarrowPane(t *testing.T) {
 	line1 := strings.Split(s.String(), "\n")[0]
 	require.Contains(t, line1, "ways-of-working", "the lane name must survive even when the full right block does not fit")
 	require.LessOrEqual(t, ansi.StringWidth(line1), 62)
+}
+
+// TestSessionPane_HeaderLine2_TruncatesLeftNeverDropsBranchOrModel is
+// defect 2's own rule for the Session pane's header line 2: on a pane too
+// narrow for the whole "workdir · branch · model · window" left block
+// alongside the right-hand msgs/session block, the LEFT-MOST field (the
+// working directory - the least essential, since the lane name is already
+// on line 1) is what gets truncated, never the branch or model that follow
+// it in the same joined string. Before this fix, padRow's own
+// keep-the-front/cut-the-tail truncation did the opposite: the long workdir
+// path survived whole and everything after it - branch, model, window - was
+// the part silently cut off.
+func TestSessionPane_HeaderLine2_TruncatesLeftNeverDropsBranchOrModel(t *testing.T) {
+	pinHome(t)
+	info := fixtureInfo()
+	info.WorkDir = "/Users/allencoates/projects/Clarity/sessions/a-very-long-lane-name-that-eats-the-whole-header-line"
+
+	s := NewSessionPane()
+	s.SetSize(90, 30)
+	s.SetInfo(info)
+
+	line2 := strings.Split(s.String(), "\n")[1]
+	require.LessOrEqual(t, ansi.StringWidth(line2), 90)
+	require.Contains(t, line2, "main", "header line 2 must never drop the branch to make room for the workdir")
+	require.Contains(t, line2, "fable-5-1", "header line 2 must never drop the model to make room for the workdir")
+	require.Contains(t, line2, "…", "an overflowing left block truncates with an ellipsis, not a silent cut")
 }
 
 // TestSessionPane_NeverExceedsPaneDimensions is the FINISH requirement at

@@ -129,6 +129,31 @@ func TestUpdateHandleWindowSizeEvent_CollapsesBelowThreshold(t *testing.T) {
 	require.NotEmpty(t, h.tabbedWindow.String(), "at/above the collapse threshold the preview/diff pane renders")
 }
 
+// TestListWidthForTerminal_ClampedTo28PercentBetween38And52 is defect 2's
+// own rule, verbatim: listWidth = clamp(int(width*0.28), 38, 52) - replacing
+// the old flat 40% split so the compact list row (name/pct/glyph+word/time)
+// gets just what it needs and the Session pane's header line 2 gets the rest.
+func TestListWidthForTerminal_ClampedTo28PercentBetween38And52(t *testing.T) {
+	cases := []struct{ width, want int }{
+		{100, 38}, // 28: below listWidthMin, clamped up
+		{120, 38}, // 33.6->33: below listWidthMin, clamped up
+		{164, 45}, // 45.9->45: within bounds, unclamped
+		{200, 52}, // 56: above listWidthMax, clamped down
+	}
+	for _, c := range cases {
+		require.Equalf(t, c.want, listWidthForTerminal(c.width), "width %d", c.width)
+	}
+}
+
+// TestUpdateHandleWindowSizeEvent_ListGetsNewProportion is the same rule at
+// the app level: the list's own SetSize call receives listWidthForTerminal's
+// value, not the old 40%.
+func TestUpdateHandleWindowSizeEvent_ListGetsNewProportion(t *testing.T) {
+	h := newHome(context.Background(), "true", false, true)
+	h.updateHandleWindowSizeEvent(tea.WindowSizeMsg{Width: 164, Height: 45})
+	require.Equal(t, 45, h.list.Width(), "164 columns must give the list 45 (clamp(int(164*0.28),38,52)), not the old 40%-share of 65")
+}
+
 // TestFeedTick_ComputesContextFillForPausedInstances is the OWN ROW
 // defect's "ctx n/a" root cause, exercised at the app level:
 // tickUpdateMetadataCmd only ever computes context fill for

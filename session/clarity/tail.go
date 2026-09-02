@@ -140,6 +140,50 @@ type rawContentItem struct {
 	IsError   bool            `json:"is_error"`    // tool_result
 }
 
+// harnessRecordTags are the fixed tags the harness itself writes at the
+// start of an injected user record (a task-notification, a system-reminder,
+// a slash-command echo, a local-command result, a cross-session relay) -
+// confirmed against a live transcript's own task-notification body
+// (/Users/allencoates/.claude/projects/-Users-allencoates-projects-Clarity-sessions-ways-of-working/0027514b-8a29-48c8-b98e-ff6b81b4ecf4.jsonl,
+// grep "<task-notification>" in a user record; see the leg's report for the
+// quoted sample) before this file was written. A user string record that
+// starts with one of these, after trimming, is a harness note the owner
+// never typed - never an owner Turn, DEFECT 1's own rule.
+var harnessRecordTags = []string{
+	"<system-reminder>",
+	"<task-notification>",
+	"<command-name>",
+	"<command-message>",
+	"<local-command-stdout>",
+	"<local-command-caveat>",
+	"<cross-session-message>",
+}
+
+// isHarnessTaggedText reports whether s, trimmed, starts with one of
+// harnessRecordTags.
+func isHarnessTaggedText(s string) bool {
+	trimmed := strings.TrimSpace(s)
+	for _, tag := range harnessRecordTags {
+		if strings.HasPrefix(trimmed, tag) {
+			return true
+		}
+	}
+	return false
+}
+
+// isHarnessTaggedUserRecord reports whether r is a "user" record whose
+// message content is a plain string starting with a harness tag - the same
+// test buildTurns applies before rendering an owner Turn, reused here so
+// ClassifyState's anchor walk and the turn stream can never disagree about
+// which records are harness notes.
+func isHarnessTaggedUserRecord(r rawRecord) bool {
+	if r.Type != "user" || r.Message == nil {
+		return false
+	}
+	text, _, isString := parseContentItems(r.Message.Content)
+	return isString && isHarnessTaggedText(text)
+}
+
 // untimestampedBookkeepingTypes are the record types ClassifyState's
 // backward walk steps past, verified on 2 Sep against five live lanes by
 // the design leg (DECISIONS.md, slice 1). A record of one of these types is
@@ -337,8 +381,24 @@ func ClassifyState(records []rawRecord, now time.Time) stateResult {
 }
 
 // lastTimestampedRecord walks records backward, skipping any record of an
-// untimestampedBookkeepingTypes type or one that carries no parseable
-// timestamp, and returns the first (i.e. chronologically last) one found.
+// untimestampedBookkeepingTypes type, a harness-tagged user record that is
+// not itself the very last record in the tail, or one that carries no
+// parseable timestamp - and returns the first (i.e. chronologically last)
+// one found.
+//
+// DEFECT 1's anchor choice: a harness-tagged user record (task-notification,
+// system-reminder, etc.) is skipped like any other bookkeeping record when
+// something else follows it, exactly the away_summary/stop_hook_summary
+// treatment above - it never interrupts the search for the real last
+// conversational record. But when the tagged record IS the last record in
+// the tail (nothing follows it - the live case this rule was written for: a
+// task-notification landing after the owner's real last turn), it still
+// counts as the anchor, read as an open turn on its own timestamp. The
+// alternative - never letting a tagged record anchor at all - would leave a
+// lane that just received a notification with no anchor whatsoever once
+// every earlier record is bookkeeping too, which is a worse answer than
+// treating the harness's own write to the transcript as evidence the lane
+// is live, even though that write never renders as a Turn.
 func lastTimestampedRecord(records []rawRecord) (rawRecord, bool) {
 	for i := len(records) - 1; i >= 0; i-- {
 		r := records[i]
@@ -348,6 +408,9 @@ func lastTimestampedRecord(records []rawRecord) (rawRecord, bool) {
 		if r.Type == "system" && r.Subtype != "turn_duration" {
 			// away_summary, stop_hook_summary, local_command: harness notes,
 			// not conversation; they never open or close a turn.
+			continue
+		}
+		if isHarnessTaggedUserRecord(r) && i != len(records)-1 {
 			continue
 		}
 		if strings.TrimSpace(r.Timestamp) == "" {
@@ -572,7 +635,12 @@ func buildTurns(records []rawRecord, maxTurns int) (turns []Turn, trimmed bool) 
 		switch r.Type {
 		case "user":
 			text, _, isString := parseContentItems(r.Message.Content)
-			if isString {
+			// DEFECT 1: a string-content user record is an owner turn only
+			// when it is not one of the harness's own injected notes
+			// (task-notification, system-reminder, etc.) - those are
+			// harness bookkeeping, skipped from the turn stream entirely,
+			// never rendered as if the owner had typed them.
+			if isString && !isHarnessTaggedText(text) {
 				turns = append(turns, Turn{Kind: TurnOwner, At: at, Text: text})
 			}
 

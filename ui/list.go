@@ -108,74 +108,118 @@ func laneStateGlyph(state string) (string, lipgloss.Style) {
 	}
 }
 
-// laneStateWordWidth is the widest of the four state words ClassifyState
-// produces ("waiting on you") - the state field is padded to this width on
-// every row so the last-turn time lands in the same column regardless of
-// which word a given row shows.
-var laneStateWordWidth = len(clarity.StateWaitingYou)
+// laneStateDisplayWord is the WORD a lane row itself shows for state - the
+// row's own vocabulary is exactly working/waiting/idle/stalled (THE RULE),
+// never ClassifyState's raw StateWaitingYou value ("waiting on you"), which
+// only the Session pane's header and state line render in full
+// (renderHeaderLine1/renderStateLine in session.go - unchanged by this fix).
+func laneStateDisplayWord(state string) string {
+	if state == clarity.StateWaitingYou {
+		return "waiting"
+	}
+	return state
+}
 
-// laneCtxFieldWidth is "ctx 100%" - the widest a context-fill percentage
-// ever renders (0-100%, three digits plus a leading 100% edge case), fixed
-// so the field's own width never changes row to row; the percentage
-// right-aligns inside it (item 1's "ctx percentage right-aligned").
-const laneCtxFieldWidth = len("ctx 100%")
+// laneStateWordWidth is the widest of the row's own four display words
+// (laneStateDisplayWord's output: working/waiting/idle/stalled - "working",
+// "waiting" and "stalled" are all 7, "idle" is 4). DEFECT: this used to be
+// len(clarity.StateWaitingYou), the Session pane's own 14-character "waiting
+// on you" phrase that a row never actually renders - reserving 15 columns
+// (14 + the separating space) for a word column that only ever shows 7,
+// starving the name column by exactly that much on every row.
+var laneStateWordWidth = len(clarity.StateWorking)
+
+// lanePctFieldWidth is "100%" - the widest a context-fill percentage ever
+// renders (0-100%, the 100% edge case), fixed so the field's own width
+// never changes row to row; the percentage right-aligns inside it (item 1's
+// "ctx percentage right-aligned"). DEFECT 2 dropped the "ctx" label this
+// field used to carry (design/cockpit-pane/DECISIONS.md slice 3b: "the
+// percentage without the ctx label") - it stays on the Session pane's own
+// header line 1 (ctxBarLabel in session.go), a different component with
+// room to spare; the lane row does not.
+const lanePctFieldWidth = len("100%")
 
 // laneTimeWidth is "15:04" - the last-turn time, local, hours:minutes.
 const laneTimeWidth = len("15:04")
 
+// laneShowTimeMinWidth is THE RULE's own second collapse point, distinct
+// from app.go's collapsePreviewBelowWidth (which drops the state WORD): a
+// row-inner width under this many columns drops the last-turn TIME entirely
+// instead - the mock-up's 120-column rows (PANE-MOCKUP-120x36.md) carry no
+// time field at all - so the name column keeps that room rather than the
+// clock does.
+const laneShowTimeMinWidth = 42
+
+// laneShowTime reports whether a row built from a rowInner budget this wide
+// carries the last-turn time field.
+func laneShowTime(rowInner int) bool {
+	return rowInner >= laneShowTimeMinWidth
+}
+
 // laneSuffixWidth is the plain-text width of laneRowSuffix's output for a
-// given showWord - kept as an explicit function (not just len() on a
-// sample render) so nameCol sizing and the actual render can never drift
-// out of step with each other.
-func laneSuffixWidth(showWord bool) int {
-	// " " + ctx + "  " + glyph + " " + time
-	w := 1 + laneCtxFieldWidth + 2 + 1 + 1 + laneTimeWidth
+// given showWord/showTime pair - kept as an explicit function (not just
+// len() on a sample render) so nameCol sizing and the actual render can
+// never drift out of step with each other.
+func laneSuffixWidth(showWord, showTime bool) int {
+	// " " + pct + "  " + glyph
+	w := 1 + lanePctFieldWidth + 2 + 1
 	if showWord {
-		// + word + " "
-		w += laneStateWordWidth + 1
+		// + " " + word
+		w += 1 + laneStateWordWidth
+	}
+	if showTime {
+		// + " " + time
+		w += 1 + laneTimeWidth
 	}
 	return w
 }
 
-// laneCtxField renders a lane's "ctx NN%" label right-justified within a
+// lanePctField renders a lane's bare "NN%" right-justified within a
 // fixed-width field, so the trailing "%" always lands in the same column
 // regardless of how many digits the percentage has (item 1's "ctx
-// percentage right-aligned") - the label itself is left-aligned within
-// that padding, so "ctx 42%" still appears as a literal, unbroken
-// substring rather than gaining an internal gap. When the fill genuinely
-// cannot be derived the number is blank (not "n/a", the OWN ROW fix's
-// rule) but the "ctx" label still marks the column.
-func laneCtxField(pct int, ok bool) string {
+// percentage right-aligned", now without the "ctx" label - defect 2). When
+// the fill genuinely cannot be derived the field is blank (not "n/a", the
+// OWN ROW fix's rule, and no longer a bare "ctx" placeholder either, since
+// that label no longer prints at all).
+func lanePctField(pct int, ok bool) string {
 	if !ok {
-		return runewidth.FillRight("ctx", laneCtxFieldWidth)
+		return strings.Repeat(" ", lanePctFieldWidth)
 	}
-	return fmt.Sprintf("%*s", laneCtxFieldWidth, fmt.Sprintf("ctx %d%%", pct))
+	return fmt.Sprintf("%*s", lanePctFieldWidth, fmt.Sprintf("%d%%", pct))
 }
 
 // laneRowSuffix renders the fixed-width tail every lane row (tracked or
 // external) shares: right-aligned ctx, the state glyph (and word, unless
-// collapsed), then the last-turn time - the FINISH defect's "one table"
-// requirement. Every segment carries rowBg/rowFg forward explicitly (the
-// same technique the diff-stat badge already uses, see Render() below) so
-// the glyph's own state colour does not reset the row's selected-highlight
-// background for the characters after it.
-func laneRowSuffix(rowBg, rowFg color.Color, pct int, fillOK bool, state string, lastTurn time.Time, turnOK bool, showWord bool) string {
+// collapsed), then the last-turn time (unless the row is too narrow to
+// carry it - laneShowTime) - the FINISH defect's "one table" requirement.
+// Every segment carries rowBg/rowFg forward explicitly (the same technique
+// the diff-stat badge already uses, see Render() below) so the glyph's own
+// state colour does not reset the row's selected-highlight background for
+// the characters after it.
+func laneRowSuffix(rowBg, rowFg color.Color, pct int, fillOK bool, state string, lastTurn time.Time, turnOK bool, showWord, showTime bool) string {
 	plain := lipgloss.NewStyle().Background(rowBg).Foreground(rowFg)
 	glyph, glyphStyle := laneStateGlyph(state)
 	glyphStyle = glyphStyle.Background(rowBg)
 
-	timeText := strings.Repeat(" ", laneTimeWidth)
-	if turnOK {
-		timeText = lastTurn.Local().Format("15:04")
+	pctSeg := plain.Render(lanePctField(pct, fillOK))
+
+	var wordSeg string
+	if showWord {
+		word := plain.Foreground(glyphStyle.GetForeground()).
+			Render(runewidth.FillRight(laneStateDisplayWord(state), laneStateWordWidth))
+		wordSeg = " " + word
 	}
 
-	ctx := plain.Render(laneCtxField(pct, fillOK))
-	timeSeg := plain.Render(timeText)
-	if !showWord {
-		return fmt.Sprintf(" %s  %s %s", ctx, glyphStyle.Render(glyph), timeSeg)
+	var timeSeg string
+	if showTime {
+		timeText := strings.Repeat(" ", laneTimeWidth)
+		if turnOK {
+			timeText = lastTurn.Local().Format("15:04")
+		}
+		timeSeg = " " + plain.Render(timeText)
 	}
-	word := plain.Foreground(glyphStyle.GetForeground()).Render(runewidth.FillRight(state, laneStateWordWidth))
-	return fmt.Sprintf(" %s  %s %s %s", ctx, glyphStyle.Render(glyph), word, timeSeg)
+
+	return fmt.Sprintf(" %s  %s%s%s", pctSeg, glyphStyle.Render(glyph), wordSeg, timeSeg)
 }
 
 type List struct {
@@ -286,6 +330,13 @@ func (l *List) NumInstances() int {
 	return len(l.items)
 }
 
+// Width returns the column width SetSize last gave this list - app.go's own
+// TestUpdateHandleWindowSizeEvent_ListGetsNewProportion reads this to prove
+// the app-level split, not just listWidthForTerminal in isolation.
+func (l *List) Width() int {
+	return l.width
+}
+
 // rowInnerWidth is the width budget for one "Needs you" feed line or
 // external-lane row's raw content, ansi-aware and truncated with an
 // ellipsis when a line runs over it (ansiTruncateRow, below). It mirrors
@@ -296,7 +347,7 @@ func (l *List) NumInstances() int {
 // lipgloss.Place (List.String()'s own final wrapper) is a documented no-op
 // once content already exceeds the width it was given, it never truncates.
 func (l *List) rowInnerWidth() int {
-	w := AdjustPreviewWidth(l.width) - 2
+	w := l.width - 2
 	if w < 1 {
 		w = 1
 	}
@@ -306,25 +357,51 @@ func (l *List) rowInnerWidth() int {
 // ansiTruncateRow truncates s to width cells, ansi- and grapheme-aware
 // (github.com/charmbracelet/x/ansi.Truncate - never a byte slice, which
 // would both miscount wide/multi-byte runes and could sever an escape
-// sequence mid-code).
+// sequence mid-code). Keeps s's own FRONT, ellipsis-cuts the tail.
 func ansiTruncateRow(s string, width int) string {
 	return ansi.Truncate(s, width, "…")
 }
 
-// laneNameColMax is the widest the name column is ever allowed to be - long
-// enough for this fleet's actual lane names (see the OVERFLOW repro
-// capture: 21-27 characters) without eating into the suffix's budget on a
-// wide terminal. Shared by both row kinds (item 4's "one table").
-const laneNameColMax = 28
+// ansiTruncateLeftRow is ansiTruncateRow's mirror: it keeps s's own TAIL,
+// ellipsis-cutting the front instead - session.go's header line 2 uses this
+// (DEFECT 2) so a long working-directory path is what gets sacrificed, never
+// the branch/model/window that follow it in the same joined string.
+// ansi.TruncateLeft(s, n, prefix) removes n CELLS from the front and adds
+// prefix, so hitting an exact target width needs n = currentWidth - width +
+// len(prefix) - proven against ansi.TruncateLeft's own behaviour before this
+// was written (see the leg's report).
+func ansiTruncateLeftRow(s string, width int) string {
+	w := ansi.StringWidth(s)
+	if w <= width {
+		return s
+	}
+	const prefix = "…"
+	n := w - width + runewidth.StringWidth(prefix)
+	if n < 0 {
+		n = 0
+	}
+	return ansi.TruncateLeft(s, n, prefix)
+}
 
-// laneRowInnerWidth converts a component's own AdjustPreviewWidth(list
-// width) into the row-content budget List.rowInnerWidth() computes for the
-// "Needs you"/external section (that -2 is the small left/right padding
-// those styles apply). InstanceRenderer's r.width is already
-// AdjustPreviewWidth(list width) (see setWidth below), so this is the one
-// place both the tracked-instance title line and the external rows derive
-// their shared column grid from, instead of two independently-drifting
-// calculations.
+// laneNameColMax is the widest the name column is ever allowed to be -
+// defect 2's own "name column padded to 20 (truncate with … beyond)", down
+// from the old 28 (which the old, wider 40%-of-terminal list column could
+// spare; the new, narrower listWidthForTerminal share cannot). Shared by
+// both row kinds (item 4's "one table").
+const laneNameColMax = 20
+
+// laneRowInnerWidth converts a component's own width into the row-content
+// budget List.rowInnerWidth() computes for the "Needs you"/external
+// section (that -2 is the small left/right padding those styles apply).
+// InstanceRenderer's r.width is the SAME list width (see setWidth below,
+// defect 2: this used to run every list row through AdjustPreviewWidth's
+// own 0.9 factor first - a function named, and still used, for the
+// TABBED WINDOW's preview-pane sizing, reused here purely by historical
+// accident per the git history, and one the new compact row format cannot
+// afford to keep discarding 10% of its own, already-narrower column to),
+// so this is the one place both the tracked-instance title line and the
+// external rows derive their shared column grid from, instead of two
+// independently-drifting calculations.
 func laneRowInnerWidth(componentWidth int) int {
 	w := componentWidth - 2
 	if w < 1 {
@@ -341,9 +418,12 @@ func laneRowInnerWidth(componentWidth int) int {
 // column" requirement, generalized to both row kinds). It shrinks below
 // laneNameColMax on a narrow list column so the suffix - the state
 // information that matters most - is never the part a too-wide fixed name
-// column pushes past the row's own truncation and off the edge.
+// column pushes past the row's own truncation and off the edge. showTime is
+// derived from rowInner itself (laneShowTime), the same budget the caller
+// must use when it goes on to render laneRowSuffix, so the two can never
+// disagree about whether the time field is in play.
 func laneNameColWidthFor(rowInner int, showWord bool) int {
-	avail := rowInner - laneSuffixWidth(showWord)
+	avail := rowInner - laneSuffixWidth(showWord, laneShowTime(rowInner))
 	const minCol = 6
 	if avail < minCol {
 		avail = minCol
@@ -366,8 +446,11 @@ type InstanceRenderer struct {
 	width   int
 }
 
+// setWidth records the list's own column width directly (defect 2: this
+// used to run it through AdjustPreviewWidth's 0.9 factor first - see
+// laneRowInnerWidth's own comment on why that coupling is gone).
 func (r *InstanceRenderer) setWidth(width int) {
-	r.width = AdjustPreviewWidth(width)
+	r.width = width
 }
 
 // ɹ and ɻ are other options.
@@ -392,12 +475,13 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, h
 	// end with, since ClassifyState's four words are a strict superset of
 	// what that conveyed (a Paused instance's transcript reads idle or
 	// stalled on its own merits).
-	nameCol := laneNameColWidthFor(laneRowInnerWidth(r.width), showWord)
+	rowInner := laneRowInnerWidth(r.width)
+	nameCol := laneNameColWidthFor(rowInner, showWord)
 	name := runewidth.FillRight(runewidth.Truncate(prefix+i.Title, nameCol, "…"), nameCol)
 
 	pct, fillOK := i.GetContextFill()
 	state, lastTurn, turnOK := i.GetLaneState()
-	suffix := laneRowSuffix(titleS.GetBackground(), titleS.GetForeground(), pct, fillOK, state, lastTurn, turnOK, showWord)
+	suffix := laneRowSuffix(titleS.GetBackground(), titleS.GetForeground(), pct, fillOK, state, lastTurn, turnOK, showWord, laneShowTime(rowInner))
 	// titleS carries its own left/right Padding, added once by wrapping the
 	// WHOLE truncated line in it here (not the name alone) - the truncation
 	// budget (laneRowInnerWidth) already excludes that padding's width, so
@@ -427,10 +511,25 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, h
 		)
 	}
 
-	remainingWidth := r.width
+	// laneRowInnerWidth(r.width), not r.width itself: descS (below) carries
+	// the same left/right Padding as titleS, so the branch line's own fill
+	// target has to leave the same 2 columns of room the title line already
+	// does via this same helper - a pre-existing gap in this budget (it
+	// always started from the bare r.width) that stayed invisible while
+	// r.width was itself discounted 10% by AdjustPreviewWidth, and became a
+	// real overflow the moment defect 2 removed that discount to give the
+	// list column back its own full width.
+	remainingWidth := laneRowInnerWidth(r.width)
 	remainingWidth -= runewidth.StringWidth(prefix)
 	remainingWidth -= runewidth.StringWidth(branchIcon)
-	remainingWidth -= 2 // for the literal " " and "-" in the branchLine format string
+	// 3, not 2: the branchLine format string below ("%s %s%s %s") carries
+	// TWO literal separator spaces (one before branchSegment, one before
+	// diff) plus the "-" inside branchSegment's own "<icon>-<branch>" -
+	// this budget only ever subtracted one of the two spaces, a pre-
+	// existing gap that stayed invisible while r.width was itself
+	// discounted 10% by AdjustPreviewWidth and became a real one-column
+	// overflow the moment defect 2 removed that discount.
+	remainingWidth -= 3
 
 	diffWidth := runewidth.StringWidth(addedDiff) + runewidth.StringWidth(removedDiff)
 	if diffWidth > 0 {
@@ -570,7 +669,7 @@ func (l *List) String() string {
 			nameCol := l.laneNameColWidth(showWord)
 			name := runewidth.FillRight(ansiTruncateRow(lane.Name, nameCol), nameCol)
 			suffix := laneRowSuffix(style.GetBackground(), style.GetForeground(),
-				lane.Fill.Pct, lane.FillOK, lane.State, lane.LastTurn, lane.StateOK, showWord)
+				lane.Fill.Pct, lane.FillOK, lane.State, lane.LastTurn, lane.StateOK, showWord, laneShowTime(innerWidth))
 			// style carries its own left/right Padding, added once by
 			// wrapping the WHOLE truncated line in it here (not the name
 			// alone) - see the matching comment on the tracked-row title
