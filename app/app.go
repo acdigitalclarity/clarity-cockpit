@@ -9,6 +9,7 @@ import (
 	"claude-squad/session/git"
 	"claude-squad/ui"
 	"claude-squad/ui/overlay"
+	"claude-squad/ui/splash"
 	"context"
 	"fmt"
 	"os"
@@ -24,12 +25,15 @@ import (
 
 const GlobalInstanceLimit = 10
 
-// Run is the main entrypoint into the application.
-func Run(ctx context.Context, program string, autoYes bool) error {
+// Run is the main entrypoint into the application. noSplash skips the
+// entrance splash screen and starts directly in the instance list -
+// clarity-attach, discover and msg never call Run at all, so they never
+// show the splash regardless of this flag.
+func Run(ctx context.Context, program string, autoYes bool, noSplash bool) error {
 	// AltScreen and mouse-cell-motion (scroll) are now declared per-View,
 	// see (*home).View below - v2's declarative View fields replace v1's
 	// NewProgram options.
-	p := tea.NewProgram(newHome(ctx, program, autoYes))
+	p := tea.NewProgram(newHome(ctx, program, autoYes, noSplash))
 	_, err := p.Run()
 	return err
 }
@@ -119,9 +123,14 @@ type home struct {
 	textOverlay *overlay.TextOverlay
 	// confirmationOverlay displays confirmation modals
 	confirmationOverlay *overlay.ConfirmationOverlay
+
+	// splashModel is the entrance/idle animation shown before the list -
+	// nil once handed off (any key press, or 2s after the entrance
+	// completes), and nil from construction entirely when noSplash is set.
+	splashModel *splash.Model
 }
 
-func newHome(ctx context.Context, program string, autoYes bool) *home {
+func newHome(ctx context.Context, program string, autoYes bool, noSplash bool) *home {
 	// Load application config
 	appConfig := config.LoadConfig()
 
@@ -148,6 +157,9 @@ func newHome(ctx context.Context, program string, autoYes bool) *home {
 		autoYes:      autoYes,
 		state:        stateDefault,
 		appState:     appState,
+	}
+	if !noSplash {
+		h.splashModel = splash.New()
 	}
 	h.list = ui.NewList(&h.spinner, autoYes)
 
@@ -203,7 +215,15 @@ func (m *home) updateHandleWindowSizeEvent(msg tea.WindowSizeMsg) {
 func (m *home) Init() tea.Cmd {
 	// Upon starting, we want to start the spinner. Whenever we get a spinner.TickMsg, we
 	// update the spinner, which sends a new spinner.TickMsg. I think this lasts forever lol.
-	return tea.Batch(
+	//
+	// The list's own background ticks (spinner, preview, metadata, feed)
+	// start immediately, splash or no splash, so the list is already warm
+	// with real data the instant the splash hands off - no extra tick
+	// needed to populate it (the "no visual glitch" requirement). The
+	// splash's own tick and the window-size request are returned alongside
+	// them.
+	cmds := []tea.Cmd{
+		tea.RequestWindowSize,
 		m.spinner.Tick,
 		func() tea.Msg {
 			time.Sleep(100 * time.Millisecond)
@@ -211,11 +231,24 @@ func (m *home) Init() tea.Cmd {
 		},
 		tickUpdateMetadataCmd(m.snapshotActiveInstances(), m.list.GetSelectedInstance()),
 		func() tea.Msg { return feedTickMsg{} },
-	)
+	}
+	if m.splashModel != nil {
+		cmds = append(cmds, m.splashModel.Tick())
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case splash.TickMsg:
+		if m.splashModel == nil {
+			return m, nil
+		}
+		cmd := m.splashModel.Update(msg)
+		if m.splashModel.Done() {
+			m.splashModel = nil
+		}
+		return m, cmd
 	case hideErrMsg:
 		m.errBox.Clear()
 		m.hasErr = false
@@ -341,9 +374,20 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.KeyPressMsg:
+		// Any key press during the splash hands off to the list and does
+		// nothing else this tick - the brief's "hand-off... on any key
+		// press", not also acted on as a list command.
+		if m.splashModel != nil {
+			m.splashModel.HandleKey()
+			m.splashModel = nil
+			return m, nil
+		}
 		return m.handleKeyPress(msg)
 	case tea.WindowSizeMsg:
 		m.updateHandleWindowSizeEvent(msg)
+		if m.splashModel != nil {
+			m.splashModel.SetSize(msg.Width, msg.Height)
+		}
 		return m, nil
 	case error:
 		// Handle errors from confirmation actions
@@ -1227,6 +1271,12 @@ func (m *home) confirmAction(message string, action tea.Cmd) tea.Cmd {
 }
 
 func (m *home) View() tea.View {
+	if m.splashModel != nil {
+		v := tea.NewView(m.splashModel.View())
+		v.AltScreen = true
+		return v
+	}
+
 	listWithPadding := lipgloss.NewStyle().PaddingTop(1).Render(m.list.String())
 	previewWithPadding := lipgloss.NewStyle().PaddingTop(1).Render(m.tabbedWindow.String())
 	listAndPreview := lipgloss.JoinHorizontal(lipgloss.Top, listWithPadding, previewWithPadding)
