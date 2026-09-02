@@ -299,8 +299,8 @@ func TestRenderHeaderLine(t *testing.T) {
 	line := RenderHeaderLine("fixture-lane", tail)
 	require.Contains(t, line, "fixture-lane")
 	require.Contains(t, line, StateWorking)
-	require.Contains(t, line, "last turn 19:59:00")
-	require.Contains(t, line, "last write 20:00:00")
+	require.Contains(t, line, "last turn "+now.Add(-1*time.Minute).Local().Format("15:04:05"))
+	require.Contains(t, line, "last write "+now.Local().Format("15:04:05"))
 	require.Contains(t, line, tail.StateReason)
 }
 
