@@ -222,6 +222,23 @@ func TestDiscoverExternalLanes_ExcludesTrackedPathViaSessionsFolder(t *testing.T
 	require.Empty(t, lanes, "a tracked session lane must not double-list as an external row")
 }
 
+// TestDiscoverExternalLanes_PopulatesWorkDir is the Session pane header's
+// own requirement (design/cockpit-pane/DECISIONS.md slice 3): an external
+// lane's WorkDir comes from the same "cwd" transcript field
+// TrackedExclusionPaths matching already reads, not left blank.
+func TestDiscoverExternalLanes_PopulatesWorkDir(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(ClaudeProjectsRootEnvVar, root)
+
+	lanePath := "/Users/allencoates/projects/Clarity/sessions/fixture-workdir"
+	mkTranscriptDirWithCwd(t, root, "-Users-allencoates-projects-Clarity-sessions-fixture-workdir", "a.jsonl", time.Minute, lanePath)
+
+	lanes, err := DiscoverExternalLanes(nil)
+	require.NoError(t, err)
+	require.Len(t, lanes, 1)
+	require.Equal(t, lanePath, lanes[0].WorkDir)
+}
+
 func TestMatchesQueriedLane_BareAndSessionsPrefixed(t *testing.T) {
 	// The shape DiscoverExternalLanes actually produces: Name stripped of
 	// the "sessions-" prefix for display, Key keeping the full form for

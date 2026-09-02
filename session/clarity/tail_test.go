@@ -401,6 +401,59 @@ func TestReadLaneTail_TailLargerThanMaxBytes_DiscardsPartialFirstLine(t *testing
 	require.True(t, found, "the marker turn after the cut must still parse correctly")
 }
 
+// TestReadLaneTail_Truncated_ByteWindowCut is the Session pane's "⋯ earlier
+// in this session" divider's own precondition: when the byte-window seek
+// starts past the file's beginning, Truncated must be true even if every
+// turn that survived the cut still fits under maxTurns.
+func TestReadLaneTail_Truncated_ByteWindowCut(t *testing.T) {
+	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
+	var lines []string
+	for i := 0; i < 40; i++ {
+		lines = append(lines, assistantTextLine(now.Add(-time.Duration(40-i)*time.Hour),
+			"claude-fable-5-1", fmt.Sprintf("filler line number %d padded out with extra words to take up real space", i)))
+	}
+	lines = append(lines, turnDurationLine(now.Add(-10*time.Second), 500, 6, 0))
+	path := writeFixture(t, lines)
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	maxBytes := int(info.Size() / 3)
+
+	tail, err := ReadLaneTail(path, maxBytes, DefaultTailTurns, now)
+	require.NoError(t, err)
+	require.True(t, tail.Truncated, "a byte-window cut mid-file must be reported as truncated")
+}
+
+// TestReadLaneTail_Truncated_MaxTurnsCut is the divider's other precondition:
+// a small maxBytes never triggers (the whole file fits), but maxTurns still
+// drops earlier turns.
+func TestReadLaneTail_Truncated_MaxTurnsCut(t *testing.T) {
+	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
+	var lines []string
+	for i := 0; i < 5; i++ {
+		lines = append(lines, ownerLine(now.Add(-time.Duration(5-i)*time.Minute), fmt.Sprintf("turn %d", i)))
+	}
+	path := writeFixture(t, lines)
+
+	tail, err := ReadLaneTail(path, DefaultTailMaxBytes, 2, now)
+	require.NoError(t, err)
+	require.True(t, tail.Truncated, "maxTurns dropping earlier turns must be reported as truncated")
+	require.Len(t, tail.Turns, 2)
+}
+
+// TestReadLaneTail_NotTruncated_WholeSessionFits is the negative control:
+// nothing cut, nothing dropped, Truncated must read false.
+func TestReadLaneTail_NotTruncated_WholeSessionFits(t *testing.T) {
+	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
+	path := writeFixture(t, []string{
+		ownerLine(now.Add(-time.Minute), "only turn"),
+	})
+
+	tail, err := ReadLaneTail(path, DefaultTailMaxBytes, DefaultTailTurns, now)
+	require.NoError(t, err)
+	require.False(t, tail.Truncated, "a session that fits whole must not read as truncated")
+}
+
 func TestClassifyState_EmptyTranscript_IdleWithReason(t *testing.T) {
 	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
 	path := writeFixture(t, nil)

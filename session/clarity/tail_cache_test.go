@@ -1,6 +1,7 @@
 package clarity
 
 import (
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -22,7 +23,7 @@ func TestLaneTailCache_UnchangedFileNotReparsed(t *testing.T) {
 	require.NoError(t, err)
 
 	c := NewLaneTailCache()
-	first, err := c.Get(path, now)
+	first, err := c.Get(path, 0, now)
 	require.NoError(t, err)
 	require.Equal(t, StateIdle, first.State)
 
@@ -35,7 +36,7 @@ func TestLaneTailCache_UnchangedFileNotReparsed(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte(workingLine), 0644))
 	require.NoError(t, os.Chtimes(path, info.ModTime(), info.ModTime()))
 
-	second, err := c.Get(path, now)
+	second, err := c.Get(path, 0, now)
 	require.NoError(t, err)
 	require.Equal(t, StateIdle, second.State, "mtime and size unchanged: Get must return the cached (stale) result, not reparse")
 }
@@ -49,14 +50,37 @@ func TestLaneTailCache_ChangedSizeReparses(t *testing.T) {
 	path := writeFixture(t, []string{turnDurationLine(idleAt, 1000, 3, 0)})
 
 	c := NewLaneTailCache()
-	first, err := c.Get(path, now)
+	first, err := c.Get(path, 0, now)
 	require.NoError(t, err)
 	require.Equal(t, StateIdle, first.State)
 
 	workingAt := now.Add(-time.Second)
 	require.NoError(t, os.WriteFile(path, []byte(turnDurationLine(workingAt, 1000, 1, 2)+"\n"), 0644))
 
-	second, err := c.Get(path, now)
+	second, err := c.Get(path, 0, now)
 	require.NoError(t, err)
 	require.Equal(t, StateWorking, second.State, "a changed file must be reparsed, not served from the stale cache")
+}
+
+// TestLaneTailCache_WiderMaxTurnsReparses is the Session pane's own
+// requirement: a caller asking for more turns than the cached entry was
+// built with (list rows read the bare default; the Session pane asks for
+// 40, see design/cockpit-pane/DECISIONS.md slice 3) must get a fresh read
+// carrying that many turns, never the narrower cached slice.
+func TestLaneTailCache_WiderMaxTurnsReparses(t *testing.T) {
+	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
+	var lines []string
+	for i := 0; i < 10; i++ {
+		lines = append(lines, ownerLine(now.Add(-time.Duration(10-i)*time.Minute), fmt.Sprintf("turn %d", i)))
+	}
+	path := writeFixture(t, lines)
+
+	c := NewLaneTailCache()
+	first, err := c.Get(path, 3, now)
+	require.NoError(t, err)
+	require.Len(t, first.Turns, 3, "the narrower request must be served exactly that many turns")
+
+	second, err := c.Get(path, 8, now)
+	require.NoError(t, err)
+	require.Len(t, second.Turns, 8, "a wider request against the same unchanged file must reparse for the extra history, not return the narrower cached slice")
 }

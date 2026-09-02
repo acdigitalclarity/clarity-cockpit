@@ -156,7 +156,7 @@ func newHome(ctx context.Context, program string, autoYes bool, noSplash bool) *
 		ctx:          ctx,
 		spinner:      spinner.New(spinner.WithSpinner(spinner.MiniDot)),
 		menu:         ui.NewMenu(),
-		tabbedWindow: ui.NewTabbedWindow(ui.NewPreviewPane(), ui.NewDiffPane(), ui.NewTerminalPane()),
+		tabbedWindow: ui.NewTabbedWindow(ui.NewSessionPane(), ui.NewDiffPane(), ui.NewTerminalPane()),
 		errBox:       ui.NewErrBox(),
 		statusBox:    ui.NewStatusBox(),
 		storage:      storage,
@@ -256,12 +256,12 @@ func (m *home) updateHandleWindowSizeEvent(msg tea.WindowSizeMsg) {
 	}
 
 	// Skip when collapsed (tabsWidth == 0): TabbedWindow.SetSize leaves its
-	// last valid preview size in place rather than computing a negative
+	// last valid content size in place rather than computing a negative
 	// one, and there is nothing useful to re-apply to the real tmux panes
-	// underneath while the preview isn't shown anyway.
+	// underneath while no tab is shown anyway.
 	if tabsWidth > 0 {
-		previewWidth, previewHeight := m.tabbedWindow.GetPreviewSize()
-		if err := m.list.SetSessionPreviewSize(previewWidth, previewHeight); err != nil {
+		contentWidth, contentHeight := m.tabbedWindow.GetContentSize()
+		if err := m.list.SetSessionPreviewSize(contentWidth, contentHeight); err != nil {
 			log.ErrorLog.Print(err)
 		}
 	}
@@ -413,7 +413,7 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// path, so an external lane whose file has not changed since
 			// the last tick is not reparsed.
 			for i := range external {
-				if tail, err := m.laneTailCache.Get(external[i].TranscriptPath, now); err == nil {
+				if tail, err := m.laneTailCache.Get(external[i].TranscriptPath, 0, now); err == nil {
 					external[i].State = tail.State
 					external[i].LastTurn = tail.LastTurn
 					external[i].StateOK = true
@@ -431,7 +431,7 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !ok {
 				continue
 			}
-			tail, err := m.laneTailCache.Get(path, now)
+			tail, err := m.laneTailCache.Get(path, 0, now)
 			if err != nil {
 				continue
 			}
@@ -459,6 +459,12 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			pct, ok := inst.ComputeContextFill()
 			inst.SetContextFill(pct, ok)
 		}
+
+		// Session tab data (design/cockpit-pane/DECISIONS.md slice 3): the
+		// SELECTED row's own turns, tracked or external, on this same tick -
+		// never on the 100ms previewTickMsg cadence, since the underlying
+		// LaneTail is only as fresh as this tick anyway.
+		m.updateSessionTabInfo(now)
 
 		return m, func() tea.Msg {
 			time.Sleep(feedRefreshInterval)
@@ -831,21 +837,12 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 		return m, nil
 	}
 
-	// Exit scrolling mode when ESC is pressed and preview pane is in scrolling mode
-	// Check if Escape key was pressed and we're not in the diff tab (meaning we're in preview tab)
+	// Exit scrolling mode when ESC is pressed and the terminal pane is in
+	// scrolling mode. The Session tab has no equivalent "scroll mode" to
+	// exit - its turns are already fully loaded (bounded by maxTurns), so
+	// shift+up/down scroll it immediately with nothing to reset.
 	// Always check for escape key first to ensure it doesn't get intercepted elsewhere
 	if msg.Code == tea.KeyEsc {
-		// If in preview tab and in scroll mode, exit scroll mode
-		if m.tabbedWindow.IsInPreviewTab() && m.tabbedWindow.IsPreviewInScrollMode() {
-			// Use the selected instance from the list
-			selected := m.list.GetSelectedInstance()
-			err := m.tabbedWindow.ResetPreviewToNormalMode(selected)
-			if err != nil {
-				return m, m.handleError(err)
-			}
-			return m, m.instanceChanged()
-		}
-		// If in terminal tab and in scroll mode, exit scroll mode
 		if m.tabbedWindow.IsInTerminalTab() && m.tabbedWindow.IsTerminalInScrollMode() {
 			m.tabbedWindow.ResetTerminalToNormalMode()
 			return m, m.instanceChanged()
@@ -1091,21 +1088,19 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 	}
 }
 
-// instanceChanged updates the preview pane, menu, and diff pane based on the selected instance. It returns an error
-// Cmd if there was any error.
+// instanceChanged updates the diff/terminal panes and the menu based on the
+// selected TRACKED instance (nil for an external row or no selection). The
+// Session tab is deliberately not touched here - its data comes from the
+// feed tick only (see feedTickMsg's own Session-tab block below), on the
+// SELECTED row whichever kind it is, tracked or external.
 func (m *home) instanceChanged() tea.Cmd {
 	// selected may be nil
 	selected := m.list.GetSelectedInstance()
 
 	m.tabbedWindow.UpdateDiff(selected)
-	m.tabbedWindow.SetInstance(selected)
 	// Update menu with current instance
 	m.menu.SetInstance(selected)
 
-	// If there's no selected instance, we don't need to update the preview.
-	if err := m.tabbedWindow.UpdatePreview(selected); err != nil {
-		return m.handleError(err)
-	}
 	if err := m.tabbedWindow.UpdateTerminal(selected); err != nil {
 		return m.handleError(err)
 	}
@@ -1257,6 +1252,79 @@ func (m *home) adoptUntrackedInstances() {
 	for _, inst := range adopted {
 		m.list.AddInstance(inst)()
 	}
+}
+
+// sessionMaxTurns bounds the Session tab's own LaneTail read - large enough
+// to fill the pane at every size this app targets (120x36 through 200x55,
+// design/cockpit-pane/PANE-MOCKUP-*.md), well past the list rows' bare
+// default (they only ever look at State/LastTurn/PendingAgents, never
+// Turns).
+const sessionMaxTurns = 40
+
+// updateSessionTabInfo resolves the SELECTED row's own LaneTail (tracked or
+// external, whichever the list's cursor currently sits on) and hands it to
+// the Session pane, or clears it when nothing is selected - the pane then
+// falls back to the splash's resting frame. Called once per feedTickMsg,
+// never on the 100ms preview cadence (design/cockpit-pane/DECISIONS.md
+// slice 3's own "on the existing feed tick" requirement).
+func (m *home) updateSessionTabInfo(now time.Time) {
+	if m.tabbedWindow == nil {
+		// A *home built directly in a test (skipping newHome, see
+		// laneTailCache's own doc comment) has no tabbed window to update.
+		return
+	}
+	info := m.selectedSessionInfo(now)
+	m.tabbedWindow.SetSessionInfo(info)
+
+	live, needsYou := splash.FleetCounts()
+	m.tabbedWindow.SetSessionFleetCounts(live, needsYou)
+}
+
+// selectedSessionInfo builds the ui.SessionInfo for whichever row is
+// selected, or nil when nothing is (list empty, or the cursor is on neither
+// list's rows).
+func (m *home) selectedSessionInfo(now time.Time) *ui.SessionInfo {
+	if selected := m.list.GetSelectedInstance(); selected != nil {
+		path, ok := clarity.NewestTranscript(selected.Path)
+		if !ok {
+			return nil
+		}
+		tail, err := m.laneTailCache.Get(path, sessionMaxTurns, now)
+		if err != nil {
+			return nil
+		}
+		branch := ""
+		if selected.HasWorktree() {
+			branch = selected.Branch
+		}
+		ctxPct, ctxOK := selected.GetContextFill()
+		return &ui.SessionInfo{
+			Lane:    selected.Title,
+			WorkDir: selected.Path,
+			Branch:  branch,
+			Tail:    tail,
+			CtxPct:  ctxPct,
+			CtxOK:   ctxOK,
+			Now:     now,
+		}
+	}
+
+	if ext, ok := m.list.GetSelectedExternalLane(); ok {
+		tail, err := m.laneTailCache.Get(ext.TranscriptPath, sessionMaxTurns, now)
+		if err != nil {
+			return nil
+		}
+		return &ui.SessionInfo{
+			Lane:    ext.Name,
+			WorkDir: ext.WorkDir,
+			Tail:    tail,
+			CtxPct:  ext.Fill.Pct,
+			CtxOK:   ext.FillOK,
+			Now:     now,
+		}
+	}
+
+	return nil
 }
 
 // snapshotActiveInstances returns the currently active (started, not paused)

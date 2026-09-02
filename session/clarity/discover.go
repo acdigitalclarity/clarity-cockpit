@@ -46,6 +46,14 @@ type ExternalLane struct {
 	Fill           Fill
 	FillOK         bool
 
+	// WorkDir is the lane's own working directory, read straight from the
+	// transcript's "cwd" field (readTranscriptCwd below) - the same value
+	// TrackedExclusionPaths matching already reads, kept here too so the
+	// Session pane's header (design/cockpit-pane/DECISIONS.md slice 3) can
+	// show an external lane's workdir the same way it shows a tracked
+	// instance's. "" when the scan window never found a cwd record.
+	WorkDir string
+
 	// State, LastTurn and StateOK are the lane's clarity.ReadLaneTail
 	// classification (working/waiting on you/idle/stalled) - populated by
 	// the caller (app.go's feedTickMsg handler, via a LaneTailCache) on the
@@ -207,7 +215,8 @@ func DiscoverExternalLanes(excludeDirs map[string]bool) ([]ExternalLane, error) 
 			continue
 		}
 		seen[r.lane] = true
-		if cwd, ok := readTranscriptCwd(r.path); ok && excludeDirs[filepath.Clean(cwd)] {
+		cwd, cwdOK := readTranscriptCwd(r.path)
+		if cwdOK && excludeDirs[filepath.Clean(cwd)] {
 			continue
 		}
 		fill, ok := ReadFill(r.path, "")
@@ -218,6 +227,7 @@ func DiscoverExternalLanes(excludeDirs map[string]bool) ([]ExternalLane, error) 
 			LastWrite:      r.mod,
 			Fill:           fill,
 			FillOK:         ok,
+			WorkDir:        cwd,
 		})
 	}
 	return out, nil

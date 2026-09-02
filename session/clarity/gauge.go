@@ -215,6 +215,24 @@ func ReadFill(transcriptPath string, modelHint string) (Fill, bool) {
 	return Fill{Used: used, Window: window, Pct: pct, Basis: basis}, true
 }
 
+// ModelWindowLabel derives the Session pane header's context-window word
+// (design/cockpit-pane/DECISIONS.md slice 3, "1M window") purely from the
+// model name - the same "1m"/"fable"/"opus" naming heuristic ReadFill
+// applies above, minus its used>210_000 fallback signal, which needs an
+// actual usage figure this caller does not have. ok is false when model is
+// empty - there is nothing to derive a window word from, and the header
+// simply omits the field rather than guessing.
+func ModelWindowLabel(model string) (label string, ok bool) {
+	if model == "" {
+		return "", false
+	}
+	blob := strings.ToLower(model)
+	if strings.Contains(blob, "1m") || strings.Contains(blob, "fable") || strings.Contains(blob, "opus") {
+		return "1M window", true
+	}
+	return "200k window", true
+}
+
 // ContextFillForLane is the one-call convenience the instance list uses:
 // resolve the lane's newest transcript, then derive its fill exactly the
 // way fleet_dashboard.py's fill_of() does (no model hint - the dashboard

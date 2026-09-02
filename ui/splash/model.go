@@ -40,7 +40,7 @@ type Model struct {
 // New constructs a splash model with today's fleet numbers already loaded,
 // ready to tick from frame 0.
 func New() *Model {
-	live, waiting := fleetCounts()
+	live, waiting := FleetCounts()
 	return &Model{live: live, waiting: waiting}
 }
 

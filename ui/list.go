@@ -756,6 +756,18 @@ func (l *List) GetSelectedInstance() *session.Instance {
 	return l.items[l.selectedIdx]
 }
 
+// GetSelectedExternalLane returns the currently selected external lane, or
+// ok=false when the selection is on a tracked instance (or nothing is
+// selected) - the external-row counterpart to GetSelectedInstance, used by
+// the Session tab (design/cockpit-pane/DECISIONS.md slice 3) to build its
+// SessionInfo for whichever kind of row is selected.
+func (l *List) GetSelectedExternalLane() (clarity.ExternalLane, bool) {
+	if !l.selExternal || l.selectedIdx < 0 || l.selectedIdx >= len(l.external) {
+		return clarity.ExternalLane{}, false
+	}
+	return l.external[l.selectedIdx], true
+}
+
 // SelectedMsgTarget returns the lane name of the current selection,
 // whichever list it is in, plus whether it is an external row - both
 // tracked instances and external rows are messageable (the brief's

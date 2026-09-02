@@ -194,6 +194,49 @@ func TestString_LaneRows_DropWordWhenCollapsed(t *testing.T) {
 	require.NotContains(t, out, "idle", "the state word must be dropped below the collapse threshold")
 }
 
+// TestSessionPane_FitsAt120x36And164x45And200x55 is item 5's own FINISH
+// requirement gaining a Session-tab case: nothing exceeds the pane at any
+// of the three named terminal sizes, using each size's own real pane
+// content dimensions (TabbedWindow.SetSize's own arithmetic, not the raw
+// terminal size) with a fixture LaneTail carrying all three turn kinds.
+func TestSessionPane_FitsAt120x36And164x45And200x55(t *testing.T) {
+	for _, sz := range []struct{ w, h int }{{120, 36}, {164, 45}, {200, 55}} {
+		t.Run(fmt.Sprintf("%dx%d", sz.w, sz.h), func(t *testing.T) {
+			w := NewTabbedWindow(NewSessionPane(), NewDiffPane(), NewTerminalPane())
+			w.SetSize(sz.w, int(float32(sz.h)*0.9))
+			contentWidth, contentHeight := w.GetContentSize()
+			require.Greater(t, contentWidth, 0)
+			require.Greater(t, contentHeight, 0)
+
+			now := time.Date(2026, 9, 2, 19, 0, 0, 0, time.Local)
+			w.SetSessionInfo(&SessionInfo{
+				Lane: "ways-of-working",
+				Tail: clarity.LaneTail{
+					State:        clarity.StateWorking,
+					LastWrite:    now,
+					LastTurn:     now,
+					Model:        "claude-fable-5-1",
+					Messages:     616,
+					TurnDuration: 81 * time.Second,
+					Turns: []clarity.Turn{
+						{Kind: clarity.TurnOwner, At: now, Text: "an owner turn"},
+						{Kind: clarity.TurnAssistant, At: now, Text: "an assistant reply"},
+						{Kind: clarity.TurnTool, At: now, Tool: "Bash", Summary: "run it", Result: clarity.ResultOK, Duration: 2 * time.Second},
+					},
+				},
+				CtxPct: 20,
+				CtxOK:  true,
+			})
+
+			out := w.String()
+			for i, line := range strings.Split(out, "\n") {
+				require.LessOrEqualf(t, ansi.StringWidth(line), sz.w,
+					"line %d exceeds terminal width %d: %q", i, sz.w, line)
+			}
+		})
+	}
+}
+
 // TestString_TrackedAndExternalRows_ShareCtxColumn is item 4's "one table"
 // requirement across row KINDS, not just within external rows
 // (TestString_ExternalRows_ColumnsLineUp covers that half): a tracked
