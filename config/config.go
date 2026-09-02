@@ -44,6 +44,10 @@ type Config struct {
 	BranchPrefix string `json:"branch_prefix"`
 	// Profiles is a list of named program profiles.
 	Profiles []Profile `json:"profiles,omitempty"`
+	// NoSplash skips the entrance splash screen and starts directly in the
+	// instance list, same effect as the --no-splash flag (which overrides
+	// this when set).
+	NoSplash bool `json:"no_splash,omitempty"`
 }
 
 // GetProgram returns the program to run. If Profiles is non-empty and
