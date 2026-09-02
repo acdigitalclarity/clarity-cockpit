@@ -50,26 +50,43 @@ func TestString_ExternalRow_TruncatesToListWidth(t *testing.T) {
 }
 
 // TestString_ExternalRows_ColumnsLineUp is the FINISH defect's "pad the
-// lane name to a column so ctx and last write line up": two external rows
-// with different-length names must place "ctx" at the same column.
+// lane name to a column so the percentage and last write line up": two
+// external rows with different-length names must place the pct field's own
+// "%" at the same column (defect 2 dropped the "ctx" label this test used
+// to key off; "%" is the field's own remaining stable marker).
 func TestString_ExternalRows_ColumnsLineUp(t *testing.T) {
 	l := newTestList()
 	l.SetSize(120, 40)
 	now := time.Now()
 	l.SetExternal([]clarity.ExternalLane{
-		{Name: "short", LastWrite: now},
-		{Name: "a-much-longer-lane-name", LastWrite: now},
+		{Name: "short", LastWrite: now, Fill: clarity.Fill{Pct: 1}, FillOK: true},
+		{Name: "a-much-longer-lane-name", LastWrite: now, Fill: clarity.Fill{Pct: 1}, FillOK: true},
 	})
 
 	out := l.String()
-	var ctxCols []int
-	for _, line := range strings.Split(out, "\n") {
-		if idx := strings.Index(line, "ctx "); idx >= 0 {
-			ctxCols = append(ctxCols, idx)
+	var pctCols []int
+	for _, line := range strings.Split(ansi.Strip(out), "\n") {
+		if idx := runeIndexOf(line, '%'); idx >= 0 {
+			pctCols = append(pctCols, idx)
 		}
 	}
-	require.Len(t, ctxCols, 2, "expected exactly the two external rows to carry a ctx column")
-	require.Equal(t, ctxCols[0], ctxCols[1], "ctx must land in the same column regardless of lane-name length")
+	require.Len(t, pctCols, 2, "expected exactly the two external rows to carry a percentage column")
+	require.Equal(t, pctCols[0], pctCols[1], "the percentage must land in the same column regardless of lane-name length")
+}
+
+// runeIndexOf returns the RUNE (not byte) index of r's first occurrence in
+// s - a plain strings.Index/IndexRune returns a byte offset, which is the
+// wrong measure the moment a row's own name column contains a multi-byte
+// truncation ellipsis ("…" is 3 UTF-8 bytes but 1 column), exactly the case
+// TestString_ExternalRows_ColumnsLineUp and
+// TestString_TrackedAndExternalRows_ShareCtxColumn both exercise.
+func runeIndexOf(s string, r rune) int {
+	for i, c := range []rune(s) {
+		if c == r {
+			return i
+		}
+	}
+	return -1
 }
 
 // TestRender_NoWorktreeInstance_NoGarbledGlyph is the OWN ROW defect's row
@@ -133,13 +150,49 @@ func TestString_NeverExceedsListHeight(t *testing.T) {
 // TestRender_KnownContextFill_StillRenders guards against the "show
 // nothing" fix accidentally suppressing a KNOWN fill too - once
 // SetContextFill has a real value cached, the row must still show it.
+// DEFECT 2 dropped the "ctx" label from lane rows (it stays on the Session
+// pane's own header, a different component) - the row shows the bare
+// percentage.
 func TestRender_KnownContextFill_StillRenders(t *testing.T) {
 	l := newTestList("known-fill")
 	l.SetSize(80, 40)
 	l.items[0].SetContextFill(42, true)
 
 	out := l.String()
-	require.Contains(t, out, "ctx 42%")
+	require.Contains(t, out, "42%")
+	require.NotContains(t, out, "ctx", "the lane row's own percentage field must not carry the ctx label (defect 2)")
+}
+
+// TestLaneRow_PercentFieldBlankWhenUnknown is defect 2's other half: an
+// undetermined fill shows a blank field, never "ctx" (which no longer
+// prints at all on a lane row) and never "n/a".
+func TestLaneRow_PercentFieldBlankWhenUnknown(t *testing.T) {
+	l := newTestList("fresh-instance")
+	l.SetSize(80, 40)
+
+	out := l.String()
+	require.NotContains(t, out, "ctx")
+	require.NotContains(t, out, "n/a")
+}
+
+// TestLaneNameColumn_PaddedTo20AndTruncatedBeyond is defect 2's own name-
+// column rule: on a terminal wide enough that the responsive shrink never
+// kicks in, a short name is padded out to exactly 20 columns and a longer
+// one truncates to 20 with an ellipsis - never the old 28-wide column.
+func TestLaneNameColumn_PaddedTo20AndTruncatedBeyond(t *testing.T) {
+	l := newTestList()
+	l.SetSize(300, 40) // deliberately huge: rowInner is never the constraint
+	now := time.Now()
+	l.SetExternal([]clarity.ExternalLane{
+		{Name: "short", LastWrite: now},
+		{Name: "a-name-well-past-twenty-characters-long", LastWrite: now},
+	})
+
+	require.Equal(t, 20, l.laneNameColWidth(true), "the name column must cap at 20, not the old 28")
+
+	out := ansi.Strip(l.String())
+	require.Contains(t, out, "short               ", "a short name pads to exactly 20 columns")
+	require.Contains(t, out, "a-name-well-past-tw…", "a name over 20 columns truncates to 20 with an ellipsis")
 }
 
 // TestString_TrackedRow_ShowsStateGlyphWordAndLastTurn is item 1's own
@@ -240,24 +293,87 @@ func TestSessionPane_FitsAt120x36And164x45And200x55(t *testing.T) {
 // TestString_TrackedAndExternalRows_ShareCtxColumn is item 4's "one table"
 // requirement across row KINDS, not just within external rows
 // (TestString_ExternalRows_ColumnsLineUp covers that half): a tracked
-// instance's title line and an external lane's row must place "ctx" in the
-// same column.
+// instance's title line and an external lane's row must place the
+// percentage field in the same column (see that test's own comment on why
+// "%" is the marker this now keys off, not "ctx").
 func TestString_TrackedAndExternalRows_ShareCtxColumn(t *testing.T) {
 	l := newTestList("a-tracked-lane")
 	l.SetSize(120, 40)
-	l.SetExternal([]clarity.ExternalLane{{Name: "an-external-lane", LastWrite: time.Now()}})
+	l.items[0].SetContextFill(1, true)
+	l.SetExternal([]clarity.ExternalLane{{Name: "an-external-lane", LastWrite: time.Now(), Fill: clarity.Fill{Pct: 1}, FillOK: true}})
 
 	out := l.String()
-	var ctxCols []int
+	var pctCols []int
 	for _, line := range strings.Split(out, "\n") {
 		// Strip ANSI first: the tracked row and the external row carry
 		// different escape sequences (different styles), so a raw
 		// strings.Index would compare byte offsets that include those
 		// codes, not the rendered column.
-		if idx := strings.Index(ansi.Strip(line), "ctx"); idx >= 0 {
-			ctxCols = append(ctxCols, idx)
+		if idx := runeIndexOf(ansi.Strip(line), '%'); idx >= 0 {
+			pctCols = append(pctCols, idx)
 		}
 	}
-	require.Len(t, ctxCols, 2, "expected exactly the tracked row and the external row to carry a ctx column")
-	require.Equal(t, ctxCols[0], ctxCols[1], "ctx must land in the same column for a tracked row and an external row alike")
+	require.Len(t, pctCols, 2, "expected exactly the tracked row and the external row to carry a percentage column")
+	require.Equal(t, pctCols[0], pctCols[1], "the percentage must land in the same column for a tracked row and an external row alike")
+}
+
+// TestLaneRow_NarrowInnerWidth_KeepsFullNameWithTimeAndPaddedWord is the
+// pane-3b2 defect's own repro: the orchestrator's 164x45 capture of this
+// worktree's PRE-FIX build truncated a lane named "ways-of-working" to
+// "ways-of-w…" because laneStateWordWidth was measuring StateWaitingYou's
+// own 14-char "waiting on you" phrase, reserving 15 columns for a word
+// column that only ever shows 7 - starving the name column. At an inner
+// width of 44 (SetSize(46, ...); laneRowInnerWidth subtracts the row
+// styles' 2-column padding) that name must now render in full, "working"
+// occupies its padded-to-7 column, and the last-turn time still shows since
+// 44 sits at/above laneShowTimeMinWidth.
+func TestLaneRow_NarrowInnerWidth_KeepsFullNameWithTimeAndPaddedWord(t *testing.T) {
+	l := newTestList("ways-of-working")
+	l.SetSize(46, 40)
+	require.Equal(t, 44, laneRowInnerWidth(l.width), "test fixture must exercise exactly the inner width named in the brief")
+
+	lastTurn := time.Date(2026, 9, 2, 22, 30, 0, 0, time.Local)
+	l.items[0].SetLaneState(clarity.StateWorking, lastTurn, true)
+
+	out := ansi.Strip(l.String())
+	require.Contains(t, out, "ways-of-working", "the full 15-character lane name must render, not truncated")
+	require.NotContains(t, out, "ways-of-w…", "the pane-3b2 defect's own truncated form must not reappear")
+	require.Contains(t, out, "working 22:30", "the word (padded to 7 - a no-op pad for \"working\" itself) is followed by the last-turn time")
+}
+
+// TestLaneRow_UnderTimeThreshold_DropsTimeKeepsFullName is THE RULE's other
+// named threshold: below laneShowTimeMinWidth (42) inner columns, the
+// last-turn time is dropped ENTIRELY (not blanked to a same-width gap) so
+// the name column keeps the room instead - the mock-up's 120-column rows
+// (PANE-MOCKUP-120x36.md) carry no time field at all. At inner width 37
+// (SetSize(39, ...)) the lane name still renders whole even though the row
+// column budget is narrower than the 44-wide case above, because dropping
+// the time frees exactly the room the name needs.
+func TestLaneRow_UnderTimeThreshold_DropsTimeKeepsFullName(t *testing.T) {
+	l := newTestList("ways-of-working")
+	l.SetSize(39, 40)
+	require.Equal(t, 37, laneRowInnerWidth(l.width), "test fixture must exercise exactly the inner width named in the brief")
+
+	lastTurn := time.Date(2026, 9, 2, 22, 30, 0, 0, time.Local)
+	l.items[0].SetLaneState(clarity.StateWorking, lastTurn, true)
+
+	out := ansi.Strip(l.String())
+	require.Contains(t, out, "ways-of-working", "the full lane name must still render once the time is dropped for room")
+	require.NotContains(t, out, "22:30", "below laneShowTimeMinWidth the time is dropped entirely, never shown")
+}
+
+// TestLaneRow_WaitingOnYou_RendersWaitingNotFullPhrase is THE RULE's word-
+// vocabulary requirement: a lane row's four words are exactly
+// working/waiting/idle/stalled, so a state of clarity.StateWaitingYou
+// ("waiting on you") renders as the short "waiting" on the row - the
+// Session pane's own header and state line (session.go) are the ones that
+// keep the full phrase, unchanged by this leg.
+func TestLaneRow_WaitingOnYou_RendersWaitingNotFullPhrase(t *testing.T) {
+	l := newTestList("a-lane")
+	l.SetSize(120, 40)
+	l.items[0].SetLaneState(clarity.StateWaitingYou, time.Now(), true)
+
+	out := l.String()
+	require.Contains(t, out, "waiting", "the row shows the short word for waiting on you")
+	require.NotContains(t, out, "waiting on you", "the row never renders the Session pane's own full phrase")
 }

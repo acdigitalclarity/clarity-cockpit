@@ -205,22 +205,51 @@ func newHome(ctx context.Context, program string, autoYes bool, noSplash bool) *
 // run at.
 const collapsePreviewBelowWidth = 100
 
+// listWidthMin/listWidthMax bound listWidthForTerminal's clamp - the list's
+// new compact row (defect 2: name/pct/glyph+word/time, no branch/diff-stat
+// second line's own width needs) never needs the 40%-of-a-wide-terminal
+// share the old row format did, and the Session pane's own header line 2
+// (workdir · branch · model · window) needs the room this frees up to stop
+// truncating those fields at the sizes this app actually runs at.
+const (
+	listWidthMin = 38
+	listWidthMax = 52
+)
+
+// listWidthForTerminal is the DEFECT 2 rule, verbatim: 28% of the terminal
+// width, clamped to [listWidthMin, listWidthMax] - replacing the old flat
+// 40% split, which gave the list far more than its new compact row format
+// needs and starved the pane's own header line of the width it needs to
+// show branch and model without truncating (ui/session.go's
+// padRowKeepRight). Only called above collapsePreviewBelowWidth; below it
+// the list still takes the whole terminal, unchanged.
+func listWidthForTerminal(width int) int {
+	w := int(float64(width) * 0.28)
+	if w < listWidthMin {
+		w = listWidthMin
+	}
+	if w > listWidthMax {
+		w = listWidthMax
+	}
+	return w
+}
+
 // updateHandleWindowSizeEvent sets the sizes of the components.
 // The components will try to render inside their bounds.
 func (m *home) updateHandleWindowSizeEvent(msg tea.WindowSizeMsg) {
-	// List takes 40% of width, preview takes the rest - above the collapse
-	// threshold. (Previously 30/70, sized by nothing but the ratio itself;
-	// the OVERFLOW defect's real cause was that neither the list's feed
-	// rows nor the external-lane rows ever truncated to whatever column
-	// width fell out of the split - fixed in ui/list.go - so this ratio
-	// change is cosmetic breathing room for the list column, not the fix.)
+	// List takes listWidthForTerminal's own share, preview takes the rest -
+	// above the collapse threshold. (The OVERFLOW defect's real cause was
+	// that neither the list's feed rows nor the external-lane rows ever
+	// truncated to whatever column width fell out of the split - fixed in
+	// ui/list.go - so this ratio is about which side of the split gets the
+	// room, not that fix.)
 	var listWidth, tabsWidth int
 	collapsed := msg.Width < collapsePreviewBelowWidth
 	if collapsed {
 		listWidth = msg.Width
 		tabsWidth = 0
 	} else {
-		listWidth = int(float32(msg.Width) * 0.4)
+		listWidth = listWidthForTerminal(msg.Width)
 		tabsWidth = msg.Width - listWidth
 	}
 	// Item 1's "below 100 columns drop the word, keep the glyph" - the

@@ -526,6 +526,109 @@ func systemSummaryLine(ts time.Time, subtype string) string {
 // written after the closing turn_duration is not a conversation record and
 // must not re-open the turn. Seen live on weekend-run 2 Sep: closed 12:43,
 // an away_summary after it, wrongly read as stalled.
+// taskNotificationLine builds a user record whose string content is a real
+// task-notification body - the shape confirmed against a live transcript
+// (see the leg's report for the quoted sample from
+// 0027514b-8a29-48c8-b98e-ff6b81b4ecf4.jsonl) - before this test was written.
+func taskNotificationLine(ts time.Time) string {
+	body := "<task-notification>\n<task-id>a856e5a7acf406303</task-id>\n<tool-use-id>toolu_017FhLvitq4H8uUnRuzBctY2</tool-use-id>\n<status>completed</status>\n<summary>Agent finished</summary>\n<result>a result body</result>\n</task-notification>"
+	return ownerLine(ts, body)
+}
+
+func systemReminderLine(ts time.Time) string {
+	return ownerLine(ts, "<system-reminder>\nsome injected harness context\n</system-reminder>")
+}
+
+// TestBuildTurns_TaskNotificationRecord_NeverRendersAsOwnerTurn is defect 1's
+// own fixture: a task-notification the harness injected must never render as
+// if the owner had typed it, but a genuine owner line in the same window
+// must still render as YOU.
+func TestBuildTurns_TaskNotificationRecord_NeverRendersAsOwnerTurn(t *testing.T) {
+	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
+	path := writeFixture(t, []string{
+		ownerLine(now.Add(-5*time.Minute), "please check the fixture"),
+		taskNotificationLine(now.Add(-3 * time.Minute)),
+		assistantTextLine(now.Add(-2*time.Minute), "claude-fable-5-1", "on it"),
+		turnDurationLine(now.Add(-1*time.Minute), 1000, 3, 0),
+	})
+	tail, err := ReadLaneTail(path, DefaultTailMaxBytes, DefaultTailTurns, now)
+	require.NoError(t, err)
+
+	var ownerTurns []Turn
+	for _, turn := range tail.Turns {
+		if turn.Kind == TurnOwner {
+			ownerTurns = append(ownerTurns, turn)
+		}
+	}
+	require.Len(t, ownerTurns, 1, "the task-notification record must never render as an owner turn")
+	require.Equal(t, "please check the fixture", ownerTurns[0].Text)
+	for _, turn := range tail.Turns {
+		require.NotContains(t, turn.Text, "task-notification", "a harness note must never appear in the rendered turn stream")
+	}
+}
+
+// TestBuildTurns_SystemReminderRecord_NeverRendersAsOwnerTurn covers the
+// other harness tag named in the rule.
+func TestBuildTurns_SystemReminderRecord_NeverRendersAsOwnerTurn(t *testing.T) {
+	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
+	path := writeFixture(t, []string{
+		systemReminderLine(now.Add(-1 * time.Minute)),
+	})
+	tail, err := ReadLaneTail(path, DefaultTailMaxBytes, DefaultTailTurns, now)
+	require.NoError(t, err)
+	require.Empty(t, tail.Turns, "a lone system-reminder record renders no owner turn")
+}
+
+// TestClassifyState_TaggedHarnessRecordMidTranscript_SkippedAsAnchor is
+// defect 1's anchor rule, first half: a tagged harness record is NOT the
+// last record in the tail (a real turn_duration close follows it), so the
+// walk must step past it exactly like an untimestamped bookkeeping record -
+// classifying off the turn_duration close, not the notification's own
+// (newer) timestamp.
+func TestClassifyState_TaggedHarnessRecordMidTranscript_SkippedAsAnchor(t *testing.T) {
+	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
+	closedAt := now.Add(-5 * time.Minute)
+	path := writeFixture(t, []string{
+		turnDurationLine(closedAt, 1000, 3, 0),
+		taskNotificationLine(now.Add(-1 * time.Second)),
+		modeLine("normal"),
+	})
+	// The last record overall is the untimestamped mode line (always
+	// skipped) - the taskNotificationLine right before it is mid-transcript
+	// (something follows it), so the walk must skip that too and anchor on
+	// the turn_duration close instead. Before this fix the walk would land
+	// on the notification's own newer timestamp, reading "waiting on you"
+	// one second old instead of the true 5-minute-old close.
+	tail, err := ReadLaneTail(path, DefaultTailMaxBytes, DefaultTailTurns, now)
+	require.NoError(t, err)
+	require.Equal(t, StateWaitingYou, tail.State, "must classify off the turn_duration close, not the mid-transcript notification's own timestamp")
+	require.WithinDuration(t, closedAt, tail.LastTurn, time.Second)
+}
+
+// TestClassifyState_TaggedHarnessRecordIsLastRecord_UsedAsOpenTurnAnchor is
+// the anchor rule's second half: when the tagged harness record IS the very
+// last record in the tail (defect 1's own live case - a task-notification
+// landing after the owner's real last turn with nothing after it), it still
+// counts for the state anchor, read as an OPEN turn on its own timestamp
+// (never re-opening the classification off nothing at all). Choice made
+// here, per the brief: the rule cares whether the lane has gone idle since
+// its last write, and a harness note IS a write to the transcript even
+// though it never renders as a Turn - the alternative (skip it and starve
+// the anchor entirely) would read a lane that just received a task
+// notification as having no anchor at all, which is worse.
+func TestClassifyState_TaggedHarnessRecordIsLastRecord_UsedAsOpenTurnAnchor(t *testing.T) {
+	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
+	path := writeFixture(t, []string{
+		assistantTextLine(now.Add(-10*time.Minute), "claude-fable-5-1", "earlier work"),
+		turnDurationLine(now.Add(-9*time.Minute), 1000, 3, 0),
+		taskNotificationLine(now.Add(-2 * time.Minute)),
+	})
+	tail, err := ReadLaneTail(path, DefaultTailMaxBytes, DefaultTailTurns, now)
+	require.NoError(t, err)
+	require.Equal(t, StateWorking, tail.State, "the trailing notification, being the last record, must anchor as an open turn under 10m old")
+	require.WithinDuration(t, now.Add(-2*time.Minute), tail.LastTurn, time.Second)
+}
+
 func TestClassifyState_SystemSummaryAfterClose_StaysClosed(t *testing.T) {
 	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
 	closedAt := now.Add(-2 * time.Hour)

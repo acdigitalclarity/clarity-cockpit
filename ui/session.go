@@ -142,11 +142,22 @@ func (s *SessionPane) turnsAreaHeight() int {
 	return h
 }
 
-// refreshViewport rebuilds the turns viewport's content and re-pins it to
-// the bottom - called whenever the size or the selected lane's data
-// changes, never from String() (which must not reset a scroll the owner is
-// mid-way through).
+// refreshViewport rebuilds the turns viewport's content - called whenever
+// the size or the selected lane's data changes, never from String() (which
+// must not reset a scroll the owner is mid-way through).
+//
+// DEFECT 3: this used to call GotoBottom() unconditionally on every rebuild,
+// so a mid-scroll read (shift+up's own reason to exist) was thrown away on
+// the app's 3-second feed tick, which calls SetInfo again with the same
+// lane's freshly-read data. The rule: read whether the viewport was AT the
+// bottom before this rebuild changes the content underneath it: if it was,
+// it stays pinned to the (new) bottom, same as before; otherwise it keeps
+// its own line offset, clamped to whatever the new content's own maximum
+// now is (SetYOffset's own contract) - never snapping back down.
 func (s *SessionPane) refreshViewport() {
+	wasAtBottom := s.viewport.TotalLineCount() == 0 || s.viewport.AtBottom()
+	prevOffset := s.viewport.YOffset()
+
 	s.viewport.SetWidth(s.width)
 	s.viewport.SetHeight(s.turnsAreaHeight())
 	if s.info == nil {
@@ -155,7 +166,11 @@ func (s *SessionPane) refreshViewport() {
 	}
 	lines := buildTurnLines(s.info.Tail.Turns, s.width)
 	s.viewport.SetContent(strings.Join(lines, "\n"))
-	s.viewport.GotoBottom()
+	if wasAtBottom {
+		s.viewport.GotoBottom()
+	} else {
+		s.viewport.SetYOffset(prevOffset)
+	}
 }
 
 // ScrollUp/ScrollDown scroll the turns region - bound to the app-wide
@@ -319,7 +334,7 @@ func (s *SessionPane) renderHeaderLine2() string {
 		right += fmt.Sprintf(" · session %s", stem)
 	}
 
-	return sessionMutedStyle.Render(padRow(strings.Join(left, " · "), right, s.width))
+	return sessionMutedStyle.Render(padRowKeepRight(strings.Join(left, " · "), right, s.width))
 }
 
 // rule is a full-width horizontal divider, dim.
@@ -415,6 +430,34 @@ func padRow(left, right string, width int) string {
 			left = ""
 		} else {
 			left = ansiTruncateRow(left, avail)
+		}
+		leftW = ansi.StringWidth(left)
+	}
+	gap := width - leftW - rightW
+	if gap < 1 {
+		gap = 1
+	}
+	return left + strings.Repeat(" ", gap) + right
+}
+
+// padRowKeepRight is padRow's mirror for header line 2 (DEFECT 2): when
+// left and right together overflow width, the LEFT side is truncated from
+// its own FRONT with an ellipsis prefix, keeping its tail - branch/model/
+// window, joined onto the end of the same string - visible as long as any
+// reasonable width remains at all. padRow itself (tool lines, header line
+// 1) keeps the front of its own left text and cuts the tail instead, which
+// is the right choice there (the lane name/tool name lead); here the most
+// useful fields trail, so the truncation direction has to flip.
+func padRowKeepRight(left, right string, width int) string {
+	leftW := ansi.StringWidth(left)
+	rightW := ansi.StringWidth(right)
+	if leftW+rightW+1 > width {
+		avail := width - rightW - 1
+		if avail < 0 {
+			avail = 0
+			left = ""
+		} else {
+			left = ansiTruncateLeftRow(left, avail)
 		}
 		leftW = ansi.StringWidth(left)
 	}
