@@ -5,6 +5,7 @@ import (
 	"claude-squad/keys"
 	"claude-squad/log"
 	"claude-squad/session"
+	"claude-squad/session/clarity"
 	"claude-squad/session/git"
 	"claude-squad/ui"
 	"claude-squad/ui/overlay"
@@ -190,6 +191,7 @@ func (m *home) Init() tea.Cmd {
 			return previewTickMsg{}
 		},
 		tickUpdateMetadataCmd(m.snapshotActiveInstances(), m.list.GetSelectedInstance()),
+		func() tea.Msg { return feedTickMsg{} },
 	)
 }
 
@@ -256,8 +258,19 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				r.instance.SetDiffStats(r.diffStats)
 			}
+			r.instance.SetContextFill(r.fillPct, r.fillOK)
 		}
 		return m, tickUpdateMetadataCmd(m.snapshotActiveInstances(), m.list.GetSelectedInstance())
+	case feedTickMsg:
+		// Exactly one read of the fleet's ranked queue file per tick - see
+		// clarity.NeedsYou's doc comment. This self-reschedules the same way
+		// previewTickMsg/tickUpdateMetadataCmd do above: message-driven,
+		// never a blocking polling loop.
+		m.list.SetNeedsYou(clarity.NeedsYou(clarity.DefaultFeedPath(), feedTopN))
+		return m, func() tea.Msg {
+			time.Sleep(feedRefreshInterval)
+			return feedTickMsg{}
+		}
 	case tea.MouseMsg:
 		// Handle mouse wheel events for scrolling the diff/preview pane
 		if msg.Action == tea.MouseActionPress {
@@ -913,7 +926,20 @@ type instanceMetaResult struct {
 	updated   bool
 	hasPrompt bool
 	diffStats *git.DiffStats
+	fillPct   int
+	fillOK    bool
 }
+
+// feedTickMsg fires once per "Needs you" feed refresh tick.
+type feedTickMsg struct{}
+
+// feedRefreshInterval is how often the feed re-reads the queue file -
+// distinct from the 100ms preview tick and the 500ms metadata tick, since
+// the fleet queue changes far less often than either.
+const feedRefreshInterval = 3 * time.Second
+
+// feedTopN is how many ranked entries the "Needs you" section shows.
+const feedTopN = 5
 
 // metadataUpdateDoneMsg is sent when the background metadata update completes.
 type metadataUpdateDoneMsg struct {
@@ -979,6 +1005,7 @@ func tickUpdateMetadataCmd(active []*session.Instance, selected *session.Instanc
 				} else {
 					r.diffStats = instance.ComputeDiffNumstat()
 				}
+				r.fillPct, r.fillOK = instance.ComputeContextFill()
 			}(idx, inst)
 		}
 		wg.Wait()

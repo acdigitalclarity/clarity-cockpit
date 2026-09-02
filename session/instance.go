@@ -2,6 +2,7 @@ package session
 
 import (
 	"claude-squad/log"
+	"claude-squad/session/clarity"
 	"claude-squad/session/git"
 	"claude-squad/session/tmux"
 	"errors"
@@ -60,6 +61,14 @@ type Instance struct {
 
 	// DiffStats stores the current git diff statistics
 	diffStats *git.DiffStats
+
+	// contextFillPct/contextFillOK cache this instance's lane context-fill
+	// gauge (see session/clarity/gauge.go), derived the same way
+	// scripts/fleet_dashboard.py's fill_of() does. Set only from the main
+	// event loop's metadata tick - same contract as diffStats/SetDiffStats,
+	// to avoid data races with View.
+	contextFillPct int
+	contextFillOK  bool
 
 	// selectedBranch is the existing branch to start on (empty = new branch from HEAD)
 	selectedBranch string
@@ -671,6 +680,32 @@ func (i *Instance) SetDiffStats(stats *git.DiffStats) {
 // GetDiffStats returns the current git diff statistics
 func (i *Instance) GetDiffStats() *git.DiffStats {
 	return i.diffStats
+}
+
+// ComputeContextFill runs the (file-read-only) context-fill derivation for
+// this instance's lane and returns the result without mutating instance
+// state. Safe to call from a background goroutine, same contract as
+// ComputeDiff/ComputeDiffNumstat above. ok is false ("n/a") when no
+// transcript resolves for this instance's Path.
+func (i *Instance) ComputeContextFill() (pct int, ok bool) {
+	fill, ok := clarity.ContextFillForLane(i.Path)
+	if !ok {
+		return 0, false
+	}
+	return fill.Pct, true
+}
+
+// SetContextFill caches the context-fill gauge on the instance. Should be
+// called from the main event loop only, to avoid data races with View -
+// same contract as SetDiffStats.
+func (i *Instance) SetContextFill(pct int, ok bool) {
+	i.contextFillPct = pct
+	i.contextFillOK = ok
+}
+
+// GetContextFill returns the cached context-fill gauge.
+func (i *Instance) GetContextFill() (pct int, ok bool) {
+	return i.contextFillPct, i.contextFillOK
 }
 
 // SendPrompt sends a prompt to the tmux session

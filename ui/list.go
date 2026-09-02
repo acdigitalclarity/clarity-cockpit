@@ -53,6 +53,14 @@ var autoYesStyle = lipgloss.NewStyle().
 	Background(lipgloss.Color("#dde4f0")).
 	Foreground(lipgloss.Color("#1a1a1a"))
 
+var needsYouTitleStyle = lipgloss.NewStyle().
+	Bold(true).
+	Foreground(lipgloss.AdaptiveColor{Light: "#b5581a", Dark: "#e0a458"})
+
+var needsYouLineStyle = lipgloss.NewStyle().
+	Padding(0, 0, 0, 1).
+	Foreground(lipgloss.AdaptiveColor{Light: "#5a5a5a", Dark: "#aaaaaa"})
+
 type List struct {
 	items         []*session.Instance
 	selectedIdx   int
@@ -63,6 +71,17 @@ type List struct {
 	// map of repo name to number of instances using it. Used to display the repo name only if there are
 	// multiple repos in play.
 	repos map[string]int
+
+	// needsYou holds the "Needs you" feed lines, refreshed once per feed
+	// tick by the caller (see app.go's feedTickMsg handling) - this struct
+	// never reads the queue file itself, it only renders what it is handed.
+	needsYou []string
+}
+
+// SetNeedsYou replaces the "Needs you" feed lines shown above the instance
+// list.
+func (l *List) SetNeedsYou(lines []string) {
+	l.needsYou = lines
 }
 
 func NewList(spinner *spinner.Model, autoYes bool) *List {
@@ -184,6 +203,17 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, h
 	// Use fixed width for diff stats to avoid layout issues
 	remainingWidth -= diffWidth
 
+	// Context-fill gauge: the same number scripts/fleet_dashboard.py would
+	// show for this instance's lane (see session/clarity/gauge.go), or
+	// "n/a" when no transcript resolves.
+	fillLabel := "n/a"
+	if fillPct, ok := i.GetContextFill(); ok {
+		fillLabel = fmt.Sprintf("%d%%", fillPct)
+	}
+	gauge := fmt.Sprintf("ctx %s", fillLabel)
+	gaugeWidth := runewidth.StringWidth(gauge) + 2 // surrounding separator spaces
+	remainingWidth -= gaugeWidth
+
 	branch := i.Branch
 	if i.Started() && hasMultipleRepos {
 		repoName, err := i.RepoName()
@@ -213,7 +243,7 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, h
 		spaces = strings.Repeat(" ", remainingWidth)
 	}
 
-	branchLine := fmt.Sprintf("%s %s-%s%s%s", strings.Repeat(" ", len(prefix)), branchIcon, branch, spaces, diff)
+	branchLine := fmt.Sprintf("%s %s-%s%s %s %s", strings.Repeat(" ", len(prefix)), branchIcon, branch, spaces, gauge, diff)
 
 	// join title and subtitle
 	text := lipgloss.JoinVertical(
@@ -251,6 +281,18 @@ func (l *List) String() string {
 
 	b.WriteString("\n")
 	b.WriteString("\n")
+
+	// Render the "Needs you" feed, once per feed tick (see app.go) - never
+	// a bare empty section when the queue is absent, per the brief.
+	if len(l.needsYou) > 0 {
+		b.WriteString(needsYouTitleStyle.Render(" Needs you "))
+		b.WriteString("\n")
+		for _, line := range l.needsYou {
+			b.WriteString(needsYouLineStyle.Render(line))
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
 
 	// Render the list.
 	for i, item := range l.items {
