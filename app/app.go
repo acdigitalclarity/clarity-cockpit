@@ -47,6 +47,10 @@ const (
 	stateHelp
 	// stateConfirm is the state when a confirmation modal is displayed.
 	stateConfirm
+	// stateMsg is the state when the user is entering text for the m key -
+	// send-into-tmux for the selected row, tracked instance or external
+	// lane alike (Digital Clarity workspace enhancement).
+	stateMsg
 )
 
 type home struct {
@@ -94,10 +98,24 @@ type home struct {
 	tabbedWindow *ui.TabbedWindow
 	// errBox displays error messages
 	errBox *ui.ErrBox
+	// statusBox displays ephemeral non-error status text - currently just
+	// the m-key message-delivery result.
+	statusBox *ui.StatusBox
+	// hasErr and statusText track whether errBox/statusBox currently hold
+	// something to show, so View() can pick between the two footer rows
+	// without ui.ErrBox/ui.StatusBox needing their own "is set" getters.
+	hasErr     bool
+	statusText string
 	// global spinner instance. we plumb this down to where it's needed
 	spinner spinner.Model
 	// textInputOverlay handles text input with state
 	textInputOverlay *overlay.TextInputOverlay
+	// msgTargetLane and msgTargetExternal name the row the m-key prompt
+	// (stateMsg) is currently addressed to - captured when the prompt opens
+	// so the send still goes to the right row even if the list's selection
+	// moves before the overlay closes.
+	msgTargetLane     string
+	msgTargetExternal bool
 	// textOverlay displays text information
 	textOverlay *overlay.TextOverlay
 	// confirmationOverlay displays confirmation modals
@@ -124,6 +142,7 @@ func newHome(ctx context.Context, program string, autoYes bool) *home {
 		menu:         ui.NewMenu(),
 		tabbedWindow: ui.NewTabbedWindow(ui.NewPreviewPane(), ui.NewDiffPane(), ui.NewTerminalPane()),
 		errBox:       ui.NewErrBox(),
+		statusBox:    ui.NewStatusBox(),
 		storage:      storage,
 		appConfig:    appConfig,
 		program:      program,
@@ -161,8 +180,9 @@ func (m *home) updateHandleWindowSizeEvent(msg tea.WindowSizeMsg) {
 
 	// Menu takes 10% of height, list and window take 90%
 	contentHeight := int(float32(msg.Height) * 0.9)
-	menuHeight := msg.Height - contentHeight - 1     // minus 1 for error box
-	m.errBox.SetSize(int(float32(msg.Width)*0.9), 1) // error box takes 1 row
+	menuHeight := msg.Height - contentHeight - 1        // minus 1 for error/status box
+	m.errBox.SetSize(int(float32(msg.Width)*0.9), 1)    // error box takes 1 row
+	m.statusBox.SetSize(int(float32(msg.Width)*0.9), 1) // status box shares that row
 
 	m.tabbedWindow.SetSize(tabsWidth, contentHeight)
 	m.list.SetSize(listWidth, contentHeight)
@@ -199,6 +219,10 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case hideErrMsg:
 		m.errBox.Clear()
+		m.hasErr = false
+	case hideStatusMsg:
+		m.statusBox.Clear()
+		m.statusText = ""
 	case previewTickMsg:
 		cmd := m.instanceChanged()
 		return m, tea.Batch(
@@ -267,6 +291,22 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// previewTickMsg/tickUpdateMetadataCmd do above: message-driven,
 		// never a blocking polling loop.
 		m.list.SetNeedsYou(clarity.NeedsYou(clarity.DefaultFeedPath(), feedTopN))
+
+		// Refresh the external-lane rows on this same tick - exactly one
+		// glob per tick (clarity.DiscoverExternalLanes), same cadence as
+		// the feed above, never a tick of its own (the brief's requirement).
+		tracked := make(map[string]bool, m.list.NumInstances()*2)
+		for _, inst := range m.list.GetInstances() {
+			for _, n := range clarity.TrackedExclusionNames(inst.Title) {
+				tracked[n] = true
+			}
+		}
+		if external, err := clarity.DiscoverExternalLanes(tracked); err != nil {
+			log.WarningLog.Printf("discover external lanes failed: %v", err)
+		} else {
+			m.list.SetExternal(external)
+		}
+
 		return m, func() tea.Msg {
 			time.Sleep(feedRefreshInterval)
 			return feedTickMsg{}
@@ -352,6 +392,11 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
+	case msgSentMsg:
+		if msg.err != nil {
+			return m, m.handleError(msg.err)
+		}
+		return m, m.setStatus(msg.text)
 	}
 	return m, nil
 }
@@ -370,7 +415,7 @@ func (m *home) handleMenuHighlighting(msg tea.KeyMsg) (cmd tea.Cmd, returnEarly 
 		m.keySent = false
 		return nil, false
 	}
-	if m.state == statePrompt || m.state == stateHelp || m.state == stateConfirm {
+	if m.state == statePrompt || m.state == stateHelp || m.state == stateConfirm || m.state == stateMsg {
 		return nil, false
 	}
 	// If it's in the global keymap, we should try to highlight it.
@@ -575,6 +620,39 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 		}
 
 		return m, nil
+	}
+
+	// Handle the m-key one-line message prompt.
+	if m.state == stateMsg {
+		if msg.String() == "ctrl+c" {
+			m.textInputOverlay = nil
+			m.state = stateDefault
+			return m, tea.Sequence(
+				tea.WindowSize(),
+				func() tea.Msg {
+					m.menu.SetState(ui.StateDefault)
+					return nil
+				},
+			)
+		}
+
+		shouldClose, _ := m.textInputOverlay.HandleKeyPress(msg)
+		if !shouldClose {
+			return m, nil
+		}
+
+		text := m.textInputOverlay.GetValue()
+		canceled := m.textInputOverlay.IsCanceled()
+		lane, isExternal := m.msgTargetLane, m.msgTargetExternal
+
+		m.textInputOverlay = nil
+		m.state = stateDefault
+		m.menu.SetState(ui.StateDefault)
+
+		if canceled || strings.TrimSpace(text) == "" {
+			return m, tea.WindowSize()
+		}
+		return m, tea.Batch(tea.WindowSize(), m.sendMsgCmd(lane, isExternal, text))
 	}
 
 	// Handle confirmation state
@@ -786,6 +864,21 @@ func (m *home) handleKeyPress(msg tea.KeyMsg) (mod tea.Model, cmd tea.Cmd) {
 			return m, m.instanceChanged()
 		}
 		return m, nil
+	case keys.KeyMsg:
+		lane, isExternal, ok := m.list.SelectedMsgTarget()
+		if !ok {
+			return m, nil
+		}
+		m.msgTargetLane = lane
+		m.msgTargetExternal = isExternal
+		m.state = stateMsg
+		m.menu.SetState(ui.StatePrompt)
+		label := "Message " + lane
+		if isExternal {
+			label += " (external)"
+		}
+		m.textInputOverlay = overlay.NewTextInputOverlay(label, "")
+		return m, nil
 	case keys.KeyResume:
 		selected := m.list.GetSelectedInstance()
 		if selected == nil || selected.Status == session.Loading {
@@ -871,6 +964,17 @@ func (m *home) keydownCallback(name keys.KeyName) tea.Cmd {
 
 // hideErrMsg implements tea.Msg and clears the error text from the screen.
 type hideErrMsg struct{}
+
+// hideStatusMsg implements tea.Msg and clears the status text from the screen.
+type hideStatusMsg struct{}
+
+// msgSentMsg carries the result of an m-key/sendMsgCmd delivery back to
+// Update: either the line that landed (or the UNCONSTRUCTED line) in text,
+// or a delivery error.
+type msgSentMsg struct {
+	text string
+	err  error
+}
 
 // previewTickMsg implements tea.Msg and triggers a preview update
 type previewTickMsg struct{}
@@ -1019,6 +1123,7 @@ func tickUpdateMetadataCmd(active []*session.Instance, selected *session.Instanc
 func (m *home) handleError(err error) tea.Cmd {
 	log.ErrorLog.Printf("%v", err)
 	m.errBox.SetError(err)
+	m.hasErr = true
 	return func() tea.Msg {
 		select {
 		case <-m.ctx.Done():
@@ -1026,6 +1131,52 @@ func (m *home) handleError(err error) tea.Cmd {
 		}
 
 		return hideErrMsg{}
+	}
+}
+
+// setStatus shows ephemeral, non-error status text in the footer (the
+// m-key message-delivery result) for a few seconds, mirroring handleError's
+// shape but through the neutral statusBox rather than the red errBox.
+func (m *home) setStatus(text string) tea.Cmd {
+	m.statusBox.SetText(text)
+	m.statusText = text
+	return func() tea.Msg {
+		select {
+		case <-m.ctx.Done():
+		case <-time.After(4 * time.Second):
+		}
+
+		return hideStatusMsg{}
+	}
+}
+
+// sendMsgCmd delivers text to lane (a tracked instance, unless isExternal)
+// in the background and reports the result through setStatus: the last
+// pane line that landed for a tracked instance, or the fixed UNCONSTRUCTED
+// line for an external row. This is the TUI's m key doing exactly what
+// `cs-clarity msg <lane> '<text>'` does from the command line.
+func (m *home) sendMsgCmd(lane string, isExternal bool, text string) tea.Cmd {
+	return func() tea.Msg {
+		if isExternal {
+			return msgSentMsg{text: clarity.ExternalMsgUnconstructed(lane)}
+		}
+		for _, inst := range m.list.GetInstances() {
+			if inst.Title != lane {
+				continue
+			}
+			if !inst.Started() || inst.Paused() || !inst.TmuxAlive() {
+				return msgSentMsg{err: fmt.Errorf("%q is not a live tmux session", lane)}
+			}
+			if err := inst.SendPrompt(text); err != nil {
+				return msgSentMsg{err: fmt.Errorf("failed to send message to %q: %w", lane, err)}
+			}
+			pane, err := inst.Preview()
+			if err != nil {
+				return msgSentMsg{err: fmt.Errorf("message sent to %q but pane capture failed: %w", lane, err)}
+			}
+			return msgSentMsg{text: clarity.LastPaneLine(pane)}
+		}
+		return msgSentMsg{err: fmt.Errorf("no such tracked instance %q", lane)}
 	}
 }
 
@@ -1080,11 +1231,19 @@ func (m *home) View() string {
 	previewWithPadding := lipgloss.NewStyle().PaddingTop(1).Render(m.tabbedWindow.String())
 	listAndPreview := lipgloss.JoinHorizontal(lipgloss.Top, listWithPadding, previewWithPadding)
 
+	// The error box and status box share one footer row: an error always
+	// wins if somehow both are set (it should never lose visibility behind
+	// a status message), otherwise show the status if there is one.
+	footer := m.errBox.String()
+	if !m.hasErr && m.statusText != "" {
+		footer = m.statusBox.String()
+	}
+
 	mainView := lipgloss.JoinVertical(
 		lipgloss.Center,
 		listAndPreview,
 		m.menu.String(),
-		m.errBox.String(),
+		footer,
 	)
 
 	if m.state == statePrompt {

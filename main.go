@@ -235,6 +235,118 @@ var (
 			return nil
 		},
 	}
+
+	// discoverCmd is a Digital Clarity workspace enhancement (not upstream).
+	// It shows every LIVE lane on this Mac even when it was started outside
+	// the cockpit (a bare Terminal/iTerm tab, or `clarity new`/`clarity open`
+	// before cs-clarity existed) - derived the same way
+	// scripts/fleet_dashboard.py derives its live-lane list, minus any lane
+	// already tracked as a Claude Squad instance. External rows can be
+	// messaged (see msgCmd) but never attached or killed - there is no
+	// tracked tmux session or git worktree behind them.
+	discoverCmd = &cobra.Command{
+		Use:   "discover",
+		Short: "List every live lane on this Mac not already tracked here, with its context-fill gauge and last write",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			log.Initialize(false)
+			defer log.Close()
+
+			state := config.LoadState()
+			storage, err := session.NewStorage(state)
+			if err != nil {
+				return fmt.Errorf("failed to initialize storage: %w", err)
+			}
+			instances, err := storage.LoadInstances()
+			if err != nil {
+				return fmt.Errorf("failed to load instances: %w", err)
+			}
+			tracked := make(map[string]bool, len(instances)*2)
+			for _, inst := range instances {
+				for _, n := range clarity.TrackedExclusionNames(inst.Title) {
+					tracked[n] = true
+				}
+			}
+
+			external, err := clarity.DiscoverExternalLanes(tracked)
+			if err != nil {
+				return fmt.Errorf("failed to discover external lanes: %w", err)
+			}
+			if len(external) == 0 {
+				fmt.Println("discover: no external lanes live in the last 90 minutes")
+				return nil
+			}
+			for _, ext := range external {
+				fillLabel := "n/a"
+				if ext.FillOK {
+					fillLabel = fmt.Sprintf("%d%%", ext.Fill.Pct)
+				}
+				fmt.Printf("%-32s ctx %-5s last write %s  (external - message only, cannot attach/kill)\n",
+					ext.Name, fillLabel, ext.LastWrite.Format("15:04:05"))
+			}
+			return nil
+		},
+	}
+
+	// msgCmd is a Digital Clarity workspace enhancement (not upstream). It
+	// delivers text into a lane's live claude prompt by tmux send-keys
+	// followed by Enter (session.Instance.SendPrompt does exactly this
+	// already), then captures the pane and prints the last line so the
+	// caller sees it landed. A lane with no tracked tmux session (an
+	// external row - see discoverCmd) gets the fixed UNCONSTRUCTED line
+	// instead of a silently dropped or fabricated delivery.
+	msgCmd = &cobra.Command{
+		Use:   "msg <lane> <text>",
+		Short: "Send one line of text into a lane's live prompt, and print back the line that landed",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			log.Initialize(false)
+			defer log.Close()
+
+			lane, text := args[0], args[1]
+
+			state := config.LoadState()
+			storage, err := session.NewStorage(state)
+			if err != nil {
+				return fmt.Errorf("failed to initialize storage: %w", err)
+			}
+			instances, err := storage.LoadInstances()
+			if err != nil {
+				return fmt.Errorf("failed to load instances: %w", err)
+			}
+
+			for _, inst := range instances {
+				if inst.Title != lane {
+					continue
+				}
+				if !inst.Started() || inst.Paused() || !inst.TmuxAlive() {
+					return fmt.Errorf("clarity-squad instance %q is not a live tmux session (started=%v paused=%v)",
+						lane, inst.Started(), inst.Paused())
+				}
+				if err := inst.SendPrompt(text); err != nil {
+					return fmt.Errorf("failed to send message to %q: %w", lane, err)
+				}
+				pane, err := inst.Preview()
+				if err != nil {
+					return fmt.Errorf("message sent to %q but pane capture failed: %w", lane, err)
+				}
+				fmt.Println(clarity.LastPaneLine(pane))
+				return nil
+			}
+
+			// Not a tracked instance - check whether it resolves to a live
+			// external lane before giving up.
+			external, discErr := clarity.DiscoverExternalLanes(nil)
+			if discErr == nil {
+				for _, ext := range external {
+					if clarity.MatchesQueriedLane(ext, lane) {
+						fmt.Println(clarity.ExternalMsgUnconstructed(lane))
+						return nil
+					}
+				}
+			}
+			return fmt.Errorf("no live lane named %q (checked tracked instances and external transcripts)", lane)
+		},
+	}
 )
 
 func init() {
@@ -258,6 +370,8 @@ func init() {
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(resetCmd)
 	rootCmd.AddCommand(clarityAttachCmd)
+	rootCmd.AddCommand(discoverCmd)
+	rootCmd.AddCommand(msgCmd)
 }
 
 func main() {
