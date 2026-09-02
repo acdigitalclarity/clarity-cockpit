@@ -589,7 +589,7 @@ func wrapWords(s string, width int) []string {
 // typed even when lt.Lane carries the encoded discovery form.
 func RenderHeaderLine(lane string, lt LaneTail) string {
 	return fmt.Sprintf("%s  %s  last turn %s  last write %s  %s",
-		lane, lt.State, lt.LastTurn.Format("15:04:05"), lt.LastWrite.Format("15:04:05"), lt.StateReason)
+		lane, lt.State, lt.LastTurn.Local().Format("15:04:05"), lt.LastWrite.Format("15:04:05"), lt.StateReason)
 }
 
 // RenderTurnLines renders one Turn as "hh:mm:ss  YOU|CLAUDE|▪ <tool>  <text
@@ -597,7 +597,7 @@ func RenderHeaderLine(lane string, lt LaneTail) string {
 // continuation lines hanging-indented under the text column.
 func RenderTurnLines(t Turn, width int) []string {
 	label := turnLabel(t)
-	prefix := fmt.Sprintf("%s  %s  ", t.At.Format("15:04:05"), label)
+	prefix := fmt.Sprintf("%s  %s  ", t.At.Local().Format("15:04:05"), label)
 
 	body := collapseWhitespace(turnBody(t))
 	if t.Kind == TurnTool {
