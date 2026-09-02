@@ -8,6 +8,7 @@ import (
 
 	"charm.land/lipgloss/v2"
 	"charm.land/lipgloss/v2/compat"
+	"github.com/charmbracelet/x/ansi"
 )
 
 var keyStyle = lipgloss.NewStyle().Foreground(compat.AdaptiveColor{
@@ -223,6 +224,14 @@ func (m *Menu) String() string {
 		}
 	}
 
-	centeredMenuText := menuStyle.Render(s.String())
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, centeredMenuText)
+	menuText := menuStyle.Render(s.String())
+	// The FINISH defect's "help footer on one line and truncated to width":
+	// menuText already carries per-key/desc ANSI colour codes from the
+	// Render calls above, so this needs an ansi-aware truncation (the
+	// lipgloss.Place below is a documented no-op once content already
+	// exceeds the given width - it never truncates on its own).
+	if m.width > 0 && ansi.StringWidth(menuText) > m.width {
+		menuText = ansi.Truncate(menuText, m.width, "…")
+	}
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, menuText)
 }

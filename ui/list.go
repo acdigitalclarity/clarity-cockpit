@@ -11,6 +11,7 @@ import (
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/lipgloss/v2"
 	"charm.land/lipgloss/v2/compat"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
 )
 
@@ -169,6 +170,63 @@ func (l *List) NumInstances() int {
 	return len(l.items)
 }
 
+// rowInnerWidth is the width budget for one "Needs you" feed line or
+// external-lane row's raw content, ansi-aware and truncated with an
+// ellipsis when a line runs over it (ansiTruncateRow, below). It mirrors
+// InstanceRenderer's own r.width (AdjustPreviewWidth(l.width)) minus the
+// small left/right padding needsYouLineStyle and externalRowStyle apply, so
+// the STYLED line never exceeds l.width - the OVERFLOW defect's root cause
+// was exactly this budget going unenforced for these two row kinds:
+// lipgloss.Place (List.String()'s own final wrapper) is a documented no-op
+// once content already exceeds the width it was given, it never truncates.
+func (l *List) rowInnerWidth() int {
+	w := AdjustPreviewWidth(l.width) - 2
+	if w < 1 {
+		w = 1
+	}
+	return w
+}
+
+// ansiTruncateRow truncates s to width cells, ansi- and grapheme-aware
+// (github.com/charmbracelet/x/ansi.Truncate - never a byte slice, which
+// would both miscount wide/multi-byte runes and could sever an escape
+// sequence mid-code).
+func ansiTruncateRow(s string, width int) string {
+	return ansi.Truncate(s, width, "…")
+}
+
+// externalRowSuffixWidth is the fixed width of every external-lane row's
+// content after the name column: " ctx " (5) + the fill percentage padded
+// to 5 ("%-5s") + " last write " (12) + "HH:MM:SS" (8) = 30, matching the
+// literal format string in String() below exactly.
+const externalRowSuffixWidth = 30
+
+// externalNameColMax is the widest the name column is ever allowed to be -
+// long enough for this fleet's actual lane names (see the OVERFLOW repro
+// capture: 21-27 characters) without eating into the suffix's budget on a
+// wide terminal.
+const externalNameColMax = 28
+
+// externalNameColWidth returns the fixed column width the external-lane
+// name is padded/truncated to, so every row's "ctx NN%" and "last write
+// HH:MM:SS" line up under each other regardless of individual lane-name
+// length (the FINISH defect's "pad the lane name to a column" requirement).
+// It shrinks below externalNameColMax on a narrow list column so the
+// suffix - the ctx/last-write information that matters most - is never the
+// part a too-wide fixed name column pushes past the row's own truncation
+// and off the edge.
+func (l *List) externalNameColWidth() int {
+	avail := l.rowInnerWidth() - externalRowSuffixWidth
+	const minCol = 6
+	if avail < minCol {
+		avail = minCol
+	}
+	if avail > externalNameColMax {
+		avail = externalNameColMax
+	}
+	return avail
+}
+
 // InstanceRenderer handles rendering of session.Instance objects
 type InstanceRenderer struct {
 	spinner *spinner.Model
@@ -253,14 +311,23 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, h
 	remainingWidth -= diffWidth
 
 	// Context-fill gauge: the same number scripts/fleet_dashboard.py would
-	// show for this instance's lane (see session/clarity/gauge.go), or
-	// "n/a" when no transcript resolves.
-	fillLabel := "n/a"
+	// show for this instance's lane (see session/clarity/gauge.go). A
+	// tracked instance's fill is now derived from its own transcript
+	// whether the instance is Paused or Running (app.go's feedTickMsg
+	// handler computes it for every tracked instance, not just the active
+	// ones - see that file's comment); when it genuinely cannot be derived
+	// (no transcript resolves at all) this shows nothing rather than the
+	// "n/a" upstream fell back to, per the brief's OWN ROW fix. The column
+	// is still reserved at a fixed width either way, so every row's gauge
+	// and diff badge line up regardless of whether this particular row has
+	// a fill to show.
+	const gaugeColWidth = len("ctx 100%")
+	gaugeText := ""
 	if fillPct, ok := i.GetContextFill(); ok {
-		fillLabel = fmt.Sprintf("%d%%", fillPct)
+		gaugeText = fmt.Sprintf("ctx %d%%", fillPct)
 	}
-	gauge := fmt.Sprintf("ctx %s", fillLabel)
-	gaugeWidth := runewidth.StringWidth(gauge) + 2 // surrounding separator spaces
+	gauge := runewidth.FillRight(gaugeText, gaugeColWidth)
+	gaugeWidth := gaugeColWidth + 2 // surrounding separator spaces
 	remainingWidth -= gaugeWidth
 
 	branch := i.Branch
@@ -292,7 +359,18 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, h
 		spaces = strings.Repeat(" ", remainingWidth)
 	}
 
-	branchLine := fmt.Sprintf("%s %s-%s%s %s %s", strings.Repeat(" ", len(prefix)), branchIcon, branch, spaces, gauge, diff)
+	// clarity-attach instances (session/clarity/attach.go) have no git
+	// worktree and so no branch to show. Upstream's "<icon>-<branch>"
+	// segment rendered unconditionally, so a branchless row showed a bare
+	// Cherokee glyph and hyphen with nothing after it (the OWN ROW defect's
+	// garbled second line) - blank space of the same width keeps the
+	// gauge/diff columns lined up with every other row instead.
+	branchSegment := fmt.Sprintf("%s-%s", branchIcon, branch)
+	if !i.HasWorktree() {
+		branchSegment = strings.Repeat(" ", runewidth.StringWidth(branchSegment))
+	}
+
+	branchLine := fmt.Sprintf("%s %s%s %s %s", strings.Repeat(" ", len(prefix)), branchSegment, spaces, gauge, diff)
 
 	// join title and subtitle
 	text := lipgloss.JoinVertical(
@@ -332,12 +410,16 @@ func (l *List) String() string {
 	b.WriteString("\n")
 
 	// Render the "Needs you" feed, once per feed tick (see app.go) - never
-	// a bare empty section when the queue is absent, per the brief.
+	// a bare empty section when the queue is absent, per the brief. Every
+	// row is truncated to the list's own inner width first (the OVERFLOW
+	// defect: a feed row can run to 100+ characters, and nothing downstream
+	// clips it back down).
+	innerWidth := l.rowInnerWidth()
 	if len(l.needsYou) > 0 {
 		b.WriteString(needsYouTitleStyle.Render(" Needs you "))
 		b.WriteString("\n")
 		for _, line := range l.needsYou {
-			b.WriteString(needsYouLineStyle.Render(line))
+			b.WriteString(needsYouLineStyle.Render(ansiTruncateRow(line, innerWidth)))
 			b.WriteString("\n")
 		}
 		b.WriteString("\n")
@@ -371,13 +453,42 @@ func (l *List) String() string {
 			if lane.FillOK {
 				fillLabel = fmt.Sprintf("%d%%", lane.Fill.Pct)
 			}
-			line := fmt.Sprintf("%s  ctx %-5s last write %s", lane.Name, fillLabel, lane.LastWrite.Format("15:04:05"))
-			b.WriteString(style.Render(line))
+			// Pad (or truncate) the name to a fixed column first, so ctx and
+			// last write line up across every row regardless of how long an
+			// individual lane name is - then truncate the WHOLE row to the
+			// list's inner width, since a name near the column width plus
+			// the fixed suffix can still run past a narrow terminal.
+			nameCol := l.externalNameColWidth()
+			name := runewidth.FillRight(ansiTruncateRow(lane.Name, nameCol), nameCol)
+			line := fmt.Sprintf("%s ctx %-5s last write %s", name, fillLabel, lane.LastWrite.Format("15:04:05"))
+			b.WriteString(style.Render(ansiTruncateRow(line, innerWidth)))
 			b.WriteString("\n")
 		}
 	}
 
-	return lipgloss.Place(l.width, l.height, lipgloss.Left, lipgloss.Top, b.String())
+	// Cap the block to l.height before handing it to Place: with the "Needs
+	// you" feed, every tracked instance and a full external-lane section
+	// all present at once, the natural content height can exceed l.height
+	// on a short terminal (24 rows, say) - and lipgloss.Place's own
+	// documented behaviour is a no-op ("If the given height is shorter
+	// than the content height... this will be a noöp") rather than a
+	// crop, so an unenforced budget here let the list's block grow past
+	// its box and push the menu/footer below it off the bottom of the
+	// terminal entirely (the OVERFLOW defect's vertical half, on real
+	// fleet data: needsYou + 2 tracked instances + 6 external rows at
+	// 80x24). External-lane rows are the lowest-priority content (added
+	// last, message-only), so they are what a tight terminal loses first;
+	// cutting on whole lines (never mid-row) keeps every ANSI style
+	// sequence intact.
+	content := b.String()
+	if l.height > 0 {
+		lines := strings.Split(content, "\n")
+		if len(lines) > l.height {
+			content = strings.Join(lines[:l.height], "\n")
+		}
+	}
+
+	return lipgloss.Place(l.width, l.height, lipgloss.Left, lipgloss.Top, content)
 }
 
 // Down selects the next item in the list, crossing from the tracked

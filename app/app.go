@@ -182,16 +182,53 @@ func newHome(ctx context.Context, program string, autoYes bool, noSplash bool) *
 	return h
 }
 
+// collapsePreviewBelowWidth is the OVERFLOW fix's stated decision: below
+// this many terminal columns there simply isn't room for a list column and
+// a Preview/Diff pane side by side without either one being squeezed to
+// unreadable (or, as observed, the list refusing to shrink and pushing the
+// preview pane off-screen entirely). Below it the preview/diff pane is
+// COLLAPSED - width 0, not rendered - and the list takes the full width;
+// above it the two share the width by fixed proportion. Stacking the two
+// vertically instead was the other option the brief named; collapsing was
+// chosen because this fork's TabbedWindow/List already both render as a
+// single horizontal-join block with no vertical-stack code path, so
+// collapsing is the root-cause-sized fix and stacking would be new
+// machinery for a case (a terminal under 100 columns) this app is rarely
+// run at.
+const collapsePreviewBelowWidth = 100
+
 // updateHandleWindowSizeEvent sets the sizes of the components.
 // The components will try to render inside their bounds.
 func (m *home) updateHandleWindowSizeEvent(msg tea.WindowSizeMsg) {
-	// List takes 30% of width, preview takes 70%
-	listWidth := int(float32(msg.Width) * 0.3)
-	tabsWidth := msg.Width - listWidth
+	// List takes 40% of width, preview takes the rest - above the collapse
+	// threshold. (Previously 30/70, sized by nothing but the ratio itself;
+	// the OVERFLOW defect's real cause was that neither the list's feed
+	// rows nor the external-lane rows ever truncated to whatever column
+	// width fell out of the split - fixed in ui/list.go - so this ratio
+	// change is cosmetic breathing room for the list column, not the fix.)
+	var listWidth, tabsWidth int
+	if msg.Width < collapsePreviewBelowWidth {
+		listWidth = msg.Width
+		tabsWidth = 0
+	} else {
+		listWidth = int(float32(msg.Width) * 0.4)
+		tabsWidth = msg.Width - listWidth
+	}
 
-	// Menu takes 10% of height, list and window take 90%
+	// Menu takes 10% of height, list and window take 90%.
+	//
+	// menuHeight reserves 2 rows below contentHeight, not 1: one for the
+	// error/status footer row, and one for View()'s own
+	// lipgloss.NewStyle().PaddingTop(1) that it applies to both the list and
+	// the preview pane on top of the content height they were actually
+	// given - a row this arithmetic must account for or the whole screen
+	// renders exactly one row taller than msg.Height every time (the
+	// OVERFLOW defect's vertical half: at every height this was tested at,
+	// View() rendered height+1 lines, one row over the terminal's own
+	// height budget, which is exactly what pushed the preview box's bottom
+	// border off screen at a small height like 24 rows).
 	contentHeight := int(float32(msg.Height) * 0.9)
-	menuHeight := msg.Height - contentHeight - 1        // minus 1 for error/status box
+	menuHeight := msg.Height - contentHeight - 2        // -1 padding row, -1 error/status box
 	m.errBox.SetSize(int(float32(msg.Width)*0.9), 1)    // error box takes 1 row
 	m.statusBox.SetSize(int(float32(msg.Width)*0.9), 1) // status box shares that row
 
@@ -205,9 +242,15 @@ func (m *home) updateHandleWindowSizeEvent(msg tea.WindowSizeMsg) {
 		m.textOverlay.SetWidth(int(float32(msg.Width) * 0.6))
 	}
 
-	previewWidth, previewHeight := m.tabbedWindow.GetPreviewSize()
-	if err := m.list.SetSessionPreviewSize(previewWidth, previewHeight); err != nil {
-		log.ErrorLog.Print(err)
+	// Skip when collapsed (tabsWidth == 0): TabbedWindow.SetSize leaves its
+	// last valid preview size in place rather than computing a negative
+	// one, and there is nothing useful to re-apply to the real tmux panes
+	// underneath while the preview isn't shown anyway.
+	if tabsWidth > 0 {
+		previewWidth, previewHeight := m.tabbedWindow.GetPreviewSize()
+		if err := m.list.SetSessionPreviewSize(previewWidth, previewHeight); err != nil {
+			log.ErrorLog.Print(err)
+		}
 	}
 	m.menu.SetSize(msg.Width, menuHeight)
 }
@@ -337,6 +380,28 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			log.WarningLog.Printf("discover external lanes failed: %v", err)
 		} else {
 			m.list.SetExternal(external)
+		}
+
+		// Context-fill for Paused tracked instances (the OWN ROW defect's
+		// "ctx n/a"): tickUpdateMetadataCmd's 500ms loop only computes
+		// context fill for snapshotActiveInstances() (Started and not
+		// Paused), because its OTHER two computations - HasUpdated and the
+		// diff stats - genuinely need a live tmux session. Context fill
+		// does not: clarity.ContextFillForLane reads the instance's own
+		// transcript file by path, exactly the same file-only derivation
+		// DiscoverExternalLanes' ReadFill call above already does
+		// synchronously on this same tick for every external lane. A
+		// tracked instance is Paused far more often than an external lane
+		// is absent, and its transcript is exactly as file-only-derivable
+		// while paused as while running - so this closes that gap the same
+		// way, on the same cadence, rather than leaving every paused lane's
+		// gauge permanently stuck wherever it was when it was last active.
+		for _, inst := range m.list.GetInstances() {
+			if inst.Status != session.Paused {
+				continue
+			}
+			pct, ok := inst.ComputeContextFill()
+			inst.SetContextFill(pct, ok)
 		}
 
 		return m, func() tea.Msg {
