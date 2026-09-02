@@ -14,8 +14,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/charmbracelet/x/ansi"
 )
 
 // Turn kinds.
@@ -453,23 +456,83 @@ func indexToolResults(records []rawRecord) map[string]toolOutcome {
 	return out
 }
 
-// toolSummary renders a tool_use call's one-line description: the input's
-// "description" field when present (Bash and most other tools carry one),
-// otherwise the input's own compact JSON as a fallback first line.
-func toolSummary(raw json.RawMessage) string {
+// toolSummaryMaxLen is the tool line summary's own outer bound - every
+// branch below is truncated ansi-aware to this width before it is ever
+// handed to a Turn, regardless of which rule produced it.
+const toolSummaryMaxLen = 100
+
+// toolSummaryFieldMaxLen is the narrower bound the Bash-command and
+// fallback-compact-rendering branches apply to their own field, ahead of
+// the outer toolSummaryMaxLen truncation above.
+const toolSummaryFieldMaxLen = 80
+
+// toolSummary renders a tool_use call's one-line summary (defect 2, seen on
+// a real Write turn: its raw input JSON - a whole file's content - printed
+// as the summary). The rule, in order: the input's "description" field
+// when present; else, for Write/Edit/Read, the file path's last two path
+// segments; else, for Bash, the command's first line; else the first line
+// of a compact (whitespace-stripped) rendering of the input - never the
+// raw input itself. Every branch is truncated ansi-aware to
+// toolSummaryMaxLen before it reaches a Turn.
+func toolSummary(tool string, raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
 	}
+
 	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err == nil {
-		if descRaw, ok := fields["description"]; ok {
-			var desc string
-			if json.Unmarshal(descRaw, &desc) == nil && desc != "" {
-				return firstLine(desc)
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return ansi.Truncate(firstLine(compactJSON(raw)), toolSummaryMaxLen, "…")
+	}
+
+	if descRaw, ok := fields["description"]; ok {
+		var desc string
+		if json.Unmarshal(descRaw, &desc) == nil && desc != "" {
+			return ansi.Truncate(firstLine(desc), toolSummaryMaxLen, "…")
+		}
+	}
+
+	switch tool {
+	case "Write", "Edit", "Read":
+		if pathRaw, ok := fields["file_path"]; ok {
+			var path string
+			if json.Unmarshal(pathRaw, &path) == nil && path != "" {
+				return ansi.Truncate(lastTwoPathSegments(path), toolSummaryMaxLen, "…")
+			}
+		}
+	case "Bash":
+		if cmdRaw, ok := fields["command"]; ok {
+			var cmd string
+			if json.Unmarshal(cmdRaw, &cmd) == nil && cmd != "" {
+				return ansi.Truncate(firstLine(cmd), toolSummaryFieldMaxLen, "…")
 			}
 		}
 	}
-	return firstLine(string(raw))
+
+	return ansi.Truncate(firstLine(compactJSON(raw)), toolSummaryFieldMaxLen, "…")
+}
+
+// lastTwoPathSegments returns path's final two "/"-separated segments (or
+// fewer, if path has fewer than two) - enough to identify the file without
+// the long, mostly-shared prefix a full absolute path carries in this
+// workspace (/Users/allencoates/projects/Clarity/...).
+func lastTwoPathSegments(path string) string {
+	path = filepath.ToSlash(strings.TrimRight(path, "/"))
+	parts := strings.Split(path, "/")
+	if len(parts) <= 2 {
+		return strings.Join(parts, "/")
+	}
+	return strings.Join(parts[len(parts)-2:], "/")
+}
+
+// compactJSON strips insignificant whitespace from raw, so a fallback
+// summary is always a single line even when the source input was pretty-
+// printed - never a byte-for-byte dump of a possibly large input.
+func compactJSON(raw json.RawMessage) string {
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, raw); err != nil {
+		return string(raw)
+	}
+	return buf.String()
 }
 
 // firstLine returns s's first line, trimmed.
@@ -512,7 +575,7 @@ func buildTurns(records []rawRecord, maxTurns int) []Turn {
 						Kind:    TurnTool,
 						At:      at,
 						Tool:    item.Name,
-						Summary: toolSummary(item.Input),
+						Summary: toolSummary(item.Name, item.Input),
 						Result:  ResultRunning,
 					}
 					if outcome, ok := outcomes[item.ID]; ok {

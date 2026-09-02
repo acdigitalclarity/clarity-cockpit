@@ -31,7 +31,16 @@ const ExternalLiveWindow = 90 * time.Minute
 // rows can be messaged (the brief's requirement) but never attached or
 // killed - there is no tracked tmux session or git worktree behind them.
 type ExternalLane struct {
-	Name           string
+	// Name is the DISPLAYED lane name - laneNameFromTranscriptDir's result
+	// with a leading "sessions-" stripped (defect 3: the prefix wasted nine
+	// columns on every row and forced truncation that would otherwise not
+	// be needed). Key below carries the un-stripped form for matching.
+	Name string
+	// Key is the full, un-stripped name laneNameFromTranscriptDir derived -
+	// what MatchesQueriedLane/TranscriptForLane actually match against, so
+	// stripping the prefix for display never changes which lane a caller's
+	// `cs-clarity msg <lane>`/lane-tail argument resolves to.
+	Key            string
 	TranscriptPath string
 	LastWrite      time.Time
 	Fill           Fill
@@ -93,15 +102,16 @@ func TrackedExclusionPaths(paths []string) map[string]bool {
 }
 
 // MatchesQueriedLane reports whether ext is the lane a caller meant by
-// queried - either the exact discovered name, or queried with the same
-// "sessions-" prefix DiscoverExternalLanes' names carry for anything under
-// the Clarity sessions/ tree. This lets `cs-clarity msg <lane> ...` and the
-// bash `clarity msg <lane> ...` wrapper accept the same bare lane name a
-// human uses everywhere else in this ecosystem (clarity attach <lane>,
-// sessions/<lane>/), rather than forcing the fleet_dashboard.py-style
-// "sessions-<lane>" form onto the command line.
+// queried - either ext's own displayed Name (already stripped of any
+// "sessions-" prefix, defect 3), its full un-stripped Key, or queried with
+// the same "sessions-" prefix DiscoverExternalLanes' keys carry for
+// anything under the Clarity sessions/ tree. This lets `cs-clarity msg
+// <lane> ...` and the bash `clarity msg <lane> ...` wrapper accept the same
+// bare lane name a human uses everywhere else in this ecosystem (clarity
+// attach <lane>, sessions/<lane>/), rather than forcing the
+// fleet_dashboard.py-style "sessions-<lane>" form onto the command line.
 func MatchesQueriedLane(ext ExternalLane, queried string) bool {
-	return ext.Name == queried || ext.Name == "sessions-"+queried
+	return ext.Name == queried || ext.Key == queried || ext.Key == "sessions-"+queried
 }
 
 // cwdScanMaxLines and cwdScanMaxBytes bound readTranscriptCwd's forward
@@ -202,7 +212,8 @@ func DiscoverExternalLanes(excludeDirs map[string]bool) ([]ExternalLane, error) 
 		}
 		fill, ok := ReadFill(r.path, "")
 		out = append(out, ExternalLane{
-			Name:           r.lane,
+			Name:           strings.TrimPrefix(r.lane, "sessions-"),
+			Key:            r.lane,
 			TranscriptPath: r.path,
 			LastWrite:      r.mod,
 			Fill:           fill,

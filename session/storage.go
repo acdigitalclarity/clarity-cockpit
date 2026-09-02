@@ -2,6 +2,7 @@ package session
 
 import (
 	"claude-squad/config"
+	"claude-squad/log"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -42,26 +43,68 @@ type DiffStatsData struct {
 	Content string `json:"content"`
 }
 
-// Storage handles saving and loading instances using the state interface
+// Storage handles saving and loading instances using the state interface.
+// known tracks the instance paths this process has itself loaded or saved
+// - see SaveInstances' doc comment (defect 1, the 2 Sep 20:22 instance-
+// store clobber): it is the line between "this process deleted that
+// instance on purpose" and "this process never knew that instance
+// existed".
 type Storage struct {
 	state config.InstanceStorage
+	known map[string]bool
 }
 
 // NewStorage creates a new storage instance
 func NewStorage(state config.InstanceStorage) (*Storage, error) {
 	return &Storage{
 		state: state,
+		known: make(map[string]bool),
 	}, nil
 }
 
-// SaveInstances saves the list of instances to disk
+// SaveInstances saves the list of instances to disk. It never simply
+// overwrites the store with this process's own in-memory list: it re-reads
+// the store immediately before writing (config.State.GetInstances() always
+// reads fresh from disk, see its own doc comment) and merges by instance
+// PATH. An on-disk record whose path this process has never seen (not in
+// `known`) was written by another process after this process's own list
+// was last refreshed - e.g. main.go's clarity-attach command (~line 215),
+// which loads, appends and saves from a brand-new process while the
+// cockpit keeps running - and survives even though it is absent from the
+// in-memory list handed to this call. An on-disk record this process HAS
+// previously loaded or saved and no longer lists here is a genuine
+// deletion (the `D` kill key) and is dropped, exactly as before.
+//
+// This is the root-cause fix for the 2 Sep 20:22 defect: the cockpit
+// process opened before 19:13 still held its stale in-memory list (just
+// itself) when the owner quit it; its unconditional overwrite-on-quit
+// dropped the lane clarity-attach had registered into the store at 19:13,
+// even though that lane's tmux session was still alive.
 func (s *Storage) SaveInstances(instances []*Instance) error {
 	// Convert instances to InstanceData
-	data := make([]InstanceData, 0)
+	data := make([]InstanceData, 0, len(instances))
+	byPath := make(map[string]bool, len(instances))
 	for _, instance := range instances {
 		if instance.Started() {
-			data = append(data, instance.ToInstanceData())
+			d := instance.ToInstanceData()
+			data = append(data, d)
+			byPath[d.Path] = true
 		}
+	}
+
+	if onDisk, err := s.loadRawInstanceData(); err != nil {
+		log.WarningLog.Printf("save instances: could not reload on-disk store to merge, writing in-memory list only: %v", err)
+	} else {
+		for _, d := range onDisk {
+			if byPath[d.Path] || s.known[d.Path] {
+				continue
+			}
+			data = append(data, d)
+		}
+	}
+
+	for _, d := range data {
+		s.known[d.Path] = true
 	}
 
 	// Marshal to JSON
@@ -73,13 +116,25 @@ func (s *Storage) SaveInstances(instances []*Instance) error {
 	return s.state.SaveInstances(jsonData)
 }
 
-// LoadInstances loads the list of instances from disk
-func (s *Storage) LoadInstances() ([]*Instance, error) {
+// loadRawInstanceData reads and unmarshals the on-disk store's raw
+// InstanceData records, without constructing Instance objects for them
+// (FromInstanceData restores a tracked instance's tmux session, which
+// SaveInstances' merge above has no need to pay for).
+func (s *Storage) loadRawInstanceData() ([]InstanceData, error) {
 	jsonData := s.state.GetInstances()
 
 	var instancesData []InstanceData
 	if err := json.Unmarshal(jsonData, &instancesData); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal instances: %w", err)
+	}
+	return instancesData, nil
+}
+
+// LoadInstances loads the list of instances from disk
+func (s *Storage) LoadInstances() ([]*Instance, error) {
+	instancesData, err := s.loadRawInstanceData()
+	if err != nil {
+		return nil, err
 	}
 
 	instances := make([]*Instance, len(instancesData))
@@ -89,9 +144,42 @@ func (s *Storage) LoadInstances() ([]*Instance, error) {
 			return nil, fmt.Errorf("failed to create instance %s: %w", data.Title, err)
 		}
 		instances[i] = instance
+		s.known[data.Path] = true
 	}
 
 	return instances, nil
+}
+
+// UntrackedInstances returns freshly-constructed Instances for every
+// on-disk record whose Path is not in known - the feed tick's adoption
+// step (app.go's feedTickMsg handler), defect 1's read-side half: a lane
+// registered directly into the store by another process (main.go's
+// clarity-attach) appears in the running cockpit within one feed tick,
+// with no restart needed. Only records NOT already in known are
+// reconstructed via FromInstanceData (which restores a tracked instance's
+// tmux session), so an already-tracked lane is never re-restored every
+// tick just to be discarded. Each adopted record's path is recorded into
+// `known`, exactly as LoadInstances does, so a later SaveInstances treats
+// it as this process's own from here on.
+func (s *Storage) UntrackedInstances(known map[string]bool) ([]*Instance, error) {
+	raw, err := s.loadRawInstanceData()
+	if err != nil {
+		return nil, err
+	}
+
+	var out []*Instance
+	for _, data := range raw {
+		if known[data.Path] {
+			continue
+		}
+		instance, err := FromInstanceData(data)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create instance %s: %w", data.Title, err)
+		}
+		out = append(out, instance)
+		s.known[data.Path] = true
+	}
+	return out, nil
 }
 
 // DeleteInstance removes an instance from storage

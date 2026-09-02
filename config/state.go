@@ -114,8 +114,41 @@ func (s *State) SaveInstances(instancesJSON json.RawMessage) error {
 	return SaveState(s)
 }
 
-// GetInstances returns the raw instance data
+// GetInstances returns the raw instance data, read fresh from disk on
+// every call rather than the in-memory copy loaded at LoadState time. A
+// long-lived process (the cockpit TUI) must see an instance another
+// process registered directly into state.json after this process's own
+// State was loaded - e.g. /Users/allencoates/bin/clarity's clarity-attach
+// path (main.go, ~line 215), which loads, appends and saves from a fresh
+// process while the cockpit is already running. Without this, the
+// cockpit's own periodic SaveInstances (app.go) would overwrite that
+// write with its stale in-memory list the next time it saved - the root
+// cause of the 2 Sep 20:22 instance-store clobber. Falls back to the
+// in-memory copy if the file cannot be read or parsed, rather than
+// erroring the caller out.
 func (s *State) GetInstances() json.RawMessage {
+	configDir, err := GetConfigDir()
+	if err != nil {
+		log.WarningLog.Printf("get instances: failed to get config directory, using cached copy: %v", err)
+		return s.InstancesData
+	}
+
+	statePath := filepath.Join(configDir, StateFileName)
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.WarningLog.Printf("get instances: failed to read state file, using cached copy: %v", err)
+		}
+		return s.InstancesData
+	}
+
+	var onDisk State
+	if err := json.Unmarshal(data, &onDisk); err != nil {
+		log.WarningLog.Printf("get instances: failed to parse state file, using cached copy: %v", err)
+		return s.InstancesData
+	}
+
+	s.InstancesData = onDisk.InstancesData
 	return s.InstancesData
 }
 

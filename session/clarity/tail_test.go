@@ -1,9 +1,11 @@
 package clarity
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,6 +33,32 @@ func assistantThinkingLine(ts time.Time, model, thinking string) string {
 func assistantToolUseLine(ts time.Time, model, id, name, description string) string {
 	return fmt.Sprintf(`{"type":"assistant","timestamp":%q,"message":{"role":"assistant","model":%q,"content":[{"type":"tool_use","id":%q,"name":%q,"input":{"command":"x","description":%q}}]}}`,
 		fixtureTimestamp(ts), model, id, name, description)
+}
+
+// assistantToolUseLineWithInput builds an assistant tool_use record with an
+// arbitrary input payload (marshaled to JSON), unlike assistantToolUseLine
+// above which always carries a "description" field - defect 2's fixtures
+// need to exercise the branches toolSummary takes when description is
+// ABSENT (a real Write/Edit tool_use never carries one, confirmed against a
+// live transcript before this file was written).
+func assistantToolUseLineWithInput(t *testing.T, ts time.Time, model, id, name string, input any) string {
+	t.Helper()
+	inputRaw, err := json.Marshal(input)
+	require.NoError(t, err)
+	rec := map[string]any{
+		"type":      "assistant",
+		"timestamp": fixtureTimestamp(ts),
+		"message": map[string]any{
+			"role":  "assistant",
+			"model": model,
+			"content": []map[string]any{
+				{"type": "tool_use", "id": id, "name": name, "input": json.RawMessage(inputRaw)},
+			},
+		},
+	}
+	b, err := json.Marshal(rec)
+	require.NoError(t, err)
+	return string(b)
 }
 
 func userToolResultLine(ts time.Time, toolUseID string, isError bool, denialKind string) string {
@@ -213,6 +241,100 @@ func TestBuildTurns_ToolUseMatchedToResult_DeniedAndError(t *testing.T) {
 	require.Equal(t, ResultDenied, denied.Result, "toolDenialKind on the user record must mark denied, not error")
 	require.Equal(t, ResultError, errored.Result)
 	require.Equal(t, time.Minute, errored.Duration)
+}
+
+// TestToolSummary_WriteTurn_ShowsFilePathNotRawDump reproduces defect 2: a
+// Write tool turn (no "description" field, as a real one never carries)
+// whose input carries a 2 KB content string must summarise to the file
+// path's last two segments, never the raw content.
+func TestToolSummary_WriteTurn_ShowsFilePathNotRawDump(t *testing.T) {
+	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
+	bigContent := strings.Repeat("x", 2048)
+	line := assistantToolUseLineWithInput(t, now.Add(-time.Minute), "claude-fable-5-1", "toolu_write", "Write",
+		map[string]string{
+			"file_path": "/Users/allencoates/projects/Clarity/sessions/fixture-lane/report.md",
+			"content":   bigContent,
+		})
+	path := writeFixture(t, []string{line})
+
+	tail, err := ReadLaneTail(path, DefaultTailMaxBytes, DefaultTailTurns, now)
+	require.NoError(t, err)
+	require.Len(t, tail.Turns, 1)
+	summary := tail.Turns[0].Summary
+	require.LessOrEqual(t, len([]rune(summary)), 100, "a Write turn's summary must never dump its raw input")
+	require.NotContains(t, summary, bigContent[:200], "the 2 KB content string must never appear in the summary")
+	require.Contains(t, summary, "fixture-lane/report.md", "the summary falls back to the file path's last two segments")
+}
+
+// TestToolSummary_BashCommand_FirstLineUpTo80CharsWhenNoDescription covers
+// the Bash branch when the tool_use carries no description of its own.
+func TestToolSummary_BashCommand_FirstLineUpTo80CharsWhenNoDescription(t *testing.T) {
+	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
+	longCmd := "echo " + strings.Repeat("a", 120) + "\nsecond line must never appear"
+	line := assistantToolUseLineWithInput(t, now.Add(-time.Minute), "claude-fable-5-1", "toolu_bash", "Bash",
+		map[string]string{"command": longCmd})
+	path := writeFixture(t, []string{line})
+
+	tail, err := ReadLaneTail(path, DefaultTailMaxBytes, DefaultTailTurns, now)
+	require.NoError(t, err)
+	require.Len(t, tail.Turns, 1)
+	summary := tail.Turns[0].Summary
+	require.LessOrEqual(t, len([]rune(summary)), 80)
+	require.NotContains(t, summary, "second line")
+	require.True(t, strings.HasPrefix(summary, "echo "))
+}
+
+// TestToolSummary_FallbackCompactRendering_OneLineNoRawDump covers a tool
+// with neither a description nor a Write/Edit/Read/Bash-shaped input - the
+// last-resort branch must still render one compact line, not a raw dump.
+func TestToolSummary_FallbackCompactRendering_OneLineNoRawDump(t *testing.T) {
+	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
+	line := assistantToolUseLineWithInput(t, now.Add(-time.Minute), "claude-fable-5-1", "toolu_grep", "Grep",
+		map[string]any{"pattern": "TODO"})
+	path := writeFixture(t, []string{line})
+
+	tail, err := ReadLaneTail(path, DefaultTailMaxBytes, DefaultTailTurns, now)
+	require.NoError(t, err)
+	require.Len(t, tail.Turns, 1)
+	summary := tail.Turns[0].Summary
+	require.LessOrEqual(t, len([]rune(summary)), 80)
+	require.NotContains(t, summary, "\n")
+	require.Equal(t, `{"pattern":"TODO"}`, summary, "a small input renders its own compact JSON verbatim, not a truncated fragment")
+}
+
+// TestToolSummary_FallbackCompactRendering_TruncatedNotRawDump is the same
+// branch on an input too large to render whole - it must still be exactly
+// one line, bounded, and never contain the field value in full.
+func TestToolSummary_FallbackCompactRendering_TruncatedNotRawDump(t *testing.T) {
+	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
+	bigPattern := strings.Repeat("y", 500)
+	line := assistantToolUseLineWithInput(t, now.Add(-time.Minute), "claude-fable-5-1", "toolu_grep_big", "Grep",
+		map[string]any{"pattern": bigPattern})
+	path := writeFixture(t, []string{line})
+
+	tail, err := ReadLaneTail(path, DefaultTailMaxBytes, DefaultTailTurns, now)
+	require.NoError(t, err)
+	require.Len(t, tail.Turns, 1)
+	summary := tail.Turns[0].Summary
+	require.LessOrEqual(t, len([]rune(summary)), 80)
+	require.NotContains(t, summary, "\n")
+	require.NotContains(t, summary, bigPattern, "a 500-byte field must never appear whole in an 80-char summary")
+}
+
+// TestToolSummary_DescriptionAlwaysTruncatedTo100 is the rule's outer
+// bound: even the description branch, which names no narrower field bound
+// of its own, is always truncated ansi-aware to 100 characters.
+func TestToolSummary_DescriptionAlwaysTruncatedTo100(t *testing.T) {
+	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
+	longDesc := strings.Repeat("word ", 40) // 200 characters
+	line := assistantToolUseLineWithInput(t, now.Add(-time.Minute), "claude-fable-5-1", "toolu_desc", "Bash",
+		map[string]string{"command": "x", "description": longDesc})
+	path := writeFixture(t, []string{line})
+
+	tail, err := ReadLaneTail(path, DefaultTailMaxBytes, DefaultTailTurns, now)
+	require.NoError(t, err)
+	require.Len(t, tail.Turns, 1)
+	require.LessOrEqual(t, len([]rune(tail.Turns[0].Summary)), 100)
 }
 
 func TestBuildTurns_ThinkingDropped(t *testing.T) {
