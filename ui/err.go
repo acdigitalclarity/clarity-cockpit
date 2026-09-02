@@ -3,7 +3,8 @@ package ui
 import (
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
+	"charm.land/lipgloss/v2/compat"
 	"github.com/mattn/go-runewidth"
 )
 
@@ -12,9 +13,9 @@ type ErrBox struct {
 	err           error
 }
 
-var errStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{
-	Light: "#FF0000",
-	Dark:  "#FF0000",
+var errStyle = lipgloss.NewStyle().Foreground(compat.AdaptiveColor{
+	Light: lipgloss.Color("#FF0000"),
+	Dark:  lipgloss.Color("#FF0000"),
 })
 
 func NewErrBox() *ErrBox {

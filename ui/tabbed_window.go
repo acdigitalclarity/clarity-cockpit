@@ -1,9 +1,10 @@
 package ui
 
 import (
+	"charm.land/lipgloss/v2"
+	"charm.land/lipgloss/v2/compat"
 	"claude-squad/log"
 	"claude-squad/session"
-	"github.com/charmbracelet/lipgloss"
 )
 
 func tabBorderWithBottom(left, middle, right string) lipgloss.Border {
@@ -17,7 +18,7 @@ func tabBorderWithBottom(left, middle, right string) lipgloss.Border {
 var (
 	inactiveTabBorder = tabBorderWithBottom("┴", "─", "┴")
 	activeTabBorder   = tabBorderWithBottom("┘", " ", "└")
-	highlightColor    = lipgloss.AdaptiveColor{Light: "#874BFD", Dark: "#7D56F4"}
+	highlightColor    = compat.AdaptiveColor{Light: lipgloss.Color("#874BFD"), Dark: lipgloss.Color("#7D56F4")}
 	inactiveTabStyle  = lipgloss.NewStyle().
 				Border(inactiveTabBorder, true).
 				BorderForeground(highlightColor).
