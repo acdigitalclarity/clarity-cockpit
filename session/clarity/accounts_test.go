@@ -66,3 +66,39 @@ func TestLoadAccountsRegistry_SkipsAccountWithEmptyConfigDir(t *testing.T) {
 	require.Len(t, registry, 1)
 	require.Equal(t, "/x", registry["real"])
 }
+
+// TestReadSeatOAuthAccount_PresentReportsOrgAndTierOnly proves the field
+// fence itself: even when the source .claude.json carries accountUuid and
+// emailAddress, the struct ReadSeatOAuthAccount returns has no field for
+// either - there is nothing for a caller to read even by accident.
+func TestReadSeatOAuthAccount_PresentReportsOrgAndTierOnly(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".claude.json"),
+		[]byte(`{"oauthAccount":{"organizationName":"Digital Clarity","organizationType":"claude_team","seatTier":"team_tier_1","accountUuid":"must-never-surface","emailAddress":"must-never-surface"}}`), 0644))
+
+	got := ReadSeatOAuthAccount(dir)
+	require.True(t, got.Present)
+	require.Equal(t, "Digital Clarity", got.OrganizationName)
+	require.Equal(t, "team_tier_1", got.SeatTier)
+}
+
+func TestReadSeatOAuthAccount_MissingFileIsNotAnError(t *testing.T) {
+	got := ReadSeatOAuthAccount(t.TempDir())
+	require.False(t, got.Present)
+}
+
+func TestReadSeatOAuthAccount_NoOAuthAccountKeyIsAbsent(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(`{"someOtherKey":true}`), 0644))
+
+	got := ReadSeatOAuthAccount(dir)
+	require.False(t, got.Present)
+}
+
+func TestReadSeatOAuthAccount_UnparseableJSONIsNotAnError(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".claude.json"), []byte("not json"), 0644))
+
+	got := ReadSeatOAuthAccount(dir)
+	require.False(t, got.Present)
+}

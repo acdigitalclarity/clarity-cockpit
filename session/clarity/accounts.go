@@ -12,6 +12,7 @@ import (
 	"claude-squad/log"
 	"encoding/json"
 	"os"
+	"path/filepath"
 )
 
 // AccountsRegistryEnvVar overrides the registry path. Set only for tests;
@@ -75,4 +76,48 @@ func LoadAccountsRegistry() map[string]string {
 		out[tag] = acc.ConfigDir
 	}
 	return out
+}
+
+// SeatOAuthAccount is the presence-plus-two-fields view of a seat folder's
+// own .claude.json (the CLI's own top-level config file, not this
+// registry) that seat resolution rule (c) and the slice 5 fleet line both
+// need: whether an "oauthAccount" object exists at all, and its
+// organizationName and seatTier if so - never emailAddress, accountUuid or
+// any token, per the owner's correction the field-name survey was scoped
+// to (BRIEF-FRONTDOOR-3B.md). The struct below has no field for any of
+// those three, so there is nothing for a caller to read even by accident.
+type SeatOAuthAccount struct {
+	Present          bool
+	OrganizationName string
+	SeatTier         string
+}
+
+// ReadSeatOAuthAccount reads configDir/.claude.json and reports whether it
+// carries an oauthAccount object. A missing or unreadable file, or one with
+// no oauthAccount key, is not an error - it reports Present: false, the
+// same shape the default root's own config was surveyed as before this
+// file was written.
+func ReadSeatOAuthAccount(configDir string) SeatOAuthAccount {
+	data, err := os.ReadFile(filepath.Join(configDir, ".claude.json"))
+	if err != nil {
+		return SeatOAuthAccount{}
+	}
+
+	var file struct {
+		OAuthAccount *struct {
+			OrganizationName string `json:"organizationName"`
+			SeatTier         string `json:"seatTier"`
+		} `json:"oauthAccount"`
+	}
+	if err := json.Unmarshal(data, &file); err != nil {
+		return SeatOAuthAccount{}
+	}
+	if file.OAuthAccount == nil {
+		return SeatOAuthAccount{}
+	}
+	return SeatOAuthAccount{
+		Present:          true,
+		OrganizationName: file.OAuthAccount.OrganizationName,
+		SeatTier:         file.OAuthAccount.SeatTier,
+	}
 }

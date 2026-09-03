@@ -56,10 +56,24 @@ type Fill struct {
 // ProjectsRoot pairs one discovery root with the seat tag it came from -
 // "" when no registry account's config_dir resolves to this root. The
 // default root itself carries a tag too, whenever the registry names an
-// account whose config_dir is the default's parent (typically "main").
+// account whose config_dir is the default's parent (typically "main") -
+// IsDefault below is the flag seat resolution (discover.go, slice 3B) reads
+// to override that raw tag back to the honest "default" word, since a
+// registry label like "main" is an internal bookkeeping name, never what
+// the owner should see printed for the machine's own default root.
 type ProjectsRoot struct {
 	Path    string
 	Account string
+
+	// IsDefault is true for the root that stands in for "this machine's
+	// default Claude Code config" - DefaultClaudeProjectsRoot itself in the
+	// default-plus-registry branch, or the sole root a singular
+	// ClaudeProjectsRootEnvVar override produces (that branch exists
+	// precisely to let a test stand one root in for the default without
+	// touching the real filesystem). The plural ClaudeProjectsRootsEnvVar
+	// branch never sets this - every root it names is a genuine distinct
+	// seat, none of them "the" default.
+	IsDefault bool
 }
 
 // claudeProjectsRoots resolves the roots this package glob-searches, in
@@ -74,18 +88,21 @@ func claudeProjectsRoots() []ProjectsRoot {
 	registry := LoadAccountsRegistry()
 
 	var paths []string
+	singularOverride := false
 	switch {
 	case os.Getenv(ClaudeProjectsRootsEnvVar) != "":
 		paths = splitRootsList(os.Getenv(ClaudeProjectsRootsEnvVar))
 	case os.Getenv(ClaudeProjectsRootEnvVar) != "":
 		paths = []string{os.Getenv(ClaudeProjectsRootEnvVar)}
+		singularOverride = true
 	default:
 		paths = defaultAndRegistryRootPaths(registry)
 	}
 
 	roots := make([]ProjectsRoot, 0, len(paths))
 	for _, p := range paths {
-		roots = append(roots, ProjectsRoot{Path: p, Account: tagForRoot(p, registry)})
+		isDefault := singularOverride || filepath.Clean(p) == filepath.Clean(DefaultClaudeProjectsRoot)
+		roots = append(roots, ProjectsRoot{Path: p, Account: tagForRoot(p, registry), IsDefault: isDefault})
 	}
 	return roots
 }

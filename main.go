@@ -290,10 +290,7 @@ var (
 				if ext.FillOK {
 					fillLabel = fmt.Sprintf("%d%%", ext.Fill.Pct)
 				}
-				seat := ext.Account
-				if seat == "" {
-					seat = "-"
-				}
+				seat := clarity.SeatTag(ext.Account, ext.SeatSource)
 				fmt.Printf("%-32s [%-6s] ctx %-5s last write %s  (external - message only, cannot attach/kill)\n",
 					ext.Name, seat, fillLabel, ext.LastWrite.Format("15:04:05"))
 			}
@@ -333,17 +330,16 @@ var (
 				os.Exit(1)
 			}
 
-			// The seat tag for this lane, resolved the same way discoverCmd's
-			// rows are - which root (claudeProjectsRoots) the lane's live
-			// transcript sat under. "" (no bracket printed) for a lane
-			// resolved via ResolveExistingLaneDir instead (not currently a
-			// live external row) or on a root the registry names no account
-			// for.
-			seat := ""
+			// The seat tag and source for this lane, resolved the same way
+			// discoverCmd's rows are (resolveSeat's rule a-d, discover.go).
+			// "" (no bracket printed) for a lane resolved via
+			// ResolveExistingLaneDir instead - not currently a live external
+			// row, so there is no root to resolve a seat against.
+			seat, seatSource := "", ""
 			if external, err := clarity.DiscoverExternalLanes(nil); err == nil {
 				for _, ext := range external {
 					if clarity.MatchesQueriedLane(ext, lane) {
-						seat = ext.Account
+						seat, seatSource = ext.Account, ext.SeatSource
 						break
 					}
 				}
@@ -367,7 +363,7 @@ var (
 
 			header := clarity.RenderHeaderLine(lane, tail)
 			if seat != "" {
-				header = fmt.Sprintf("%s [%s]", header, seat)
+				header = fmt.Sprintf("%s [%s]", header, clarity.SeatTag(seat, seatSource))
 			}
 			fmt.Println(header)
 			for _, turn := range tail.Turns {

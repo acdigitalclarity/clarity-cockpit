@@ -359,3 +359,189 @@ func TestDiscoverExternalLanes_ModalityEmptyWhenNoCLAUDEmd(t *testing.T) {
 	require.Len(t, lanes, 1)
 	require.Empty(t, lanes[0].Modality)
 }
+
+// mkTranscriptDirWithCwdAndEntrypoint is mkTranscriptDirWithCwd plus an
+// "entrypoint" field on the same leading record - the field seat
+// resolution rule (b) reads to recognise a Desktop-app session (confirmed
+// against a live transcript, BRIEF-FRONTDOOR-3B.md's field-name survey,
+// before this file was written).
+func mkTranscriptDirWithCwdAndEntrypoint(t *testing.T, root, encodedDir, filename string, age time.Duration, cwd, entrypoint string) string {
+	t.Helper()
+	dir := filepath.Join(root, encodedDir)
+	require.NoError(t, os.MkdirAll(dir, 0755))
+	path := filepath.Join(dir, filename)
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	writeTranscriptLine(t, f, `{"type":"user","cwd":"`+cwd+`","entrypoint":"`+entrypoint+`"}`)
+	writeTranscriptLine(t, f, fableUsageLine("claude-sonnet-5", 10_000, 0, 0))
+	require.NoError(t, f.Close())
+	mt := time.Now().Add(-age)
+	require.NoError(t, os.Chtimes(path, mt, mt))
+	return path
+}
+
+// writeDeclaredAccountCLAUDEmd writes a lane folder's .claude/CLAUDE.md
+// with an "Account: <tag>" line, the shape `clarity new --account <tag>`
+// produces (scripts/clarity's session_account()).
+func writeDeclaredAccountCLAUDEmd(t *testing.T, lanePath, tag string) {
+	t.Helper()
+	require.NoError(t, os.MkdirAll(filepath.Join(lanePath, ".claude"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(lanePath, ".claude", "CLAUDE.md"),
+		[]byte("# Session\n\nAccount: "+tag+"\n"), 0644))
+}
+
+// writeSeatOAuthAccount writes cfgDir/.claude.json with an oauthAccount
+// object carrying only organizationName and seatTier - the two fields
+// rule (c) may surface - so a test proving rule (c) never depends on this
+// leg's own ReadSeatOAuthAccount parsing more than that.
+func writeSeatOAuthAccount(t *testing.T, cfgDir string) {
+	t.Helper()
+	require.NoError(t, os.MkdirAll(cfgDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(cfgDir, ".claude.json"),
+		[]byte(`{"oauthAccount":{"organizationName":"Digital Clarity","organizationType":"claude_team","seatTier":"team_tier_1","accountUuid":"must-never-surface","emailAddress":"must-never-surface"}}`), 0644))
+}
+
+// setUpNonDefaultSeatRoot registers one registry account (tag) whose config
+// dir carries its own .claude.json - written per withOAuth - and points the
+// plural roots env var at its "projects" subdirectory, the shape a real
+// non-default seat folder has. root is that projects directory.
+func setUpNonDefaultSeatRoot(t *testing.T, tag string, withOAuth bool) (root string) {
+	t.Helper()
+	cfgDir := t.TempDir()
+	root = filepath.Join(cfgDir, "projects")
+	require.NoError(t, os.MkdirAll(root, 0755))
+	if withOAuth {
+		writeSeatOAuthAccount(t, cfgDir)
+	}
+
+	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	writeRegistry(t, registryPath, `{"accounts": {"`+tag+`": {"config_dir": "`+cfgDir+`"}}}`)
+	t.Setenv(AccountsRegistryEnvVar, registryPath)
+	t.Setenv(ClaudeProjectsRootsEnvVar, root)
+	return root
+}
+
+// TestDiscoverExternalLanes_SeatRuleA_DeclaredAccountLine is rule (a): a
+// lane folder's own Account: line resolves the seat, source "declared".
+func TestDiscoverExternalLanes_SeatRuleA_DeclaredAccountLine(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(ClaudeProjectsRootEnvVar, root)
+	t.Setenv(AccountsRegistryEnvVar, filepath.Join(t.TempDir(), "no-registry-here.json"))
+
+	lanePath := filepath.Join(t.TempDir(), "fixture-seat-declared")
+	writeDeclaredAccountCLAUDEmd(t, lanePath, "team-b")
+
+	mkTranscriptDirWithCwd(t, root, "-Users-allencoates-projects-Clarity-sessions-fixture-seat-declared", "a.jsonl", time.Minute, lanePath)
+
+	lanes, err := DiscoverExternalLanes(nil)
+	require.NoError(t, err)
+	require.Len(t, lanes, 1)
+	require.Equal(t, "team-b", lanes[0].Account)
+	require.Equal(t, SeatSourceDeclared, lanes[0].SeatSource)
+}
+
+// TestDiscoverExternalLanes_SeatRuleB_DesktopEntrypoint is rule (b): a
+// newest transcript with entrypoint "claude-desktop" resolves "desktop".
+func TestDiscoverExternalLanes_SeatRuleB_DesktopEntrypoint(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(ClaudeProjectsRootEnvVar, root)
+	t.Setenv(AccountsRegistryEnvVar, filepath.Join(t.TempDir(), "no-registry-here.json"))
+
+	lanePath := filepath.Join(t.TempDir(), "fixture-seat-desktop")
+	require.NoError(t, os.MkdirAll(lanePath, 0755))
+
+	mkTranscriptDirWithCwdAndEntrypoint(t, root, "-Users-allencoates-projects-Clarity-sessions-fixture-seat-desktop", "a.jsonl", time.Minute, lanePath, DesktopEntrypoint)
+
+	lanes, err := DiscoverExternalLanes(nil)
+	require.NoError(t, err)
+	require.Len(t, lanes, 1)
+	require.Equal(t, "desktop", lanes[0].Account)
+	require.Equal(t, SeatSourceDesktop, lanes[0].SeatSource)
+}
+
+// TestDiscoverExternalLanes_SeatRuleC_NonDefaultSeatFolderWithOAuthAccount
+// is rule (c): a non-default registry seat folder whose .claude.json
+// carries oauthAccount resolves that seat's own tag, source folder-login.
+func TestDiscoverExternalLanes_SeatRuleC_NonDefaultSeatFolderWithOAuthAccount(t *testing.T) {
+	root := setUpNonDefaultSeatRoot(t, "team-a", true)
+
+	lanePath := filepath.Join(t.TempDir(), "fixture-seat-folder-login")
+	require.NoError(t, os.MkdirAll(lanePath, 0755))
+
+	mkTranscriptDirWithCwd(t, root, "-Users-allencoates-projects-Clarity-sessions-fixture-seat-folder-login", "a.jsonl", time.Minute, lanePath)
+
+	lanes, err := DiscoverExternalLanes(nil)
+	require.NoError(t, err)
+	require.Len(t, lanes, 1)
+	require.Equal(t, "team-a", lanes[0].Account)
+	require.Equal(t, SeatSourceFolderLogin, lanes[0].SeatSource)
+}
+
+// TestDiscoverExternalLanes_SeatRuleD_DefaultRoot is rule (d): the default
+// root resolves the honest "default" tag, never a registry name, source
+// folder.
+func TestDiscoverExternalLanes_SeatRuleD_DefaultRoot(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(ClaudeProjectsRootEnvVar, root)
+	t.Setenv(AccountsRegistryEnvVar, filepath.Join(t.TempDir(), "no-registry-here.json"))
+
+	lanePath := filepath.Join(t.TempDir(), "fixture-seat-default")
+	require.NoError(t, os.MkdirAll(lanePath, 0755))
+
+	mkTranscriptDirWithCwd(t, root, "-Users-allencoates-projects-Clarity-sessions-fixture-seat-default", "a.jsonl", time.Minute, lanePath)
+
+	lanes, err := DiscoverExternalLanes(nil)
+	require.NoError(t, err)
+	require.Len(t, lanes, 1)
+	require.Equal(t, "default", lanes[0].Account)
+	require.Equal(t, SeatSourceFolder, lanes[0].SeatSource)
+}
+
+// TestDiscoverExternalLanes_SeatRuleBBeatsC proves the stated ordering: a
+// Desktop-entrypoint transcript sitting under a non-default seat folder
+// that ALSO carries its own oauthAccount still resolves "desktop", not the
+// seat's folder-login tag - rule (b) is checked before rule (c).
+func TestDiscoverExternalLanes_SeatRuleBBeatsC(t *testing.T) {
+	root := setUpNonDefaultSeatRoot(t, "team-a", true)
+
+	lanePath := filepath.Join(t.TempDir(), "fixture-seat-b-beats-c")
+	require.NoError(t, os.MkdirAll(lanePath, 0755))
+
+	mkTranscriptDirWithCwdAndEntrypoint(t, root, "-Users-allencoates-projects-Clarity-sessions-fixture-seat-b-beats-c", "a.jsonl", time.Minute, lanePath, DesktopEntrypoint)
+
+	lanes, err := DiscoverExternalLanes(nil)
+	require.NoError(t, err)
+	require.Len(t, lanes, 1)
+	require.Equal(t, "desktop", lanes[0].Account, "rule (b) must beat rule (c) when both fire")
+	require.Equal(t, SeatSourceDesktop, lanes[0].SeatSource)
+}
+
+// TestDiscoverExternalLanes_SeatRuleADeclaredBeatsEverything proves a
+// declared Account: line wins even when the newest transcript is a Desktop
+// entrypoint AND the root is a seat folder with its own oauthAccount -
+// every other rule fires here, and (a) still wins.
+func TestDiscoverExternalLanes_SeatRuleADeclaredBeatsEverything(t *testing.T) {
+	root := setUpNonDefaultSeatRoot(t, "team-a", true)
+
+	lanePath := filepath.Join(t.TempDir(), "fixture-seat-declared-beats-all")
+	writeDeclaredAccountCLAUDEmd(t, lanePath, "team-z")
+
+	mkTranscriptDirWithCwdAndEntrypoint(t, root, "-Users-allencoates-projects-Clarity-sessions-fixture-seat-declared-beats-all", "a.jsonl", time.Minute, lanePath, DesktopEntrypoint)
+
+	lanes, err := DiscoverExternalLanes(nil)
+	require.NoError(t, err)
+	require.Len(t, lanes, 1)
+	require.Equal(t, "team-z", lanes[0].Account, "a declared Account: line must beat desktop entrypoint and folder-login oauthAccount alike")
+	require.Equal(t, SeatSourceDeclared, lanes[0].SeatSource)
+}
+
+// TestSeatTag_PrintedFormPerSource is the printed tag string for each
+// source, the exact four forms item 2 names: "team-b" (declared, no
+// suffix), "desktop" (source equals tag, no redundant suffix), "team-a
+// folder-login" and "default folder".
+func TestSeatTag_PrintedFormPerSource(t *testing.T) {
+	require.Equal(t, "team-b", SeatTag("team-b", SeatSourceDeclared))
+	require.Equal(t, "desktop", SeatTag("desktop", SeatSourceDesktop))
+	require.Equal(t, "team-a folder-login", SeatTag("team-a", SeatSourceFolderLogin))
+	require.Equal(t, "default folder", SeatTag("default", SeatSourceFolder))
+}
