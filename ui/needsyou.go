@@ -22,10 +22,13 @@ import (
 // recommendation region.
 const needsYouFixedTopRows = 2
 
-// needsYouFixedBottomRows is the row cost of the three-line composer box,
-// same fixed footprint as the Session pane's own (sessionFixedBottomRows
-// minus its rule+state line, since this tab has no state line of its own).
-const needsYouFixedBottomRows = 3
+// needsYouFixedBottomRows no longer names a fixed row cost (slice 16, the
+// composer wraps: the shared Composer now grows from 3 to up to 7 rows as
+// its text wraps) - contentAreaHeight reads the current cost live from the
+// Composer's own Height instead, the same wiring ui/session.go's
+// turnsAreaHeight uses, so this tab's scrollable region shrinks in step
+// (RULE: "the turns viewport above shrinks by the same rows so nothing
+// overlaps").
 
 // NeedsYouInfo is everything one Needs-you tab render needs for the
 // SELECTED row, resolved once per feed tick (app.go's feedTickMsg) and
@@ -111,7 +114,7 @@ func (p *NeedsYouPane) Clear() {
 }
 
 func (p *NeedsYouPane) contentAreaHeight() int {
-	h := p.height - needsYouFixedTopRows - needsYouFixedBottomRows
+	h := p.height - needsYouFixedTopRows - p.composer.Height(p.width)
 	if h < 0 {
 		h = 0
 	}

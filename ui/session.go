@@ -46,12 +46,17 @@ var sessionClaudeStyle = lipgloss.NewStyle().
 var sessionRuleStyle = lipgloss.NewStyle().
 	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#DDDADA"), Dark: lipgloss.Color("#3C3C3C")})
 
-// sessionFixedBottomRows is the row cost of the bottom rule, the state
-// line and the three-line composer box - always reserved, regardless of how
-// much of the turns region above them is used (the "newest content pinned
-// to the bottom" requirement: these always sit at the pane's own bottom
-// edge).
-const sessionFixedBottomRows = 5
+// sessionNonComposerBottomRows is the row cost of the bottom rule and the
+// state line - always reserved, regardless of how much of the turns region
+// above them is used (the "newest content pinned to the bottom"
+// requirement: these always sit at the pane's own bottom edge). The
+// composer box's own row cost is no longer folded into a fixed constant
+// here (slice 16, the composer wraps: 3 lines idle, up to 7 while typing a
+// wrapped message) - turnsAreaHeight reads it live from the shared
+// Composer's own Height instead, so the turns region shrinks as the
+// composer grows (RULE: "the turns viewport above shrinks by the same rows
+// so nothing overlaps").
+const sessionNonComposerBottomRows = 2
 
 // sessionWideMinWidth is the pane-inner-width (the value SetSize actually
 // receives) threshold above which the reading layout's 1-column-each-side
@@ -287,7 +292,7 @@ func (s *SessionPane) fixedTopRows() int {
 // everything (the resting frame or a fallback mark is what a caller shows
 // instead in that case, not this pane's turns view).
 func (s *SessionPane) turnsAreaHeight() int {
-	h := s.height - s.fixedTopRows() - sessionFixedBottomRows
+	h := s.height - s.fixedTopRows() - sessionNonComposerBottomRows - s.composer.Height(s.contentWidth())
 	if h < 0 {
 		h = 0
 	}
