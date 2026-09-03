@@ -216,7 +216,7 @@ func laneRowSuffix(rowBg, rowFg color.Color, pct int, fillOK bool, state string,
 	if showWord {
 		word := plain.Foreground(glyphStyle.GetForeground()).
 			Render(runewidth.FillRight(laneStateDisplayWord(state), laneStateWordWidth))
-		wordSeg = " " + word
+		wordSeg = plain.Render(" ") + word
 	}
 
 	var timeSeg string
@@ -225,10 +225,18 @@ func laneRowSuffix(rowBg, rowFg color.Color, pct int, fillOK bool, state string,
 		if turnOK {
 			timeText = lastTurn.Local().Format("15:04")
 		}
-		timeSeg = " " + plain.Render(timeText)
+		timeSeg = plain.Render(" ") + plain.Render(timeText)
 	}
 
-	return fmt.Sprintf(" %s  %s%s%s", pctSeg, glyphStyle.Render(glyph), wordSeg, timeSeg)
+	// Every literal separator space between segments is rendered through
+	// plain too (DEFECT 2, board #280 pane-10 walkthrough): each segment
+	// above already closes with its own ANSI reset, so a bare, un-rendered
+	// " " placed between them (the pre-fix fmt.Sprintf(" %s  %s%s%s", ...))
+	// prints with the terminal's own default background rather than rowBg -
+	// a black gap on a selected (highlighted) row. Rendering the separators
+	// through the same plain style keeps the whole suffix one continuous
+	// rowBg band with no un-styled character in it.
+	return plain.Render(" ") + pctSeg + plain.Render("  ") + glyphStyle.Render(glyph) + wordSeg + timeSeg
 }
 
 type List struct {
@@ -978,6 +986,14 @@ func (l *List) GetSelectedNeedsYou() (clarity.FeedItem, bool) {
 // range for its list, or the selection is on a Needs-you row - that row's
 // own raising lane is resolved separately, via GetSelectedNeedsYou, since
 // it may name a lane this list does not track at all).
+//
+// A tracked row whose own tmux session has gone away (RequiresCopyOnlySend
+// - most commonly a Paused NoWorktree clarity-attach lane, which runs in
+// the owner's own terminal) resolves isExternal=true here too, exactly like
+// a genuine external row (cockpit pane-10 walkthrough DEFECT 1: the tracked
+// send path used to be picked for this row regardless, and errored "not a
+// live tmux session" on enter). This is checked against the instance's own
+// live session state, never assumed from its Status field alone.
 func (l *List) SelectedMsgTarget() (lane string, isExternal bool, ok bool) {
 	if l.selNeedsYou {
 		return "", false, false
@@ -991,7 +1007,8 @@ func (l *List) SelectedMsgTarget() (lane string, isExternal bool, ok bool) {
 	if l.selectedIdx < 0 || l.selectedIdx >= len(l.items) {
 		return "", false, false
 	}
-	return l.items[l.selectedIdx].Title, false, true
+	inst := l.items[l.selectedIdx]
+	return inst.Title, inst.RequiresCopyOnlySend(), true
 }
 
 // SetSelectedInstance sets the selected index into the tracked-instance

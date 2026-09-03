@@ -61,6 +61,18 @@ type Menu struct {
 	// still work: m still copies per slice 5) rather than removed, since
 	// the footer's own shape must not shift between row kinds.
 	isExternal bool
+	// isNeedsYou marks the current selection as a Needs-you row (board #280
+	// pane-10 walkthrough DEFECT 3) - set alongside instance/isExternal by
+	// SetInstance. Before this fix, instanceChanged() passed a Needs-you
+	// row's nil instance and false isExternal straight through, which
+	// SetInstance read as "nothing selected" (StateEmpty) and so drew the
+	// wrong footer ("n new • N new with prompt │ m message • ? help •
+	// q quit") instead of the drawn lane-action line. A Needs-you row gets
+	// that same drawn line, with ↵ attach and o open folder dimmed (there is
+	// no tracked instance or folder to act on) while m message and c copy
+	// stay live - the row's own raising lane is still a valid send/copy
+	// target (composerTarget resolves it separately).
+	isNeedsYou bool
 	activeTab  int
 
 	// groupBounds is the CURRENT option list's own [start,end) vertical-
@@ -104,20 +116,22 @@ func (m *Menu) SetState(state MenuState) {
 }
 
 // SetInstance updates the current selection and refreshes menu options.
-// isExternal marks a selected external lane (GetSelectedInstance returns nil
-// for one too, same as "nothing selected" - the caller, app.go's
-// instanceChanged, is the only place that can tell the two apart): an
-// external row still gets the full default option list (↵ attach and m
-// message dimmed, per DECISIONS.md slice 7), never the bare StateEmpty one.
-func (m *Menu) SetInstance(instance *session.Instance, isExternal bool) {
+// isExternal marks a selected external lane and isNeedsYou marks a selected
+// Needs-you row (GetSelectedInstance returns nil for both, same as "nothing
+// selected" - the caller, app.go's instanceChanged, is the only place that
+// can tell the three apart): an external or Needs-you row still gets the
+// full default option list (per-kind dimming, per DECISIONS.md slice 7 and
+// board #280 pane-10 walkthrough DEFECT 3), never the bare StateEmpty one.
+func (m *Menu) SetInstance(instance *session.Instance, isExternal, isNeedsYou bool) {
 	m.instance = instance
 	m.isExternal = isExternal
+	m.isNeedsYou = isNeedsYou
 	// Only change the state if we're not in a special state (NewInstance,
 	// Prompt or the composer's own Msg) - a feed tick's instanceChanged()
 	// must never kick the footer out of "enter send · esc cancel" while a
 	// message is being typed.
 	if m.state != StateNewInstance && m.state != StatePrompt && m.state != StateMsg {
-		if m.instance != nil || m.isExternal {
+		if m.instance != nil || m.isExternal || m.isNeedsYou {
 			m.state = StateDefault
 		} else {
 			m.state = StateEmpty
@@ -147,9 +161,10 @@ func (m *Menu) updateOptions() {
 		m.options = defaultMenuOptions
 		m.groupBounds = emptyGroupBounds
 	case StateDefault:
-		if m.instance != nil || m.isExternal {
-			// A tracked instance OR an external lane is selected: show the
-			// lane-action options (dimmed on an external row - see String()).
+		if m.instance != nil || m.isExternal || m.isNeedsYou {
+			// A tracked instance, an external lane, or a Needs-you row is
+			// selected: show the lane-action options (dimmed per-kind - see
+			// String()).
 			m.addInstanceOptions()
 		} else {
 			// Nothing at all is selected.
@@ -247,8 +262,16 @@ func (m *Menu) String() string {
 		// (DECISIONS.md slice 7's own "greyed" requirement) - m still works
 		// as a clipboard copy (slice 5), ↵ still no-ops outside the Terminal
 		// tab and shows the "no terminal yet" footer inside it (app.go), so
-		// the dimming is cosmetic only, never a disabled control.
-		if m.isExternal && (k == keys.KeyEnter || k == keys.KeyMsg) {
+		// the dimming is cosmetic only, never a disabled control. A
+		// Needs-you row dims ↵ attach and o open folder instead (board #280
+		// pane-10 walkthrough DEFECT 3): there is no tracked instance or
+		// folder behind the row itself, but m message and c copy stay live -
+		// composerTarget resolves the row's own raising lane as a genuine
+		// send/copy target, distinct from ↵ attach/o open folder which need
+		// an actual tracked instance.
+		dim := (m.isExternal && (k == keys.KeyEnter || k == keys.KeyMsg)) ||
+			(m.isNeedsYou && (k == keys.KeyEnter || k == keys.KeyOpenFolder))
+		if dim {
 			localActionStyle = localActionStyle.Faint(true)
 			localKeyStyle = localKeyStyle.Faint(true)
 			localDescStyle = localDescStyle.Faint(true)

@@ -164,6 +164,41 @@ func TestSessionPane_RestingFrameHasNoComposerWhenClosed(t *testing.T) {
 	require.NotContains(t, out, "message", "the plain resting frame carries no composer box until m is pressed")
 }
 
+// TestComposer_Render_CopyOnlyTitle_ShownBeforeTyping is board #280 pane-10
+// walkthrough DEFECT 1, seen failing first: a lane resolved copy-only (a
+// tracked instance with no live tmux session, or a genuine external lane)
+// must say so in the title the moment the box opens, before any text is
+// typed - never only after enter is pressed and the send fails.
+func TestComposer_Render_CopyOnlyTitle_ShownBeforeTyping(t *testing.T) {
+	c := NewComposer()
+	c.Open("ways-of-working", true)
+
+	require.Contains(t, ansi.Strip(c.Render(60, "ways-of-working")[0]), "message ways-of-working · copy only")
+}
+
+// TestComposer_Render_TrackedLaneTitleCarriesNoCopyOnlySuffix is the fix's
+// other half: a genuinely sendable tracked lane never carries the suffix.
+func TestComposer_Render_TrackedLaneTitleCarriesNoCopyOnlySuffix(t *testing.T) {
+	c := NewComposer()
+	c.Open("ways-of-working", false)
+
+	require.NotContains(t, ansi.Strip(c.Render(60, "ways-of-working")[0]), "copy only")
+}
+
+// TestComposer_Render_NoLaneRow_NeverCarriesCopyOnlySuffix pins the fix
+// against DEFECT 2's own no-lane state (composerTarget's isExternal=true
+// fallback when a Needs-you row's lane does not resolve at all) - the title
+// stays exactly "(no lane on this row)", never "... · copy only" appended
+// to a target that does not exist to begin with.
+func TestComposer_Render_NoLaneRow_NeverCarriesCopyOnlySuffix(t *testing.T) {
+	c := NewComposer()
+	c.Open("", true)
+
+	title := ansi.Strip(c.Render(60, "")[0])
+	require.Contains(t, title, NoLaneLabel)
+	require.NotContains(t, title, "copy only")
+}
+
 func TestComposer_Render_NeverExceedsWidth(t *testing.T) {
 	c := NewComposer()
 	c.Open(strings.Repeat("a-very-long-lane-name-", 5), false)

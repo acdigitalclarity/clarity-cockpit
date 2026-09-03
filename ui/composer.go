@@ -120,6 +120,12 @@ func (c *Composer) SetResult(text string) {
 // "▸ █").
 const composerCursor = "█"
 
+// copyOnlySuffix marks the composer title on a lane with no live tmux
+// session to deliver into (cockpit pane-10 walkthrough DEFECT 1) - shown
+// from the moment the box opens, before any text is typed, so the owner
+// knows enter will copy rather than send.
+const copyOnlySuffix = " · copy only"
+
 // Render draws the composer's three-line box at the given width: the
 // "message <lane>" title, the typed text with a trailing cursor while
 // open (a bare cursor when empty), and the foot - idle, editing, or the
@@ -130,13 +136,19 @@ const composerCursor = "█"
 // slice 3b's own static behaviour before m is ever pressed).
 func (c *Composer) Render(width int, lane string) []string {
 	displayLane := lane
+	displayExternal := false
 	if c.open || c.result != "" {
 		displayLane = c.lane
+		displayExternal = c.isExternal
 	}
-	if displayLane == "" {
+	noLane := displayLane == ""
+	if noLane {
 		displayLane = NoLaneLabel
 	}
 	title := fmt.Sprintf(" message %s ", displayLane)
+	if displayExternal && !noLane {
+		title = fmt.Sprintf(" message %s%s ", displayLane, copyOnlySuffix)
+	}
 	top := "┌" + title + strings.Repeat("─", maxInt0(width-2-lipgloss.Width(title))) + "┐"
 
 	prompt := "▸ " + composerCursor

@@ -359,6 +359,48 @@ func TestComposerFlow_ExternalLane_CopiesToClipboardNeverClaimsDelivery(t *testi
 	require.Equal(t, []string{"pbcopy"}, copiedArgs, "the external send path must run pbcopy, never SendPrompt")
 }
 
+// TestComposerFlow_TrackedNoWorktreeInstance_NoSession_CopiesNeverSends is
+// board #280 pane-10 walkthrough DEFECT 1, seen failing first: the owner's
+// exact PROOF (a) shape - a NoWorktree, Paused, NO tmux session tracked
+// instance (clarity-attach's own lane, run in the owner's own terminal) -
+// pressing m, typing, pressing enter must copy to the clipboard with the
+// "runs in your own terminal" note, never route through the tracked send
+// path and error "not a live tmux session".
+func TestComposerFlow_TrackedNoWorktreeInstance_NoSession_CopiesNeverSends(t *testing.T) {
+	h := newComposerTestHome()
+	noWorktreeAppFixture(t, h, "scratchfix-pane10-attached")
+
+	// m opens the composer on the current selection - composerTarget must
+	// resolve this row as copy-only (isExternal=true) even though it is a
+	// tracked instance, not a genuine external row.
+	pressGlobalKey(h, tea.KeyPressMsg{Code: 'm', Text: "m"})
+	require.True(t, h.composer.IsOpen())
+	require.Equal(t, "scratchfix-pane10-attached", h.composer.Lane())
+	require.True(t, h.composer.IsExternal(), "no live tmux session - copy-only, resolved before any text is typed")
+	require.Contains(t, ansi.Strip(strings.Join(h.composer.Render(120, ""), "\n")),
+		"message scratchfix-pane10-attached · copy only",
+		"the title says copy-only from the moment the box opens, before enter is ever pressed")
+
+	var copiedArgs []string
+	h.cmdExec = cmd_test.MockCmdExec{
+		RunFunc: func(cmd *exec.Cmd) error {
+			copiedArgs = cmd.Args
+			return nil
+		},
+	}
+	h.composer.Type("scratchfix copy test")
+
+	_, cmd := h.handleKeyPress(tea.KeyPressMsg{Code: tea.KeyEnter})
+	require.NotNil(t, cmd)
+
+	resultMsg := cmd()
+	result, ok := resultMsg.(composerResultMsg)
+	require.True(t, ok)
+	require.NoError(t, result.err)
+	require.Equal(t, "copied · this lane runs in your own terminal, paste it there", result.result)
+	require.Equal(t, []string{"pbcopy"}, copiedArgs, "must copy, never attempt a tmux send-keys")
+}
+
 func TestComposerFlow_EscClosesWithoutSending(t *testing.T) {
 	h := newComposerTestHome()
 	h.composer.Open("lane-a", false)
