@@ -61,18 +61,19 @@ type TmuxSession struct {
 	// stdin isn't a terminal (tests, piped input) or we're not attached.
 	//
 	// Needed because Attach's own read loop below forwards stdin byte for
-	// byte (including a lone ctrl-q, detected as a single-byte read of 0x11)
-	// - that only works in raw mode. Whatever put the real terminal in raw
-	// mode before Attach ran (bubbletea's own Program, for the cockpit's own
-	// keyboard; nothing, for a bare terminal) is not guaranteed to still own
-	// it for Attach's duration: the cockpit hands the terminal to Attach via
-	// tea.Exec (app/attach_exec.go), which releases bubbletea's raw mode and
-	// restores whatever cooked state came before the Program started - not
-	// raw. Left uncorrected, the real terminal sits in canonical mode for
-	// the whole attach: printable keys don't reach the PTY until Enter
-	// completes a line, and a lone ctrl-q never completes a line on its own,
-	// so it sits in the kernel's line buffer until something else does -
-	// never delivered as the single byte this loop's `nr == 1` check needs.
+	// byte (including a lone detach key, detected as a single-byte read of
+	// 0x11 ctrl-q or 0x1d ctrl-]) - that only works in raw mode. Whatever put
+	// the real terminal in raw mode before Attach ran (bubbletea's own
+	// Program, for the cockpit's own keyboard; nothing, for a bare terminal)
+	// is not guaranteed to still own it for Attach's duration: the cockpit
+	// hands the terminal to Attach via tea.Exec (app/attach_exec.go), which
+	// releases bubbletea's raw mode and restores whatever cooked state came
+	// before the Program started - not raw. Left uncorrected, the real
+	// terminal sits in canonical mode for the whole attach: printable keys
+	// don't reach the PTY until Enter completes a line, and a lone detach key
+	// never completes a line on its own, so it sits in the kernel's line
+	// buffer until something else does - never delivered as the single byte
+	// this loop's `nr == 1` check needs.
 	stdinRawState *term.State
 }
 
@@ -285,6 +286,14 @@ func (t *TmuxSession) HasUpdated() (updated bool, hasPrompt bool) {
 	return false, hasPrompt
 }
 
+// isDetachByte reports whether a lone byte read from stdin (nr == 1) is one
+// of the two keys that end an attach: Ctrl-q (0x11) or Ctrl-] (0x1d, GS). A
+// byte matching one of these values inside a longer read (nr != 1) is
+// ordinary input being forwarded to the pane, not a detach request.
+func isDetachByte(nr int, b byte) bool {
+	return nr == 1 && (b == 17 || b == 29)
+}
+
 func (t *TmuxSession) Attach() (chan struct{}, error) {
 	t.attachCh = make(chan struct{})
 
@@ -322,7 +331,7 @@ func (t *TmuxSession) Attach() (chan struct{}, error) {
 		default:
 			// If context is not done, it was likely an abnormal termination (Ctrl-D)
 			// Print warning message
-			fmt.Fprintf(os.Stderr, "\n\033[31mError: Session terminated without detaching. Use Ctrl-Q to properly detach from tmux sessions.\033[0m\n")
+			fmt.Fprintf(os.Stderr, "\n\033[31mError: Session terminated without detaching. Use Ctrl-Q (or Ctrl-]) to properly detach from tmux sessions.\033[0m\n")
 		}
 	}()
 
@@ -359,8 +368,11 @@ func (t *TmuxSession) Attach() (chan struct{}, error) {
 				continue
 			}
 
-			// Check for Ctrl+q (ASCII 17)
-			if nr == 1 && buf[0] == 17 {
+			// Check for the detach key: Ctrl+] (GS, ASCII 29) or Ctrl+q (ASCII 17).
+			// Ctrl-] is offered first because it reaches the terminal in every
+			// editor; Ctrl-q alone doesn't - VS Code's integrated terminal binds
+			// it to Quick Open View before it ever gets to us.
+			if isDetachByte(nr, buf[0]) {
 				// Detach from the session
 				t.Detach()
 				return

@@ -108,6 +108,18 @@ func TestRestoreReturnsErrSessionNotFoundWhenSessionIsGone(t *testing.T) {
 	require.Empty(t, ptyFactory.cmds, "should not have opened a PTY for a session that does not exist")
 }
 
+// Ctrl-q (0x11) never reaches VS Code's integrated terminal - it's bound to
+// Quick Open View there - so the attach loop also detaches on Ctrl-] (0x1d,
+// GS), a key no editor intercepts. Both are single-byte reads only; a 0x1d
+// arriving as part of a longer read is ordinary input for the pane, not a
+// detach request.
+func TestIsDetachByte(t *testing.T) {
+	require.True(t, isDetachByte(1, 0x11), "a lone ctrl-q byte should detach")
+	require.True(t, isDetachByte(1, 0x1d), "a lone ctrl-] byte should detach exactly as ctrl-q does")
+	require.False(t, isDetachByte(3, 0x1d), "a 0x1d byte inside a longer read is not a detach request")
+	require.False(t, isDetachByte(1, 0x41), "an unrelated single byte should not detach")
+}
+
 func TestRestoreAttachesWhenSessionExists(t *testing.T) {
 	ptyFactory := NewMockPtyFactory(t)
 	cmdExec := cmd_test.MockCmdExec{
