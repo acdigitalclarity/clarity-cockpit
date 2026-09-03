@@ -25,15 +25,26 @@ import (
 // does for the pieces this file's tests touch: one shared Composer fed
 // into both the Session and Needs-you panes, a tabbed window sized so its
 // content area is non-zero, and the tab-by-kind bookkeeping newHome itself
-// initializes.
-func newComposerTestHome() *home {
+// initializes. The TabbedWindow's own TerminalPane is built with
+// ui.NewTerminalPaneWithDeps (termPtyFactory, terminal_and_keys_test.go) -
+// this file's own tests never exercise the Terminal tab's external-lane
+// path, but every TerminalPane/TabbedWindow construction site in the test
+// suite routes through the fake regardless, so no future addition here can
+// reach the real tmux binary by accident.
+func newComposerTestHome(t *testing.T) *home {
 	sp := spinner.New()
 	composer := ui.NewComposer()
 	sessionPane := ui.NewSessionPane()
 	sessionPane.SetComposer(composer)
 	needsYouPane := ui.NewNeedsYouPane()
 	needsYouPane.SetComposer(composer)
-	tw := ui.NewTabbedWindow(sessionPane, needsYouPane, ui.NewTerminalPane())
+	sessionExists := false
+	termCmdExec := cmd_test.MockCmdExec{
+		RunFunc:    func(c *exec.Cmd) error { return nil },
+		OutputFunc: func(c *exec.Cmd) ([]byte, error) { return []byte(""), nil },
+	}
+	terminalPane := ui.NewTerminalPaneWithDeps(&termPtyFactory{t: t, sessionExists: &sessionExists}, termCmdExec)
+	tw := ui.NewTabbedWindow(sessionPane, needsYouPane, terminalPane)
 	tw.SetSize(120, 40)
 
 	return &home{
@@ -105,7 +116,7 @@ func trackedInstanceWithFakeTmux(t *testing.T, title, paneAfterSend string) *ses
 // -- composerTarget resolution --------------------------------------------
 
 func TestComposerTarget_TrackedRow(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	inst, err := session.NewInstance(session.InstanceOptions{Title: "lane-a", Path: ".", Program: "echo"})
 	require.NoError(t, err)
 	h.list.AddInstance(inst)
@@ -118,7 +129,7 @@ func TestComposerTarget_TrackedRow(t *testing.T) {
 }
 
 func TestComposerTarget_NeedsYouRow_ResolvesToTrackedInstance(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	inst, err := session.NewInstance(session.InstanceOptions{Title: "ways-of-working", Path: ".", Program: "echo"})
 	require.NoError(t, err)
 	h.list.AddInstance(inst)
@@ -141,7 +152,7 @@ func TestComposerTarget_NeedsYouRow_ResolvesToTrackedInstance(t *testing.T) {
 // all, and composerTarget must say so with lane="" rather than falling
 // back to that bogus "#277" string.
 func TestComposerTarget_NeedsYouRow_UnresolvedBoardLane_NoLane(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	h.list.SetNeedsYou([]clarity.FeedItem{{Rank: 1, Source: "#277", Lane: "#277", Title: "Owner: one settings act"}}, "")
 	h.list.Up()
 
@@ -156,7 +167,7 @@ func TestComposerTarget_NeedsYouRow_UnresolvedBoardLane_NoLane(t *testing.T) {
 // row's real raising lane (the card's own "## Lane" section) is the send
 // target, not the issue-number source string.
 func TestComposerTarget_NeedsYouRow_BoardLane_ResolvesFromFetchedBody(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	inst, err := session.NewInstance(session.InstanceOptions{Title: "ways-of-working", Path: ".", Program: "echo"})
 	require.NoError(t, err)
 	h.list.AddInstance(inst)
@@ -178,7 +189,7 @@ func TestComposerTarget_NeedsYouRow_BoardLane_ResolvesFromFetchedBody(t *testing
 // -- tab-follows-row-kind (slice 5) ----------------------------------------
 
 func TestSelectionChanged_NeedsYouRowSwitchesTabToNeedsYou(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	inst, err := session.NewInstance(session.InstanceOptions{Title: "lane-a", Path: ".", Program: "echo"})
 	require.NoError(t, err)
 	h.list.AddInstance(inst)
@@ -193,7 +204,7 @@ func TestSelectionChanged_NeedsYouRowSwitchesTabToNeedsYou(t *testing.T) {
 }
 
 func TestSelectionChanged_LaneRowReturnsTabToSession(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	inst, err := session.NewInstance(session.InstanceOptions{Title: "lane-a", Path: ".", Program: "echo"})
 	require.NoError(t, err)
 	h.list.AddInstance(inst)
@@ -209,7 +220,7 @@ func TestSelectionChanged_LaneRowReturnsTabToSession(t *testing.T) {
 }
 
 func TestSelectionChanged_RemembersManualTabChoicePerRowKind(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	inst, err := session.NewInstance(session.InstanceOptions{Title: "lane-a", Path: ".", Program: "echo"})
 	require.NoError(t, err)
 	h.list.AddInstance(inst)
@@ -231,7 +242,7 @@ func TestSelectionChanged_RemembersManualTabChoicePerRowKind(t *testing.T) {
 }
 
 func TestSelectionChanged_WithinSameKindDoesNotFightManualTab(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	h.list.SetNeedsYou([]clarity.FeedItem{
 		{Rank: 1, Lane: "#1", Title: "one"},
 		{Rank: 2, Lane: "#2", Title: "two"},
@@ -254,7 +265,7 @@ func TestSelectionChanged_WithinSameKindDoesNotFightManualTab(t *testing.T) {
 // -- refreshNeedsYouTab / board fetch (async, never blocks the UI thread) --
 
 func TestRefreshNeedsYouTab_LaneFileSourced_NoRecommendation(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	h.list.SetNeedsYou([]clarity.FeedItem{{Rank: 1, Source: "sessions/lane-a/STATUS.md:3", Lane: "lane-a", Title: "t"}}, "")
 	h.list.Up()
 
@@ -263,7 +274,7 @@ func TestRefreshNeedsYouTab_LaneFileSourced_NoRecommendation(t *testing.T) {
 }
 
 func TestRefreshNeedsYouTab_BoardIssue_CacheMissDispatchesFetch(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	h.list.SetNeedsYou([]clarity.FeedItem{{Rank: 1, Source: "#277", Lane: "#277", Title: "t"}}, "")
 	h.list.Up()
 
@@ -285,7 +296,7 @@ func TestRefreshNeedsYouTab_BoardIssue_CacheMissDispatchesFetch(t *testing.T) {
 }
 
 func TestRefreshNeedsYouTab_BoardUnreachable_AfterFailedFetch(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	h.list.SetNeedsYou([]clarity.FeedItem{{Rank: 1, Source: "#1", Lane: "#1", Title: "t"}}, "")
 	h.list.Up()
 
@@ -304,7 +315,7 @@ func TestRefreshNeedsYouTab_BoardUnreachable_AfterFailedFetch(t *testing.T) {
 // -- composer send: tracked lane (SendPrompt) and external (clipboard) ----
 
 func TestComposerFlow_TrackedLane_SendsPromptAndShowsLandedFoot(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	inst := trackedInstanceWithFakeTmux(t, "zz-smoke-lane", "some old output\nhello landed\n\n\n")
 	h.list.AddInstance(inst)
 	h.list.SetSelectedInstance(0)
@@ -329,7 +340,7 @@ func TestComposerFlow_TrackedLane_SendsPromptAndShowsLandedFoot(t *testing.T) {
 }
 
 func TestComposerFlow_ExternalLane_CopiesToClipboardNeverClaimsDelivery(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	h.list.SetExternal([]clarity.ExternalLane{{Name: "mcp-and-ideation"}})
 	h.list.Down() // -> the external row
 
@@ -367,7 +378,7 @@ func TestComposerFlow_ExternalLane_CopiesToClipboardNeverClaimsDelivery(t *testi
 // "runs in your own terminal" note, never route through the tracked send
 // path and error "not a live tmux session".
 func TestComposerFlow_TrackedNoWorktreeInstance_NoSession_CopiesNeverSends(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	noWorktreeAppFixture(t, h, "scratchfix-pane10-attached")
 
 	// m opens the composer on the current selection - composerTarget must
@@ -402,7 +413,7 @@ func TestComposerFlow_TrackedNoWorktreeInstance_NoSession_CopiesNeverSends(t *te
 }
 
 func TestComposerFlow_EscClosesWithoutSending(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	h.composer.Open("lane-a", false)
 	h.state = stateMsg
 	h.composer.Type("half-typed")
@@ -415,7 +426,7 @@ func TestComposerFlow_EscClosesWithoutSending(t *testing.T) {
 }
 
 func TestComposerFlow_EmptyTextEnterClosesWithoutSending(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	h.composer.Open("lane-a", false)
 	h.state = stateMsg
 
@@ -425,7 +436,7 @@ func TestComposerFlow_EmptyTextEnterClosesWithoutSending(t *testing.T) {
 }
 
 func TestComposerFlow_MOpensComposerFocusedOnSelectedLane(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	inst, err := session.NewInstance(session.InstanceOptions{Title: "lane-a", Path: ".", Program: "echo"})
 	require.NoError(t, err)
 	h.list.AddInstance(inst)
@@ -439,7 +450,7 @@ func TestComposerFlow_MOpensComposerFocusedOnSelectedLane(t *testing.T) {
 }
 
 func TestComposerFlow_TypingAppendsToComposer(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	h.composer.Open("lane-a", false)
 	h.state = stateMsg
 
@@ -455,7 +466,7 @@ func TestComposerFlow_TypingAppendsToComposer(t *testing.T) {
 // DEFECT 3: the composer's own menu state is StateMsg, never the upstream
 // "enter prompt" instance-start overlay's StatePrompt it used to borrow.
 func TestComposerFlow_MOpensStateMsg_NotStatePrompt(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	inst, err := session.NewInstance(session.InstanceOptions{Title: "lane-a", Path: ".", Program: "echo"})
 	require.NoError(t, err)
 	h.list.AddInstance(inst)
@@ -472,7 +483,7 @@ func TestComposerFlow_MOpensStateMsg_NotStatePrompt(t *testing.T) {
 // neither the board card's Lane field nor its lane: label still opens the
 // composer, named "(no lane on this row)", and enter delivers nothing.
 func TestComposerFlow_NoLaneRow_TitleAndEnterMessage(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	h.list.SetNeedsYou([]clarity.FeedItem{{Rank: 1, Source: "#277", Lane: "#277", Title: "t"}}, "")
 	h.list.Up()
 

@@ -232,7 +232,7 @@ func TestTerminalPane_Tracked_FallbackStates(t *testing.T) {
 	log.Initialize(false)
 	defer log.Close()
 
-	tp := NewTerminalPane()
+	tp := newTerminalPaneWithDeps(&MockPtyFactory{t: t, cmdExec: mockCmdExec("", false)}, mockCmdExec("", false))
 	tp.SetSize(80, 30)
 
 	t.Run("nil instance", func(t *testing.T) {
@@ -416,7 +416,7 @@ func TestTerminalPane_None_ShowsRestingFrame(t *testing.T) {
 	log.Initialize(false)
 	defer log.Close()
 
-	tp := NewTerminalPane()
+	tp := newTerminalPaneWithDeps(&MockPtyFactory{t: t, cmdExec: mockCmdExec("", false)}, mockCmdExec("", false))
 	tp.SetSize(80, 30)
 	tp.SetFleetCounts(5, 2)
 
@@ -460,7 +460,7 @@ func TestTerminalPane_Attach_External_ErrorsWithoutAView(t *testing.T) {
 	log.Initialize(false)
 	defer log.Close()
 
-	tp := NewTerminalPane()
+	tp := newTerminalPaneWithDeps(&MockPtyFactory{t: t, cmdExec: mockCmdExec("", false)}, mockCmdExec("", false))
 	tp.SetSize(80, 30)
 
 	_, err := tp.Attach("never-viewed-lane")
@@ -474,7 +474,7 @@ func TestTerminalPane_Caching(t *testing.T) {
 	log.Initialize(false)
 	defer log.Close()
 
-	tp := NewTerminalPane()
+	tp := newTerminalPaneWithDeps(&MockPtyFactory{t: t, cmdExec: mockCmdExec("", false)}, mockCmdExec("", false))
 	tp.SetSize(80, 30)
 
 	content1 := "session-1-content"
@@ -529,7 +529,7 @@ func TestTerminalPane_Scrolling(t *testing.T) {
 	cmdExec := mockCmdExec(fullContent, true)
 	ts := newMockTmuxSession(t, "scroll-test", cmdExec)
 
-	tp := NewTerminalPane()
+	tp := newTerminalPaneWithDeps(&MockPtyFactory{t: t, cmdExec: mockCmdExec("", false)}, mockCmdExec("", false))
 	tp.SetSize(80, 30)
 	tp.mu.Lock()
 	tp.external["scroll-lane"] = &terminalSession{tmuxSession: ts, workDir: t.TempDir()}
@@ -560,7 +560,7 @@ func TestTerminalPane_CloseForLane(t *testing.T) {
 	log.Initialize(false)
 	defer log.Close()
 
-	tp := NewTerminalPane()
+	tp := newTerminalPaneWithDeps(&MockPtyFactory{t: t, cmdExec: mockCmdExec("", false)}, mockCmdExec("", false))
 	tp.SetSize(80, 30)
 
 	content := "some content"

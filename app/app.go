@@ -758,10 +758,13 @@ func (m *home) handleQuit() (tea.Model, tea.Cmd) {
 	if err := m.storage.SaveInstances(m.list.GetInstances()); err != nil {
 		return m, m.handleError(err)
 	}
-	// Kill every external lane's own term_<lane> shell (design/cockpit-pane/
-	// DECISIONS.md slice 6's own "killed when the cockpit quits, exactly as
-	// upstream tears down its term_ shells") - a tracked row's Terminal tab
-	// mirrors its own instance session and owns nothing here to close.
+	// Kill every cached term_ shell (design/cockpit-pane/DECISIONS.md slice
+	// 6's own "killed when the cockpit quits, exactly as upstream tears
+	// down its term_ shells") - a tracked row's own term_<title> shell and
+	// an external lane's own term_<lane> shell alike (slice 15: the
+	// Terminal tab is always a shell now, never a mirror of the instance's
+	// own Claude session, so CleanupTerminal closes a tracked row's shell
+	// too).
 	if m.tabbedWindow != nil {
 		m.tabbedWindow.CleanupTerminal()
 	}
