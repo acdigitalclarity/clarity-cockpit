@@ -544,6 +544,29 @@ func (i *Instance) TmuxAlive() bool {
 	return i.tmuxSession.DoesSessionExist()
 }
 
+// Alive reports whether a live process actually backs this tracked row
+// right now - its tmux session is set and reports itself present, AND the
+// instance is not Paused (cockpit-pane slice 17b, WoW ruling 3 Sep 22:3x:
+// "liveness, not age, is the test"). Guarded on tmuxSession != nil first,
+// never i.started alone (RequiresCopyOnlySend's own reasoning: an
+// unstarted instance's tmuxSession is nil and TmuxAlive dereferences it) -
+// this is the more direct of the two equivalent guards, and the one a test
+// double built via SetTmuxSession (never Start()ed for real, the
+// established seam session/instance_test.go and its callers across app/ui
+// already use for a "live tmux" fixture) still satisfies. Paused alone is
+// not enough either way: it is set explicitly (Pause(), pauseNoWorktree())
+// but a session can also die out from under a still-Running instance with
+// no state transition at all (the 3 Sep 18:47:57 incident - a bare `tmux
+// kill-server` took the whole server down while this process kept running,
+// so Status never moved off Running even though TmuxAlive() immediately
+// reads false). The callers that gate "waiting on you"/"stalled" on
+// liveness (ui/list.go's row render and sort, app/attention.go's
+// bell/title) both read this rather than either check alone, so the two
+// can never disagree about which tracked rows are dead.
+func (i *Instance) Alive() bool {
+	return i.tmuxSession != nil && i.TmuxAlive() && !i.Paused()
+}
+
 // RequiresCopyOnlySend reports whether this tracked instance has no live
 // tmux session to deliver a keystroke into - a Paused (or otherwise
 // stopped) instance, most commonly a NoWorktree clarity-attach lane that

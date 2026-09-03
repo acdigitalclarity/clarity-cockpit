@@ -1,8 +1,11 @@
 package ui
 
 import (
+	"claude-squad/cmd/cmd_test"
 	"claude-squad/session"
 	"claude-squad/session/clarity"
+	"claude-squad/session/tmux"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -10,6 +13,20 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/require"
 )
+
+// newTestListInstanceAliveTmux is the fake, always-present tmux session
+// every newTestList row carries (slice 17b): a plain "tmux has-session"
+// mock whose Run always succeeds, the same SetTmuxSession/
+// NewTmuxSessionWithDeps seam composer_test.go already uses for a "live
+// tmux" fixture, so the many pre-existing tests built on newTestList (none
+// of which are testing liveness) keep reading the alive lane they always
+// implicitly were before Instance.Alive() existed. A test that wants a
+// DEAD row builds one directly instead (list_liveness_test.go).
+func newTestListInstanceAliveTmux(title string) *tmux.TmuxSession {
+	return tmux.NewTmuxSessionWithDeps(title, "echo", nil, cmd_test.MockCmdExec{
+		RunFunc: func(cmd *exec.Cmd) error { return nil },
+	})
+}
 
 func newTestList(titles ...string) *List {
 	s := spinner.New()
@@ -20,6 +37,7 @@ func newTestList(titles ...string) *List {
 			Path:    ".",
 			Program: "echo",
 		})
+		inst.SetTmuxSession(newTestListInstanceAliveTmux(t))
 		l.AddInstance(inst)
 	}
 	return l

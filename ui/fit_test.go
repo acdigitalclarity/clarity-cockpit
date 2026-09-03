@@ -226,7 +226,7 @@ func TestString_ExternalRow_ShowsStateGlyphWordAndLastTurn(t *testing.T) {
 	lastTurn := time.Date(2026, 9, 2, 18, 29, 0, 0, time.Local)
 	l.SetExternal([]clarity.ExternalLane{
 		{Name: "travel-matrix-m4", LastWrite: time.Now(), Fill: clarity.Fill{Pct: 80}, FillOK: true,
-			State: clarity.StateStalled, LastTurn: lastTurn, StateOK: true},
+			State: clarity.StateStalled, LastTurn: lastTurn, StateOK: true, Alive: true},
 	})
 
 	out := l.String()
@@ -244,7 +244,7 @@ func TestString_LaneRows_DropWordWhenCollapsed(t *testing.T) {
 	l.SetCollapsed(true)
 	l.items[0].SetLaneState(clarity.StateWorking, time.Now(), true)
 	l.SetExternal([]clarity.ExternalLane{
-		{Name: "external-one", LastWrite: time.Now(), State: clarity.StateIdle, LastTurn: time.Now(), StateOK: true},
+		{Name: "external-one", LastWrite: time.Now(), State: clarity.StateIdle, LastTurn: time.Now(), StateOK: true, Alive: true},
 	})
 
 	out := l.String()
