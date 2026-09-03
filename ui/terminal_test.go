@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -207,10 +208,13 @@ func TestTerminalPane_Tracked_MirrorsInstanceOwnPane(t *testing.T) {
 	require.Contains(t, rendered, "whoami", "rendered output should contain captured content")
 }
 
-// TestTerminalPane_Tracked_FallbackStates covers the same not-selected/
-// paused/not-started fallback wording the pre-redesign pane already had -
-// unchanged by the tracked-vs-external split, since these all still concern
-// a tracked instance's own state.
+// TestTerminalPane_Tracked_FallbackStates covers the nil/not-started
+// fallback wording the pre-redesign pane already had - unchanged by the
+// tracked-vs-external split, since these both still concern a tracked
+// instance's own state. The third (formerly "paused instance") case moved
+// out to TestTerminalPane_TrackedPaused_OpensTermShell below: slice 8 rule
+// 3 replaced its fallback text with a real term_<title> shell, so it no
+// longer belongs in a "fallback states" test at all.
 func TestTerminalPane_Tracked_FallbackStates(t *testing.T) {
 	log.Initialize(false)
 	defer log.Close()
@@ -223,28 +227,10 @@ func TestTerminalPane_Tracked_FallbackStates(t *testing.T) {
 		require.NoError(t, err)
 
 		tp.mu.Lock()
+		defer tp.mu.Unlock()
 		require.True(t, tp.fallback, "should be in fallback mode for nil instance")
 		require.Contains(t, tp.fallbackText, "Select an instance", "fallback text should prompt to select instance")
 		require.Empty(t, tp.content, "content should be empty in fallback mode")
-		tp.mu.Unlock()
-	})
-
-	t.Run("paused instance", func(t *testing.T) {
-		instance, err := session.NewInstance(session.InstanceOptions{
-			Title:   "paused-inst",
-			Path:    t.TempDir(),
-			Program: "bash",
-		})
-		require.NoError(t, err)
-		instance.SetStatus(session.Paused)
-
-		err = tp.UpdateContent(TerminalTarget{Kind: TerminalTargetTracked, Instance: instance})
-		require.NoError(t, err)
-
-		tp.mu.Lock()
-		require.True(t, tp.fallback, "should be in fallback mode for paused instance")
-		require.Contains(t, tp.fallbackText, "paused", "fallback text should mention paused")
-		tp.mu.Unlock()
 	})
 
 	t.Run("not started instance", func(t *testing.T) {
@@ -259,10 +245,124 @@ func TestTerminalPane_Tracked_FallbackStates(t *testing.T) {
 		require.NoError(t, err)
 
 		tp.mu.Lock()
+		defer tp.mu.Unlock()
 		require.True(t, tp.fallback, "should be in fallback mode for not-started instance")
 		require.Contains(t, tp.fallbackText, "not started", "fallback text should indicate not started")
-		tp.mu.Unlock()
 	})
+}
+
+// sessionNameFromArgs pulls a tmux command's own session name out of its
+// args - "-s <name>" (new-session) or "-t <name>"/"-t=<name>" (has-session,
+// attach-session, kill-session, set-option) - so a fake tmux double can
+// tell two DIFFERENT sessions apart. The shared recordingCmdExec above
+// deliberately does not do this (its own tests only ever juggle one session
+// name at a time); this test needs two (an instance's own session, and its
+// separately-named term_<title> shell), so a real tmux would never confuse
+// "session closed" on one for "session closed" on the other.
+func sessionNameFromArgs(args []string) string {
+	for i, a := range args {
+		if (a == "-s" || a == "-t") && i+1 < len(args) {
+			return args[i+1]
+		}
+		if strings.HasPrefix(a, "-t=") {
+			return strings.TrimPrefix(a, "-t=")
+		}
+	}
+	return ""
+}
+
+// multiSessionCmdExec is a tmux double that tracks EACH session name's own
+// existence independently (has-session/new-session/kill-session, keyed by
+// the name sessionNameFromArgs reads off each command) - the per-session
+// realism TestTerminalPane_TrackedPaused_OpensTermShell needs to prove a
+// Paused instance's own (now-closed) session and its freshly-opened
+// term_<title> shell are never conflated.
+type multiSessionCmdExec struct {
+	mu       sync.Mutex
+	sessions map[string]bool
+	capture  string
+}
+
+func newMultiSessionCmdExec(capture string) *multiSessionCmdExec {
+	return &multiSessionCmdExec{sessions: make(map[string]bool), capture: capture}
+}
+
+func (m *multiSessionCmdExec) exec() cmd_test.MockCmdExec {
+	return cmd_test.MockCmdExec{
+		RunFunc: func(cmd *exec.Cmd) error {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			name := sessionNameFromArgs(cmd.Args)
+			cmdStr := cmd.String()
+			switch {
+			case strings.Contains(cmdStr, "has-session"):
+				if m.sessions[name] {
+					return nil
+				}
+				return fmt.Errorf("session does not exist")
+			case strings.Contains(cmdStr, "new-session"):
+				m.sessions[name] = true
+				return nil
+			case strings.Contains(cmdStr, "kill-session"):
+				delete(m.sessions, name)
+				return nil
+			}
+			return nil
+		},
+		OutputFunc: func(cmd *exec.Cmd) ([]byte, error) {
+			if strings.Contains(cmd.String(), "capture-pane") {
+				return []byte(m.capture), nil
+			}
+			return []byte(""), nil
+		},
+	}
+}
+
+// TestTerminalPane_TrackedPaused_OpensTermShell is slice 8 rule 3's own
+// test, seen failing against the pre-fix code (which showed a "Session is
+// paused. Resume to use terminal." fallback here - the installed binary's
+// wordmark-plus-message the owner actually hit): a Paused tracked
+// instance's Terminal tab must instead open/mirror its own term_<title>
+// shell in its Path, exactly as an external lane's Terminal tab does - the
+// resting frame is reserved for "nothing selected", never "this row has no
+// live session right now". Uses a NoWorktree fixture (the exact shape of
+// the owner's report) so Pause() itself is real, not stubbed.
+func TestTerminalPane_TrackedPaused_OpensTermShell(t *testing.T) {
+	log.Initialize(false)
+	defer log.Close()
+
+	workDir := t.TempDir()
+	rec := newMultiSessionCmdExec("$ pwd\n" + workDir)
+	ptyFactory := &MockPtyFactory{t: t, cmdExec: rec.exec()}
+
+	instance, err := session.NewInstance(session.InstanceOptions{
+		Title:      "scratchfix-attached",
+		Path:       workDir,
+		Program:    "bash",
+		NoWorktree: true,
+	})
+	require.NoError(t, err)
+	instance.SetTmuxSession(tmux.NewTmuxSessionWithDeps(instance.Title, "bash", ptyFactory, rec.exec()))
+	require.NoError(t, instance.Start(true))
+	require.True(t, instance.TmuxAlive(), "the instance's own session must be live right after Start")
+	require.NoError(t, instance.Pause(), "a NoWorktree instance's own Pause (slice 8 rule 1) must succeed with no git worktree involved")
+	require.True(t, instance.Paused())
+	require.False(t, instance.TmuxAlive(), "Pause must actually close the instance's own session")
+
+	tp := newTerminalPaneWithDeps(ptyFactory, rec.exec())
+	tp.SetSize(80, 30)
+
+	err = tp.UpdateContent(TerminalTarget{Kind: TerminalTargetTracked, Instance: instance})
+	require.NoError(t, err)
+
+	tp.mu.Lock()
+	require.False(t, tp.fallback, "a paused tracked row must show its term shell, not a fallback message")
+	require.Equal(t, "$ pwd\n"+workDir, tp.content)
+	require.Contains(t, tp.external, instance.Title, "the term_<title> shell must be cached the same way an external lane's is")
+	tp.mu.Unlock()
+
+	rendered := tp.String() // locks tp.mu itself - must run after the block above releases it
+	require.NotContains(t, rendered, "Session is paused", "the old worktree-flavoured paused fallback must be gone")
 }
 
 // TestTerminalPane_External_OpensTermShellLazilyThenReuses is the brief's
