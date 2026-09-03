@@ -473,6 +473,22 @@ func (i *Instance) TmuxAlive() bool {
 	return i.tmuxSession.DoesSessionExist()
 }
 
+// RequiresCopyOnlySend reports whether this tracked instance has no live
+// tmux session to deliver a keystroke into - a Paused (or otherwise
+// stopped) instance, most commonly a NoWorktree clarity-attach lane that
+// runs in the owner's own terminal (cockpit pane-10 walkthrough DEFECT 1:
+// the composer's tracked send path used to be picked for ANY tracked row
+// regardless of session state, and errored "not a live tmux session" on
+// enter instead of falling back to the clipboard-copy path an external lane
+// already uses). Gated on Started() first, never TmuxAlive() alone, since an
+// instance that has never been started (never in production - every row a
+// real list holds is already started; this guard exists only so a
+// construction-only test double, which never calls Start(), does not panic
+// dereferencing a nil tmuxSession) has no tmux session to check at all.
+func (i *Instance) RequiresCopyOnlySend() bool {
+	return i.started && !i.TmuxAlive()
+}
+
 // pauseNoWorktree closes a NoWorktree instance's tmux session - there is no
 // git worktree to preserve (see Instance.NoWorktree), so Pause here never
 // touches git at all: it just stops tracking a live session. The lane

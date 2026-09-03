@@ -40,7 +40,7 @@ func TestMenu_SetInstance_NeverOverridesStateMsg(t *testing.T) {
 
 	inst, err := session.NewInstance(session.InstanceOptions{Title: "lane-a", Path: ".", Program: "echo"})
 	require.NoError(t, err)
-	m.SetInstance(inst, false)
+	m.SetInstance(inst, false, false)
 
 	require.Equal(t, StateMsg, m.state)
 	require.Equal(t, "enter send · esc cancel", ansi.Strip(m.String()))
@@ -73,7 +73,7 @@ func TestMenu_TrackedRow_FooterMatchesMockUpExactly(t *testing.T) {
 	m := NewMenu()
 	inst, err := session.NewInstance(session.InstanceOptions{Title: "lane-a", Path: ".", Program: "echo"})
 	require.NoError(t, err)
-	m.SetInstance(inst, false)
+	m.SetInstance(inst, false, false)
 	m.SetSize(200, 1)
 
 	require.Equal(t, mockUpFooterText, strings.TrimSpace(ansi.Strip(m.String())))
@@ -88,11 +88,11 @@ func TestMenu_ExternalRow_FooterSameShapeButDimmed(t *testing.T) {
 	tracked := NewMenu()
 	inst, err := session.NewInstance(session.InstanceOptions{Title: "lane-a", Path: ".", Program: "echo"})
 	require.NoError(t, err)
-	tracked.SetInstance(inst, false)
+	tracked.SetInstance(inst, false, false)
 	tracked.SetSize(200, 1)
 
 	external := NewMenu()
-	external.SetInstance(nil, true)
+	external.SetInstance(nil, true, false)
 	external.SetSize(200, 1)
 
 	require.Equal(t, mockUpFooterText, strings.TrimSpace(ansi.Strip(external.String())),
@@ -107,9 +107,48 @@ func TestMenu_ExternalRow_FooterSameShapeButDimmed(t *testing.T) {
 // (SetInstance(nil, true)), which the fix above must not collapse into.
 func TestMenu_NothingSelected_IsStateEmptyNotDimmed(t *testing.T) {
 	m := NewMenu()
-	m.SetInstance(nil, false)
+	m.SetInstance(nil, false, false)
 
 	require.Equal(t, StateEmpty, m.state)
 	require.NotContains(t, ansi.Strip(m.String()), "open folder",
 		"nothing selected shows the bare empty-state menu, not the lane-action one")
+}
+
+// TestMenu_NeedsYouRow_FooterMatchesMockUpExactly is board #280 pane-10
+// walkthrough DEFECT 3, seen failing first: the pre-fix instanceChanged()
+// passed a Needs-you row's nil instance/false isExternal straight into
+// SetInstance, which read that as "nothing selected" and drew the StateEmpty
+// footer ("n new • N new with prompt │ m message • ? help • q quit") instead
+// of the drawn lane-action line every other row kind shares.
+func TestMenu_NeedsYouRow_FooterMatchesMockUpExactly(t *testing.T) {
+	m := NewMenu()
+	m.SetInstance(nil, false, true)
+	m.SetSize(200, 1)
+
+	require.Equal(t, StateDefault, m.state)
+	require.Equal(t, mockUpFooterText, strings.TrimSpace(ansi.Strip(m.String())),
+		"a Needs-you row must draw the same footer line as a tracked or external row")
+}
+
+// TestMenu_NeedsYouRow_AttachAndOpenFolderDimmed_MessageAndCopyLive pins the
+// per-key half of DEFECT 3's rule: ↵ attach and o open folder are faint (no
+// tracked instance/folder to act on), m message and c copy are not (the
+// row's own raising lane is still a valid send/copy target).
+func TestMenu_NeedsYouRow_AttachAndOpenFolderDimmed_MessageAndCopyLive(t *testing.T) {
+	tracked := NewMenu()
+	inst, err := session.NewInstance(session.InstanceOptions{Title: "lane-a", Path: ".", Program: "echo"})
+	require.NoError(t, err)
+	tracked.SetInstance(inst, false, false)
+	tracked.SetSize(200, 1)
+
+	needsYou := NewMenu()
+	needsYou.SetInstance(nil, false, true)
+	needsYou.SetSize(200, 1)
+
+	require.NotEqual(t, tracked.String(), needsYou.String(),
+		"the Needs-you row's raw (unstripped) render must differ - the Faint style on ↵ attach/o open folder must actually change the emitted ANSI")
+
+	plain := ansi.Strip(needsYou.String())
+	require.Contains(t, plain, "m message", "m message stays advertised on a Needs-you row")
+	require.Contains(t, plain, "c copy", "c copy stays advertised on a Needs-you row")
 }

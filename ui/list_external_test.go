@@ -1,7 +1,15 @@
 package ui
 
 import (
+	"claude-squad/cmd/cmd_test"
+	"claude-squad/session"
 	"claude-squad/session/clarity"
+	"claude-squad/session/tmux"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -73,6 +81,82 @@ func TestSelectedMsgTarget_TrackedInstance(t *testing.T) {
 	require.True(t, ok)
 	require.False(t, isExternal)
 	require.Equal(t, "b", lane)
+}
+
+// pauseAwarePtyFactory flips *exists true the moment its PTY "starts" - the
+// same shared-bool shape session/instance_test.go's startAwarePtyFactory
+// uses - so TmuxSession.Start's own existence-poll loop sees the session as
+// live immediately rather than running out its timeout.
+type pauseAwarePtyFactory struct {
+	t      *testing.T
+	exists *bool
+}
+
+func (p *pauseAwarePtyFactory) Start(cmd *exec.Cmd) (*os.File, error) {
+	*p.exists = true
+	return os.OpenFile(filepath.Join(p.t.TempDir(), "pty"), os.O_CREATE|os.O_RDWR, 0644)
+}
+
+func (p *pauseAwarePtyFactory) Close() {}
+
+// pausedNoWorktreeInstance builds a Started, Paused (no live tmux session)
+// NoWorktree instance - the clarity-attach shape (a lane started outside
+// the cockpit, run: clarity attach) - reusing the same has-session/
+// kill-session tracking cmdExec shape session/instance_test.go's
+// sessionAwareCmdExec already proved, so SelectedMsgTarget's own resolution
+// (board #280 pane-10 walkthrough DEFECT 1) exercises the exact instance
+// shape the owner hit. title is prefixed scratchfix- by every caller, never
+// a real lane name - tmux session names are machine-global even though this
+// fixture's own tmux calls are fully mocked (cmd_test.MockCmdExec, never a
+// real tmux binary).
+func pausedNoWorktreeInstance(t *testing.T, title string) *session.Instance {
+	t.Helper()
+	sessionExists := false
+	cmdExec := cmd_test.MockCmdExec{
+		RunFunc: func(cmd *exec.Cmd) error {
+			cmdStr := cmd.String()
+			if strings.Contains(cmdStr, "has-session") {
+				if sessionExists {
+					return nil
+				}
+				return fmt.Errorf("session does not exist")
+			}
+			if strings.Contains(cmdStr, "kill-session") {
+				sessionExists = false
+			}
+			return nil
+		},
+	}
+	inst, err := session.NewInstance(session.InstanceOptions{
+		Title:      title,
+		Path:       t.TempDir(),
+		Program:    "claude",
+		NoWorktree: true,
+	})
+	require.NoError(t, err)
+	inst.SetTmuxSession(tmux.NewTmuxSessionWithDeps(title, "claude", &pauseAwarePtyFactory{t: t, exists: &sessionExists}, cmdExec))
+	require.NoError(t, inst.Start(true))
+	require.NoError(t, inst.Pause())
+	require.False(t, inst.TmuxAlive(), "fixture must land Paused with no live session")
+	return inst
+}
+
+// TestSelectedMsgTarget_TrackedInstance_NoLiveSession_CopyOnly is board
+// #280 pane-10 walkthrough DEFECT 1, seen failing first: a tracked
+// NoWorktree instance with no live tmux session (Paused - the
+// clarity-attach shape: the lane runs in the owner's own terminal) must
+// resolve isExternal=true, the composer's copy-only path, never the
+// tracked send path that used to error "not a live tmux session" on enter.
+func TestSelectedMsgTarget_TrackedInstance_NoLiveSession_CopyOnly(t *testing.T) {
+	l := newTestList()
+	inst := pausedNoWorktreeInstance(t, "scratchfix-pane10-noworktree")
+	l.AddInstance(inst)
+	l.SetSelectedInstance(0)
+
+	lane, isExternal, ok := l.SelectedMsgTarget()
+	require.True(t, ok)
+	require.True(t, isExternal, "no live tmux session - copy-only, same as a genuine external row")
+	require.Equal(t, "scratchfix-pane10-noworktree", lane)
 }
 
 func TestSelectedMsgTarget_ExternalRow(t *testing.T) {

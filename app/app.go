@@ -1304,9 +1304,10 @@ func noWorktreeResumeAllowed(inst *session.Instance) bool {
 func (m *home) instanceChanged() tea.Cmd {
 	selected := m.list.GetSelectedInstance()
 	_, isExternal := m.list.GetSelectedExternalLane()
+	_, isNeedsYou := m.list.GetSelectedNeedsYou()
 
 	// Update menu with current instance
-	m.menu.SetInstance(selected, isExternal)
+	m.menu.SetInstance(selected, isExternal, isNeedsYou)
 
 	if err := m.tabbedWindow.UpdateTerminal(m.terminalTarget()); err != nil {
 		return m.handleError(err)
@@ -1350,7 +1351,11 @@ func (m *home) composerTarget() (lane string, isExternal bool, ok bool) {
 		}
 		for _, inst := range m.list.GetInstances() {
 			if inst.Title == lane {
-				return lane, false, true
+				// Same DEFECT 1 rule SelectedMsgTarget applies below: a
+				// matched tracked instance with no live tmux session (e.g.
+				// a Paused NoWorktree lane) is a copy-only target too, not
+				// the tracked send path.
+				return lane, inst.RequiresCopyOnlySend(), true
 			}
 		}
 		for _, ext := range m.list.GetExternal() {

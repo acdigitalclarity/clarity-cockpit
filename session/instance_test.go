@@ -166,6 +166,41 @@ func TestNoWorktreeInstance_Pause_ClosesSessionNeverTouchesGitWorktree(t *testin
 	require.NotContains(t, err.Error(), "worktree")
 }
 
+// TestRequiresCopyOnlySend_RunningInstance_False is cockpit pane-10
+// walkthrough DEFECT 1's negative case: a Started, Running instance with a
+// live tmux session is a genuine send target.
+func TestRequiresCopyOnlySend_RunningInstance_False(t *testing.T) {
+	instance, _ := newNoWorktreeFixture(t, "scratchfix-running")
+	require.False(t, instance.RequiresCopyOnlySend())
+}
+
+// TestRequiresCopyOnlySend_PausedNoWorktreeInstance_True is DEFECT 1 itself,
+// seen failing first: a NoWorktree instance Paused (no live tmux session -
+// the clarity-attach shape, its lane runs in the owner's own terminal) must
+// report copy-only, not the tracked send path the pre-fix composer wrongly
+// picked for it.
+func TestRequiresCopyOnlySend_PausedNoWorktreeInstance_True(t *testing.T) {
+	instance, exists := newNoWorktreeFixture(t, "scratchfix-paused")
+	require.NoError(t, instance.Pause())
+	require.False(t, *exists)
+
+	require.True(t, instance.RequiresCopyOnlySend())
+}
+
+// TestRequiresCopyOnlySend_NeverStartedInstance_False guards the nil-
+// tmuxSession short circuit: a construction-only instance that has never
+// called Start() (no test in this codebase's list/composer suites ever
+// starts one - session.NewInstance alone is the common lightweight double)
+// must never panic dereferencing a nil tmuxSession, and reads false, the
+// same as before this fix.
+func TestRequiresCopyOnlySend_NeverStartedInstance_False(t *testing.T) {
+	instance, err := NewInstance(InstanceOptions{Title: "never-started", Path: t.TempDir(), Program: "echo"})
+	require.NoError(t, err)
+	require.False(t, instance.Started())
+
+	require.False(t, instance.RequiresCopyOnlySend())
+}
+
 // TestNoWorktreeInstance_Resume_StartsNewSessionNeverTouchesGitWorktree
 // covers the "creates" half of rule 1's "creates (or reuses)": after Pause
 // has closed the session, Resume must start a fresh one in the instance's
