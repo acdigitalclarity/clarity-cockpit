@@ -66,6 +66,15 @@ const (
 	// intercepted here, same shape as stateMsg above, so ordinary list
 	// navigation is suspended while the picker is open.
 	stateSessionPicker
+	// stateAnswerConfirm is the y-key answer confirm strip (slice 18,
+	// ANSWER-AND-BANK-SPEC.md): enter sends (the reply, then the board
+	// comment), e reopens ordinary typing mode with the text pre-filled,
+	// esc cancels - no other key is captured, same modal shape as stateMsg.
+	stateAnswerConfirm
+	// stateBankConfirm is the b-key bank confirm strip: enter sends the
+	// standard bank line, esc cancels - no e (the line is fixed, never
+	// edited).
+	stateBankConfirm
 )
 
 type home struct {
@@ -148,6 +157,25 @@ type home struct {
 	// (clarity.BoardCache) - lazily initialized on first use, same pattern
 	// as laneTailCache below.
 	boardCache *clarity.BoardCache
+	// answeredIssues is the y-key answer flow's own in-memory marker set
+	// (ANSWER-AND-BANK-SPEC.md "Answered marker and its lifetime") - board
+	// issue numbers answered THIS session; dropped when the rebuilt queue
+	// no longer carries an issue (pruneAnsweredIssues, every feed tick) and
+	// on quit. Never persisted, never read back as truth by anything but
+	// the row/card tick-and-dim render (ui.List/ui.NeedsYouInfo.Answered).
+	answeredIssues map[int]bool
+	// pendingComments holds a board comment that failed to post, keyed by
+	// issue number - the retry queue the spec's own "Ordering and retry"
+	// rule describes: retried on the feed tick at most once a minute
+	// (clarity.BoardRetryInterval), abandoned after 5 attempts. Memory-only
+	// - lost on quit, the foot says "pending", never "commented".
+	pendingComments map[int]*pendingComment
+	// bankWatch is the b-key bank flow's own CONTINUATION-*.md poll, set on
+	// a successful bank send and cleared on the first hit, on 30 minutes
+	// elapsed, or on quit - nil otherwise. Only one watch is ever live at a
+	// time (one composer, one send target), matching the shared Composer's
+	// own "at most one in-progress compose" contract.
+	bankWatch *bankWatch
 	// laneTab/needsYouTab remember the user's own last-chosen tab for each
 	// row kind (slice 5's "remember the user's own tab choice per row kind
 	// so tab does not fight the cursor") - laneTab covers both tracked and
@@ -546,6 +574,10 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// driven, never a blocking polling loop.
 		needsYouItems, needsYouStatus := clarity.RankedNeedsYou(clarity.DefaultFeedPath(), feedTopN)
 		m.list.SetNeedsYou(needsYouItems, needsYouStatus)
+		// Answered-marker lifetime (ANSWER-AND-BANK-SPEC.md): dropped the
+		// instant the rebuilt queue no longer carries an issue, never before.
+		m.pruneAnsweredIssues(needsYouItems)
+		m.list.SetAnsweredIssues(m.answeredIssues)
 		// Slice 23 rule 3: fly to Needs you on a genuinely new row - nil-guarded
 		// the same way this tick's other tabbedWindow calls below are (a
 		// lightweight test home built without one, e.g. fit_test.go's own
@@ -597,6 +629,17 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			inst.SetLaneState(tail.State, tail.LastTurn, true)
 		}
 
+		// Permission-prompt state word (item 7) - a live tmux pane sample,
+		// never derived from the transcript (SetLaneState above), on the
+		// same 3s cadence.
+		m.sampleNeedsKey()
+
+		// Bank watch (item 8) and the answer flow's own board-comment retry
+		// queue (item 6's "Ordering and retry") - both memory-only, both
+		// polled on this same tick.
+		m.checkBankWatch(now)
+		retryCmd := m.retryPendingCommentsCmd(now)
+
 		// Context-fill for Paused tracked instances (the OWN ROW defect's
 		// "ctx n/a"): tickUpdateMetadataCmd's 500ms loop only computes
 		// context fill for snapshotActiveInstances() (Started and not
@@ -631,7 +674,7 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// waiting on a key press.
 		needsYouCmd := m.refreshNeedsYouTab()
 
-		return m, tea.Batch(needsYouCmd, func() tea.Msg {
+		return m, tea.Batch(needsYouCmd, retryCmd, func() tea.Msg {
 			time.Sleep(feedRefreshInterval)
 			return feedTickMsg{}
 		})
@@ -749,7 +792,40 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.composer.Close()
 			return m, m.handleError(msg.err)
 		}
-		m.composer.SetResult(msg.result)
+		switch {
+		case msg.bank:
+			m.composer.SetBankResult(msg.result)
+			if msg.bankDir != "" {
+				m.bankWatch = &bankWatch{dir: msg.bankDir, since: msg.bankAt, deadline: msg.bankAt.Add(bankWatchTimeout)}
+			}
+		case msg.issue != 0:
+			m.composer.SetAnswerResult(msg.result, msg.issue)
+			if msg.answered {
+				m.markAnswered(msg.issue)
+			}
+			if msg.pendingBody != "" {
+				m.addPendingComment(msg.issue, msg.pendingBody, msg.sendResult)
+			}
+		default:
+			m.composer.SetResult(msg.result)
+		}
+		return m, nil
+	case commentRetryMsg:
+		p, ok := m.pendingComments[msg.issue]
+		if !ok {
+			// Superseded (the pending record was dropped some other way,
+			// e.g. an owner-driven clear) - nothing to update.
+			return m, nil
+		}
+		if msg.err == nil {
+			delete(m.pendingComments, msg.issue)
+			m.composer.UpdateResultIfIssue(msg.issue, fmt.Sprintf("%s · board #%d commented", msg.sendResult, msg.issue))
+			return m, nil
+		}
+		if p.attempts >= 5 {
+			delete(m.pendingComments, msg.issue)
+			m.composer.UpdateResultIfIssue(msg.issue, fmt.Sprintf("%s · board #%d comment failed · c copies the line", msg.sendResult, msg.issue))
+		}
 		return m, nil
 	case boardFetchedMsg:
 		return m, m.refreshNeedsYouTab()
@@ -818,7 +894,8 @@ func (m *home) handleMenuHighlighting(msg tea.KeyPressMsg) (cmd tea.Cmd, returnE
 	// picker's own up/down/c/esc dispatch is direct and single-pass, same
 	// reason stateMsg's composer typing is: the menu has no highlight state
 	// for any of those keys while a modal like this owns them outright.
-	if m.state == statePrompt || m.state == stateHelp || m.state == stateConfirm || m.state == stateMsg || m.state == stateSessionPicker {
+	if m.state == statePrompt || m.state == stateHelp || m.state == stateConfirm || m.state == stateMsg ||
+		m.state == stateSessionPicker || m.state == stateAnswerConfirm || m.state == stateBankConfirm {
 		return nil, false
 	}
 	// If it's in the global keymap, we should try to highlight it.
@@ -1060,6 +1137,13 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 				m.menu.SetState(ui.StateDefault)
 				return m, nil
 			}
+			// The y-key answer strip's own e chord (EditConfirmedAnswer)
+			// re-enters this same typing mode with AnswerIssue set - Enter
+			// here still runs the two-write answer flow, with whatever text
+			// was edited, rather than a plain message send (RULE 6).
+			if issue := m.composer.AnswerIssue(); issue != 0 {
+				return m, m.sendAnswerCmd(issue, lane, isExternal, text)
+			}
 			return m, m.sendComposerCmd(lane, isExternal, text)
 		case tea.KeyBackspace:
 			m.composer.Backspace()
@@ -1068,6 +1152,54 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 			if msg.Text != "" {
 				m.composer.Type(msg.Text)
 			}
+			return m, nil
+		}
+	}
+
+	// Handle the y-key answer confirm strip: enter sends (the two-write
+	// flow), e reopens ordinary typing mode with the text pre-filled, esc/
+	// ctrl+c cancels writing nothing - no other key is captured (RULE 6).
+	if m.state == stateAnswerConfirm {
+		switch {
+		case msg.String() == "ctrl+c" || msg.Code == tea.KeyEsc:
+			m.composer.Close()
+			m.state = stateDefault
+			m.menu.SetState(ui.StateDefault)
+			return m, nil
+		case msg.Code == tea.KeyEnter:
+			issue := m.composer.ConfirmIssue()
+			lane, isExternal := m.composer.Lane(), m.composer.IsExternal()
+			text := m.composer.Value()
+			m.state = stateDefault
+			m.menu.SetState(ui.StateDefault)
+			return m, m.sendAnswerCmd(issue, lane, isExternal, text)
+		case msg.String() == "e":
+			m.composer.EditConfirmedAnswer()
+			m.state = stateMsg
+			m.menu.SetState(ui.StateMsg)
+			return m, nil
+		default:
+			return m, nil
+		}
+	}
+
+	// Handle the b-key bank confirm strip: enter sends the standard bank
+	// line, esc/ctrl+c cancels - no e, the line is fixed.
+	if m.state == stateBankConfirm {
+		switch {
+		case msg.String() == "ctrl+c" || msg.Code == tea.KeyEsc:
+			m.composer.Close()
+			m.state = stateDefault
+			m.menu.SetState(ui.StateDefault)
+			return m, nil
+		case msg.Code == tea.KeyEnter:
+			lane, isExternal := m.composer.Lane(), m.composer.IsExternal()
+			text := m.composer.Value()
+			dir := m.selectedFolderPath()
+			m.state = stateDefault
+			m.menu.SetState(ui.StateDefault)
+			return m, m.sendBankCmd(lane, isExternal, text, dir)
+		default:
 			return m, nil
 		}
 	}
@@ -1382,6 +1514,10 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 			m.tabbedWindow.ToggleButterflyEnabled()
 		}
 		return m, nil
+	case keys.KeyAnswer:
+		return m, m.handleAnswerKey()
+	case keys.KeyBank:
+		return m, m.handleBankKey()
 	default:
 		return m, nil
 	}
@@ -1534,10 +1670,17 @@ func noWorktreeResumeAllowed(inst *session.Instance) bool {
 func (m *home) instanceChanged() tea.Cmd {
 	selected := m.list.GetSelectedInstance()
 	_, isExternal := m.list.GetSelectedExternalLane()
-	_, isNeedsYou := m.list.GetSelectedNeedsYou()
+	needsYouItem, isNeedsYou := m.list.GetSelectedNeedsYou()
 
 	// Update menu with current instance
 	m.menu.SetInstance(selected, isExternal, isNeedsYou)
+	answered := false
+	if isNeedsYou {
+		if n, ok := clarity.BoardIssueNumber(needsYouItem.Source); ok {
+			answered = m.answeredIssues[n]
+		}
+	}
+	m.menu.SetNeedsYouAnswered(answered)
 
 	if err := m.tabbedWindow.UpdateTerminal(m.terminalTarget()); err != nil {
 		return m.handleError(err)
@@ -1697,6 +1840,7 @@ func (m *home) refreshNeedsYouTab() tea.Cmd {
 		m.tabbedWindow.SetNeedsYouInfo(info)
 		return nil
 	}
+	info.Answered = m.answeredIssues[n]
 	if m.boardCache == nil {
 		m.boardCache = clarity.NewBoardCache()
 	}
@@ -1757,6 +1901,60 @@ type hideStatusMsg struct{}
 type composerResultMsg struct {
 	result string
 	err    error
+
+	// -- y-key answer flow only (issue != 0) --
+	// issue is the board issue number this result belongs to.
+	issue int
+	// answered is true once the send itself succeeded - the row is marked
+	// regardless of whether the board comment that follows also succeeded
+	// (test: a board-unreachable send still ticks the row).
+	answered bool
+	// pendingBody is the comment body to queue for retry - set only when
+	// PostComment failed (empty on success, and on a send failure that
+	// never attempted a comment at all).
+	pendingBody string
+	// sendResult is the delivery-only foot text ("sent · landed ..." /
+	// "copied · paste it in ...") - carried so a LATER retry (commentRetry-
+	// Msg) can rebuild the full foot without a fresh, possibly-stale
+	// time.Now().
+	sendResult string
+
+	// -- b-key bank flow only --
+	bank    bool
+	bankDir string
+	bankAt  time.Time
+}
+
+// pendingComment is one board comment that failed to post, held in memory
+// for the retry queue (ANSWER-AND-BANK-SPEC.md "Ordering and retry") -
+// never persisted, lost on quit.
+type pendingComment struct {
+	body        string
+	sendResult  string
+	attempts    int
+	lastAttempt time.Time
+}
+
+// bankWatchTimeout bounds the b-key bank flow's own CONTINUATION-*.md poll
+// (the spec's own "30 minutes elapsed").
+const bankWatchTimeout = 30 * time.Minute
+
+// bankWatch is the one in-flight bank-and-close poll (see the home field's
+// own doc comment).
+type bankWatch struct {
+	dir      string
+	since    time.Time
+	deadline time.Time
+}
+
+// commentRetryMsg carries one retry attempt's own result back to Update -
+// the pendingComment record itself (attempts/lastAttempt) is mutated on the
+// main thread, at DISPATCH time (retryPendingCommentsCmd), never here, so
+// two ticks landing close together can never double-count one attempt.
+type commentRetryMsg struct {
+	issue      int
+	sendResult string
+	err        error
 }
 
 // boardFetchedMsg signals that a background board-issue fetch (fetchBoard-
@@ -1947,6 +2145,12 @@ func (m *home) selectedSessionInfo(now time.Time) *ui.SessionInfo {
 		if err != nil {
 			return nil
 		}
+		if selected.NeedsKey() {
+			// Overrides the transcript-derived word on this LOCAL copy only
+			// (LaneTailCache.Get returns LaneTail by value) - "ahead of
+			// every other word" (item 7), never persisted into the cache.
+			tail.State = clarity.StateNeedsKey
+		}
 		branch := ""
 		if selected.HasWorktree() {
 			branch = selected.Branch
@@ -2074,30 +2278,304 @@ func (m *home) setStatus(text string) tea.Cmd {
 // external lane, a clipboard copy instead ("copied · this lane runs in
 // your own terminal, paste it there") - never a claimed delivery this
 // cockpit cannot confirm.
+// deliverResult is the send-or-copy rule's own outcome, shared by every
+// composer flow (the plain m-key message, the y-key answer, the b-key
+// bank) so the delivery rule itself lives in exactly one place. at is the
+// moment delivery actually landed - the answer flow's board comment quotes
+// this same instant (AnswerCommentBody), never a second, separately-taken
+// time.Now(). notLive marks the one failure the answer/bank flows give
+// their own "not sent" foot text to (a tracked lane resolved but its tmux
+// session is not live) - every other failure (clipboard, pane-capture, an
+// unresolved instance) falls back to the plain error box, same as before
+// this slice.
+type deliverResult struct {
+	result  string
+	err     error
+	at      time.Time
+	notLive bool
+}
+
+func (m *home) deliverToLane(lane string, isExternal bool, text string) deliverResult {
+	if isExternal {
+		if err := clarity.CopyToClipboard(m.cmdExec, text); err != nil {
+			return deliverResult{err: fmt.Errorf("could not copy to clipboard: %w", err)}
+		}
+		return deliverResult{result: "copied · this lane runs in your own terminal, paste it there", at: time.Now()}
+	}
+	for _, inst := range m.list.GetInstances() {
+		if inst.Title != lane {
+			continue
+		}
+		if !inst.Started() || inst.Paused() || !inst.TmuxAlive() {
+			return deliverResult{err: fmt.Errorf("%q is not a live tmux session", lane), notLive: true}
+		}
+		if err := inst.SendPrompt(text); err != nil {
+			return deliverResult{err: fmt.Errorf("failed to send message to %q: %w", lane, err)}
+		}
+		if _, err := inst.Preview(); err != nil {
+			return deliverResult{err: fmt.Errorf("message sent to %q but pane capture failed: %w", lane, err)}
+		}
+		return deliverResult{result: fmt.Sprintf("sent · landed %s", time.Now().Local().Format("15:04:05")), at: time.Now()}
+	}
+	return deliverResult{err: fmt.Errorf("no such tracked instance %q", lane)}
+}
+
 func (m *home) sendComposerCmd(lane string, isExternal bool, text string) tea.Cmd {
 	return func() tea.Msg {
+		r := m.deliverToLane(lane, isExternal, text)
+		return composerResultMsg{result: r.result, err: r.err}
+	}
+}
+
+// copiedIntoLanePrefix is the y/b confirm strips' own external-lane foot
+// prefix, verbatim (ANSWER-AND-BANK-MOCKUP-164x45.md: "copied · paste it in
+// andy-e-bid · ...") - distinct wording from the plain m-key composer's own
+// deliverResult.result ("copied · this lane runs in your own terminal,
+// paste it there"), which stays exactly as it already was for that flow.
+func copiedIntoLanePrefix(lane string) string {
+	return fmt.Sprintf("copied · paste it in %s", lane)
+}
+
+// sendAnswerCmd is the y-key answer flow's own Enter (ANSWER-AND-BANK-
+// SPEC.md "Ordering and retry"): the reply is the act, the board comment is
+// bookkeeping - it runs the SAME send-or-copy delivery every composer flow
+// shares, then - only once that succeeds - posts the comment; a comment
+// failure never blocks or reverses the reply, it becomes a pendingComment
+// retried on the feed tick instead (test 10). A send failure posts no
+// comment at all and never marks the row answered (test 9).
+func (m *home) sendAnswerCmd(issue int, lane string, isExternal bool, text string) tea.Cmd {
+	return func() tea.Msg {
+		r := m.deliverToLane(lane, isExternal, text)
+		if r.err != nil {
+			if r.notLive {
+				return composerResultMsg{result: fmt.Sprintf("not sent · %s is not a live tmux session · nothing written to the board", lane)}
+			}
+			return composerResultMsg{err: r.err}
+		}
+		prefix := fmt.Sprintf("sent · landed %s", r.at.Local().Format("15:04:05"))
 		if isExternal {
-			if err := clarity.CopyToClipboard(m.cmdExec, text); err != nil {
-				return composerResultMsg{err: fmt.Errorf("could not copy to clipboard: %w", err)}
-			}
-			return composerResultMsg{result: "copied · this lane runs in your own terminal, paste it there"}
+			prefix = copiedIntoLanePrefix(lane)
 		}
-		for _, inst := range m.list.GetInstances() {
-			if inst.Title != lane {
-				continue
-			}
-			if !inst.Started() || inst.Paused() || !inst.TmuxAlive() {
-				return composerResultMsg{err: fmt.Errorf("%q is not a live tmux session", lane)}
-			}
-			if err := inst.SendPrompt(text); err != nil {
-				return composerResultMsg{err: fmt.Errorf("failed to send message to %q: %w", lane, err)}
-			}
-			if _, err := inst.Preview(); err != nil {
-				return composerResultMsg{err: fmt.Errorf("message sent to %q but pane capture failed: %w", lane, err)}
-			}
-			return composerResultMsg{result: fmt.Sprintf("sent · landed %s", time.Now().Local().Format("15:04:05"))}
+		body := clarity.AnswerCommentBody(text, lane, isExternal, r.at)
+		if m.boardCache == nil {
+			m.boardCache = clarity.NewBoardCache()
 		}
-		return composerResultMsg{err: fmt.Errorf("no such tracked instance %q", lane)}
+		if err := m.boardCache.PostComment(issue, body); err != nil {
+			return composerResultMsg{
+				result:      fmt.Sprintf("%s · board #%d comment pending", prefix, issue),
+				issue:       issue,
+				answered:    true,
+				pendingBody: body,
+				sendResult:  prefix,
+			}
+		}
+		return composerResultMsg{
+			result:   fmt.Sprintf("%s · board #%d commented", prefix, issue),
+			issue:    issue,
+			answered: true,
+		}
+	}
+}
+
+// sendBankCmd is the b-key bank flow's own Enter: the same send-or-copy
+// delivery, then (on success only) hands back the lane folder to watch for
+// a fresh CONTINUATION-*.md (Update's own composerResultMsg case starts the
+// watch - dir is resolved on the main thread, before this Cmd runs, since
+// m.selectedFolderPath reads the CURRENT selection and must not race a
+// selection change while this Cmd is in flight).
+func (m *home) sendBankCmd(lane string, isExternal bool, text, dir string) tea.Cmd {
+	return func() tea.Msg {
+		r := m.deliverToLane(lane, isExternal, text)
+		if r.err != nil {
+			if r.notLive {
+				return composerResultMsg{result: fmt.Sprintf("not sent · %s is not a live tmux session", lane)}
+			}
+			return composerResultMsg{err: r.err}
+		}
+		prefix := fmt.Sprintf("bank sent %s", r.at.Local().Format("15:04:05"))
+		if isExternal {
+			prefix = copiedIntoLanePrefix(lane)
+		}
+		bankSent := fmt.Sprintf("%s · watching for CONTINUATION-*.md", prefix)
+		return composerResultMsg{result: bankSent, bank: true, bankDir: dir, bankAt: r.at}
+	}
+}
+
+// handleAnswerKey is the y key (ANSWER-AND-BANK-SPEC.md): loads the
+// selected Needs-you row's own recommended response into the composer's
+// confirm strip. Inert (zero calls, no state change - test 4) on anything
+// but a NOT-yet-answered, board-sourced Needs-you row: a lane row (no
+// selected Needs-you item at all), a lane-file-sourced row (no issue to
+// comment on), or an already-answered one. A card with no recommendation
+// opens the composer empty instead (test 3) - the cockpit never invents an
+// answer.
+func (m *home) handleAnswerKey() tea.Cmd {
+	item, ok := m.list.GetSelectedNeedsYou()
+	if !ok {
+		return nil
+	}
+	n, isBoard := clarity.BoardIssueNumber(item.Source)
+	if !isBoard || m.answeredIssues[n] {
+		return nil
+	}
+	lane, isExternal, ok := m.composerTarget()
+	if !ok {
+		return nil
+	}
+	var opts []clarity.BoardOption
+	if m.boardCache != nil {
+		if cached, cok := m.boardCache.Peek(n); cok && cached.Err == "" {
+			opts = cached.Options
+		}
+	}
+	chosen, _, ok := clarity.ChosenOption(opts)
+	if !ok {
+		m.composer.Open(lane, isExternal)
+		m.state = stateMsg
+		m.menu.SetState(ui.StateMsg)
+		return nil
+	}
+	m.composer.OpenAnswerConfirm(n, lane, isExternal, clarity.AnswerText(chosen.Text))
+	m.state = stateAnswerConfirm
+	m.menu.SetState(ui.StateAnswerConfirm)
+	return nil
+}
+
+// handleBankKey is the b key: loads the standard bank-and-close line into
+// the composer's confirm strip for the currently selected lane row. Inert
+// on a Needs-you row or when nothing is selected (SelectedMsgTarget's own
+// ok=false, unchanged from the plain m-key composer's own gate).
+func (m *home) handleBankKey() tea.Cmd {
+	lane, isExternal, ok := m.list.SelectedMsgTarget()
+	if !ok {
+		return nil
+	}
+	m.composer.OpenBankConfirm(lane, isExternal)
+	m.state = stateBankConfirm
+	m.menu.SetState(ui.StateBankConfirm)
+	return nil
+}
+
+// markAnswered adds issue to the answered-marker set and pushes it straight
+// into the list, so the tick/dim shows on the very next render rather than
+// waiting up to feedRefreshInterval for the next tick.
+func (m *home) markAnswered(issue int) {
+	if issue == 0 {
+		return
+	}
+	if m.answeredIssues == nil {
+		m.answeredIssues = make(map[int]bool)
+	}
+	m.answeredIssues[issue] = true
+	m.list.SetAnsweredIssues(m.answeredIssues)
+}
+
+// pruneAnsweredIssues drops any answered-marker entry the rebuilt Needs-you
+// queue no longer carries (the spec's own "dropped when the rebuilt queue
+// no longer carries it") - called once per feed tick, right after the
+// queue itself is rebuilt.
+func (m *home) pruneAnsweredIssues(items []clarity.FeedItem) {
+	if len(m.answeredIssues) == 0 {
+		return
+	}
+	live := make(map[int]bool, len(items))
+	for _, it := range items {
+		if n, ok := clarity.BoardIssueNumber(it.Source); ok {
+			live[n] = true
+		}
+	}
+	for n := range m.answeredIssues {
+		if !live[n] {
+			delete(m.answeredIssues, n)
+		}
+	}
+}
+
+// addPendingComment queues a failed board comment for retry - attempts
+// starts at 1 (the send flow's own first attempt already happened), so the
+// retry queue below dispatches at most 4 more before abandoning at 5 total
+// (test 10).
+func (m *home) addPendingComment(issue int, body, sendResult string) {
+	if m.pendingComments == nil {
+		m.pendingComments = make(map[int]*pendingComment)
+	}
+	m.pendingComments[issue] = &pendingComment{body: body, sendResult: sendResult, attempts: 1, lastAttempt: time.Now()}
+}
+
+// retryPendingCommentsCmd dispatches a retry for every pending comment due
+// another attempt - never more often than clarity.BoardRetryInterval, never
+// past 5 attempts total (test 10). attempts/lastAttempt are bumped HERE, on
+// the main thread at dispatch time, not when the retry's own result comes
+// back - so two feed ticks landing close together (a slow gh call) can
+// never double-dispatch the same attempt.
+func (m *home) retryPendingCommentsCmd(now time.Time) tea.Cmd {
+	var cmds []tea.Cmd
+	for issue, p := range m.pendingComments {
+		if p.attempts >= 5 {
+			continue
+		}
+		if !p.lastAttempt.IsZero() && now.Sub(p.lastAttempt) < clarity.BoardRetryInterval {
+			continue
+		}
+		p.attempts++
+		p.lastAttempt = now
+		cmds = append(cmds, m.retryCommentCmd(issue, p.body, p.sendResult))
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
+}
+
+func (m *home) retryCommentCmd(issue int, body, sendResult string) tea.Cmd {
+	return func() tea.Msg {
+		if m.boardCache == nil {
+			m.boardCache = clarity.NewBoardCache()
+		}
+		err := m.boardCache.PostComment(issue, body)
+		return commentRetryMsg{issue: issue, sendResult: sendResult, err: err}
+	}
+}
+
+// checkBankWatch is the b-key bank flow's own feed-tick poll (the spec's
+// "Bank watch"): stops on the first CONTINUATION-*.md hit or on 30 minutes
+// elapsed, whichever comes first.
+func (m *home) checkBankWatch(now time.Time) {
+	if m.bankWatch == nil {
+		return
+	}
+	if now.After(m.bankWatch.deadline) {
+		m.bankWatch = nil
+		return
+	}
+	if path, ok := clarity.FindContinuationFile(m.bankWatch.dir, m.bankWatch.since); ok {
+		m.composer.UpdateBankResult(fmt.Sprintf("banked · %s", path))
+		m.bankWatch = nil
+	}
+}
+
+// sampleNeedsKey is the permission-prompt state word's own feed-tick
+// sample (ANSWER-AND-BANK-SPEC.md item 7, research item 7): every TRACKED
+// instance with a live tmux session gets its pane captured and classified;
+// anything else (paused, not started, dead tmux) reports false - external
+// lanes are never sampled at all (no tracked tmux session to capture),
+// exactly the "honest limit" the research leg named.
+func (m *home) sampleNeedsKey() {
+	for _, inst := range m.list.GetInstances() {
+		// Started guards TmuxAlive itself (Instance.RequiresCopyOnlySend's
+		// own "i.started && !i.TmuxAlive()" pattern) - an unstarted
+		// instance's tmuxSession is nil, and TmuxAlive dereferences it
+		// unconditionally.
+		if !inst.Started() || !inst.TmuxAlive() {
+			inst.SetNeedsKey(false)
+			continue
+		}
+		pane, err := inst.Preview()
+		if err != nil {
+			inst.SetNeedsKey(false)
+			continue
+		}
+		inst.SetNeedsKey(clarity.IsPermissionPrompt(pane))
 	}
 }
 

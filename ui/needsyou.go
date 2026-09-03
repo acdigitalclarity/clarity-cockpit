@@ -64,6 +64,12 @@ type NeedsYouInfo struct {
 	// a tea.Cmd), so this tick shows a plain "fetching" line instead of a
 	// stalled UI.
 	Loading bool
+	// Answered is true when this row's own y-key answer has already been
+	// sent this session (app.go's in-memory answered-marker set, keyed by
+	// board issue number) - never derived from Options itself; the option
+	// that was actually chosen and sent swaps its → marker for a ✓
+	// (ANSWER-AND-BANK-SPEC.md "Answered marker and its lifetime").
+	Answered bool
 }
 
 // NeedsYouPane renders the Needs-you tab.
@@ -111,6 +117,34 @@ func (p *NeedsYouPane) SetInfo(info *NeedsYouInfo) {
 // Clear is SetInfo(nil).
 func (p *NeedsYouPane) Clear() {
 	p.SetInfo(nil)
+}
+
+// needsYouGutter/needsYouMeasure are the reading layout's own numbers
+// (SESSION-READING-SPEC.md, adopted here verbatim per DECISIONS.md slice
+// 13's own ruling, carried into this slice by ANSWER-AND-BANK-SPEC.md's
+// "Carried in with this slice"): gutter 2 at the wide size, 1 narrow;
+// measure is min(96, width - gutter). Duplicated from ui/session.go's own
+// SessionPane.gutter/measure (unexported there, a different file/leg, and
+// keyed off contentWidth rather than the raw width this tab receives -
+// NeedsYouPane carries no separate pad() inset) since there is no shared
+// pane-geometry type today - see that file's own doc comment for the
+// underlying rule of thumb.
+func needsYouGutter(width int) int {
+	if width >= sessionWideMinWidth {
+		return 2
+	}
+	return 1
+}
+
+func needsYouMeasure(width int) int {
+	m := width - needsYouGutter(width)
+	if m > 96 {
+		m = 96
+	}
+	if m < 1 {
+		m = 1
+	}
+	return m
 }
 
 func (p *NeedsYouPane) contentAreaHeight() int {
@@ -256,7 +290,11 @@ func (p *NeedsYouPane) renderComposerLines() []string {
 // optionMarker/optionIndent are the "recommended option marked" glyph
 // (board #280 slice 5b DEFECT 1) and the matching blank indent every other
 // option, and every wrapped continuation line, lines up under.
+// answeredOptionMarker replaces optionMarker on the option that was
+// actually sent, once the row is answered (ANSWER-AND-BANK-SPEC.md
+// "Answered marker": "the card's sent option swaps → for ✓").
 const optionMarker = "→ "
+const answeredOptionMarker = "✓ "
 
 var optionIndent = strings.Repeat(" ", lipgloss.Width(optionMarker))
 
@@ -272,23 +310,56 @@ func buildNeedsYouContentLines(info NeedsYouInfo, width int) []string {
 	if info.Loading {
 		return []string{muteRule(width), "fetching the board row…"}
 	}
+	measure := needsYouMeasure(width)
 	if info.BoardUnreachable != "" {
 		lines := []string{muteRule(width)}
-		return append(lines, wrapPlain(collapseWS("board unreachable: "+info.BoardUnreachable), width)...)
+		return append(lines, readingProseLines("board unreachable: "+info.BoardUnreachable, measure)...)
 	}
 	var lines []string
 	lines = append(lines, muteRule(width))
-	lines = append(lines, renderExplanationLines(info.Explanation, width)...)
+	lines = append(lines, renderExplanationLines(info.Explanation, measure)...)
 	lines = append(lines, muteRule(width))
 	lines = append(lines, "Recommended response:")
-	lines = append(lines, renderOptionLines(info.Options, width)...)
+	lines = append(lines, renderOptionLines(info.Options, measure, info.Answered)...)
 	if info.ExpectedReply != "" {
 		lines = append(lines, "", "Expected reply:")
-		lines = append(lines, wrapPlain(collapseWS(info.ExpectedReply), width)...)
+		lines = append(lines, readingProseLines(info.ExpectedReply, measure)...)
 	}
 	if info.Also != "" {
 		lines = append(lines, "", "Also on the row:")
-		lines = append(lines, wrapPlain(collapseWS(info.Also), width)...)
+		lines = append(lines, readingProseLines(info.Also, measure)...)
+	}
+	return lines
+}
+
+// readingProseLines wraps text at measure preserving its own paragraphs and
+// list items (session.go's own splitProseBlocks/wrapTokens/tokenizeMarkdown/
+// renderTokenLine, same package) - the reading layout's own "rule 1: never
+// collapseWS a card's body" (DECISIONS.md slice 13, carried into this slice
+// per ANSWER-AND-BANK-SPEC.md's "Carried in with this slice"). Blocks are
+// left-flush (no gutter indent): the Needs-you tab reserves its own hanging
+// indent for wrapped list items only (splitProseBlocks' own marker), unlike
+// the Session tab's turns, which additionally nest every line under a tag/
+// time label line this tab has no equivalent of.
+func readingProseLines(text string, measure int) []string {
+	var lines []string
+	for _, block := range splitProseBlocks(text) {
+		listMarkerWidth := len([]rune(block.marker))
+		wrapWidth := measure - listMarkerWidth
+		if wrapWidth < 10 {
+			wrapWidth = 10
+		}
+		for i, wline := range wrapTokens(tokenizeMarkdown(block.text), wrapWidth) {
+			prefix := ""
+			switch {
+			case block.marker == "":
+			case i == 0:
+				prefix = block.marker
+			default:
+				prefix = strings.Repeat(" ", listMarkerWidth)
+			}
+			lines = append(lines, prefix+renderTokenLine(wline))
+		}
 	}
 	return lines
 }
@@ -297,7 +368,7 @@ func buildNeedsYouContentLines(info NeedsYouInfo, width int) []string {
 // each a small plain-word label followed by its own wrapped text, blank-
 // line separated - or, for the no-headings free-prose fallback (a single
 // section with an empty Label), just the wrapped text on its own.
-func renderExplanationLines(sections []clarity.BoardSection, width int) []string {
+func renderExplanationLines(sections []clarity.BoardSection, measure int) []string {
 	if len(sections) == 0 {
 		return []string{"no explanation on the row"}
 	}
@@ -309,7 +380,7 @@ func renderExplanationLines(sections []clarity.BoardSection, width int) []string
 		if s.Label != "" {
 			lines = append(lines, s.Label)
 		}
-		lines = append(lines, wrapPlain(collapseWS(s.Text), width)...)
+		lines = append(lines, readingProseLines(s.Text, measure)...)
 	}
 	return lines
 }
@@ -318,20 +389,29 @@ func renderExplanationLines(sections []clarity.BoardSection, width int) []string
 // and continuation-indented when an option overruns width), the
 // recommended one prefixed with optionMarker and every other line - marked
 // or not - left-padded to the same column so the list stays aligned.
-func renderOptionLines(opts []clarity.BoardOption, width int) []string {
+func renderOptionLines(opts []clarity.BoardOption, measure int, answered bool) []string {
 	if len(opts) == 0 {
 		return []string{"no recommendation on the row"}
 	}
+	chosenIdx := -1
+	if answered {
+		if _, idx, ok := clarity.ChosenOption(opts); ok {
+			chosenIdx = idx
+		}
+	}
 	indentWidth := lipgloss.Width(optionMarker)
 	var lines []string
-	for _, o := range opts {
+	for i, o := range opts {
 		marker := optionIndent
-		if o.Recommended {
+		switch {
+		case i == chosenIdx:
+			marker = answeredOptionMarker
+		case o.Recommended:
 			marker = optionMarker
 		}
-		wrapped := wrapPlain(collapseWS(o.Text), maxInt0(width-indentWidth))
-		for i, w := range wrapped {
-			if i == 0 {
+		wrapped := wrapPlain(collapseWS(o.Text), maxInt0(measure-indentWidth))
+		for j, w := range wrapped {
+			if j == 0 {
 				lines = append(lines, marker+w)
 			} else {
 				lines = append(lines, optionIndent+w)
