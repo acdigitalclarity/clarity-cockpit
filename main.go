@@ -204,34 +204,56 @@ var (
 
 			account, modality := resolveAttachSeat(accountFlag, modalityFlag, lanePath)
 
-			for _, existing := range instances {
-				if existing.Title == lane && existing.Account() == account {
-					return fmt.Errorf("an instance named %q already exists on account %q (status %v) - kill it first, or reattach to it from cs", lane, account, existing.Status)
+			// Board #317: a lane whose program ended on its own (no ctrl-q)
+			// lands here Paused, same as a dead session found on reload
+			// (NewInstanceFromStorage). Resume it in place instead of
+			// refusing - only a still-live instance for this lane+account is
+			// a real conflict. The decision itself is attachResumeDecision,
+			// pulled out the same way resolveAttachSeat above is: testable
+			// without a real tmux Resume()/Attach() call.
+			existing, conflictErr := attachResumeDecision(instances, lane, account)
+			if conflictErr != nil {
+				return conflictErr
+			}
+
+			var inst *session.Instance
+			if existing != nil {
+				if err := existing.Resume(); err != nil {
+					return fmt.Errorf("failed to resume instance %q: %w", lane, err)
 				}
+				if err := storage.SaveInstances(instances); err != nil {
+					return fmt.Errorf("failed to save instance %q: %w", lane, err)
+				}
+				fmt.Printf("clarity-attach: resumed %q (was paused)\n", lane)
+				inst = existing
 			}
 
-			inst, err := session.NewInstance(session.InstanceOptions{
-				Title:      lane,
-				Path:       lanePath,
-				Program:    program,
-				NoWorktree: true,
-				Account:    account,
-				Modality:   modality,
-			})
-			if err != nil {
-				return fmt.Errorf("failed to create instance: %w", err)
+			if inst == nil {
+				created, err := session.NewInstance(session.InstanceOptions{
+					Title:      lane,
+					Path:       lanePath,
+					Program:    program,
+					NoWorktree: true,
+					Account:    account,
+					Modality:   modality,
+				})
+				if err != nil {
+					return fmt.Errorf("failed to create instance: %w", err)
+				}
+
+				if err := created.Start(true); err != nil {
+					return fmt.Errorf("failed to start instance: %w", err)
+				}
+
+				instances = append(instances, created)
+				if err := storage.SaveInstances(instances); err != nil {
+					return fmt.Errorf("failed to save instance %q: %w", lane, err)
+				}
+				inst = created
+
+				fmt.Printf("clarity-attach: %q running %s in %s (no git worktree)\n", lane, program, lanePath)
 			}
 
-			if err := inst.Start(true); err != nil {
-				return fmt.Errorf("failed to start instance: %w", err)
-			}
-
-			instances = append(instances, inst)
-			if err := storage.SaveInstances(instances); err != nil {
-				return fmt.Errorf("failed to save instance %q: %w", lane, err)
-			}
-
-			fmt.Printf("clarity-attach: %q running %s in %s (no git worktree)\n", lane, program, lanePath)
 			fmt.Println("Attaching now - ctrl-q (or ctrl-]) returns to the cockpit (the instance keeps running; `cs` lists it by lane name).")
 
 			// Put our own stdin/stdout into raw mode for the duration of the
@@ -460,6 +482,29 @@ func resolveAttachSeat(accountFlag, modalityFlag, lanePath string) (account, mod
 		modality = clarity.ModalityFromLaneDir(lanePath)
 	}
 	return account, modality
+}
+
+// attachResumeDecision resolves clarity-attach's own resume-vs-conflict-vs-
+// create branch (board #317 item 4) against the already-loaded instances
+// list, with no side effects - split out the same way resolveAttachSeat
+// above is, so this decision is testable without a real tmux Resume() call.
+//
+// existing is non-nil only when a stored instance for this lane+account is
+// Paused and should be resumed in place. conflictErr is non-nil when one
+// already exists and is NOT paused - still live, the caller must refuse
+// rather than start a second program in the same folder. Both nil means no
+// existing instance for this lane+account: the caller creates a new one.
+func attachResumeDecision(instances []*session.Instance, lane, account string) (existing *session.Instance, conflictErr error) {
+	for _, inst := range instances {
+		if inst.Title != lane || inst.Account() != account {
+			continue
+		}
+		if inst.Status != session.Paused {
+			return nil, fmt.Errorf("an instance named %q already exists on account %q (status %v) - kill it first, or reattach to it from cs", lane, account, inst.Status)
+		}
+		return inst, nil
+	}
+	return nil, nil
 }
 
 func init() {

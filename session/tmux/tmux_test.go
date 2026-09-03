@@ -2,12 +2,15 @@ package tmux
 
 import (
 	cmd2 "claude-squad/cmd"
+	"context"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"claude-squad/cmd/cmd_test"
@@ -130,4 +133,72 @@ func TestRestoreAttachesWhenSessionExists(t *testing.T) {
 	require.NoError(t, session.Restore())
 	require.Len(t, ptyFactory.cmds, 1)
 	require.Contains(t, ptyFactory.cmds[0].String(), "attach-session")
+}
+
+// TestRunAttachCopyLoop_EOFBeforeCancel_YieldsEndedAndWritesNothingToStderr
+// is board #317's own goroutine-level proof: a pty reader that hits EOF
+// before the attach's context is cancelled - the program running inside
+// tmux exited on its own, nobody pressed Ctrl-Q/Ctrl-] - must report
+// ErrSessionEnded and must never write the old red "Session terminated
+// without detaching" line to stderr. That line used to print AND leave the
+// channel Attach returned unclosed forever, since nothing else was ever
+// going to call Detach to close it - the actual hang the owner hit.
+func TestRunAttachCopyLoop_EOFBeforeCancel_YieldsEndedAndWritesNothingToStderr(t *testing.T) {
+	session := NewTmuxSessionWithDeps("ended", "program", NewMockPtyFactory(t), cmd_test.MockCmdExec{})
+
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	origStderr := os.Stderr
+	os.Stderr = w
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	outcome := session.runAttachCopyLoop(ctx, io.Discard, strings.NewReader(""))
+
+	require.NoError(t, w.Close())
+	os.Stderr = origStderr
+	captured, err := io.ReadAll(r)
+	require.NoError(t, err)
+
+	require.ErrorIs(t, outcome, ErrSessionEnded)
+	require.Empty(t, captured, "the copy loop must never write to stderr")
+}
+
+// TestRunAttachCopyLoop_CtxAlreadyCancelled_YieldsNil is the normal-detach
+// counterpart: Detach cancels the context before the copy loop's read
+// unblocks, so the outcome is nil - a real Ctrl-Q/Ctrl-] detach, not an
+// ended session.
+func TestRunAttachCopyLoop_CtxAlreadyCancelled_YieldsNil(t *testing.T) {
+	session := NewTmuxSessionWithDeps("detached", "program", NewMockPtyFactory(t), cmd_test.MockCmdExec{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	outcome := session.runAttachCopyLoop(ctx, io.Discard, strings.NewReader(""))
+	require.NoError(t, outcome)
+}
+
+// TestDetach_AfterDetachSafely_DoesNotPanic reproduces a crash found on a
+// live attach (leg report, board #317): the stdin-reading goroutine that
+// calls Detach on a Ctrl-Q/Ctrl-] byte has no way to be cancelled
+// (os.Stdin.Read is a blocking syscall, not a select), so it can outlive an
+// ended-without-detach cycle's own DetachSafely teardown and call Detach a
+// second time on the same TmuxSession once DetachSafely has already nilled
+// t.ptmx/t.attachCh - "panic: error closing attach pty session: invalid
+// argument" then "panic: close of nil channel" on HEAD before this fix.
+func TestDetach_AfterDetachSafely_DoesNotPanic(t *testing.T) {
+	tmpFile, err := os.CreateTemp(t.TempDir(), "ptmx")
+	require.NoError(t, err)
+
+	session := NewTmuxSessionWithDeps("stale-detach", "program", NewMockPtyFactory(t), cmd_test.MockCmdExec{})
+	session.ptmx = tmpFile
+	session.attachCh = make(chan struct{})
+	session.wg = &sync.WaitGroup{}
+	session.ctx, session.cancel = context.WithCancel(context.Background())
+
+	require.NoError(t, session.DetachSafely())
+
+	require.NotPanics(t, func() { session.Detach() },
+		"a second, stale Detach call after DetachSafely has already torn the cycle down must be a no-op, never a panic")
 }

@@ -51,6 +51,12 @@ type TmuxSession struct {
 	//
 	// Channel to be closed at the very end of detaching. Used to signal callers.
 	attachCh chan struct{}
+	// attachOutcome is set by the Attach copy-loop goroutine just before
+	// attachCh closes: nil for a real Ctrl-Q/Ctrl-] detach, ErrSessionEnded
+	// when the pty went away on its own. Read via LastAttachOutcome once the
+	// channel Attach returned has closed - that close is the synchronization
+	// point, so no separate lock is needed.
+	attachOutcome error
 	// While attached, we use some goroutines to manage the window size and stdin/stdout. This stuff
 	// is used to terminate them on Detach. We don't want them to outlive the attached window.
 	ctx    context.Context
@@ -82,6 +88,14 @@ const TmuxPrefix = "claudesquad_"
 // ErrSessionNotFound is returned when the tmux session backing an instance is gone, which
 // happens whenever the tmux server dies (reboot, crash, `tmux kill-server`).
 var ErrSessionNotFound = errors.New("tmux session no longer exists")
+
+// ErrSessionEnded is Attach's completion outcome (read via LastAttachOutcome,
+// once the channel Attach returned has closed) when the program running
+// inside tmux exited on its own - Ctrl-D, `exit`, a crash - before Ctrl-Q or
+// Ctrl-] was pressed. Nothing calls Detach in that case, so the goroutine
+// that notices the pty went away finishes the teardown itself (board #317).
+// A real Ctrl-Q/Ctrl-] detach leaves LastAttachOutcome nil.
+var ErrSessionEnded = errors.New("tmux session ended before it was detached")
 
 var whiteSpaceRegex = regexp.MustCompile(`\s+`)
 
@@ -294,8 +308,41 @@ func isDetachByte(nr int, b byte) bool {
 	return nr == 1 && (b == 17 || b == 29)
 }
 
+// runAttachCopyLoop copies the attached pty's output to dst until it returns
+// EOF or any other read error, then reports how the attach ended: nil when
+// ctx is already cancelled (Detach is already in flight and owns teardown),
+// ErrSessionEnded otherwise - the pty went away before a detach was
+// requested. Split out from the Attach goroutine so the outcome can be
+// exercised directly against a fake src, with no real pty or stdin involved.
+func (t *TmuxSession) runAttachCopyLoop(ctx context.Context, dst io.Writer, src io.Reader) error {
+	_, _ = io.Copy(dst, src)
+	select {
+	case <-ctx.Done():
+		return nil
+	default:
+		return ErrSessionEnded
+	}
+}
+
+// LastAttachOutcome reports how the most recent Attach ended, once the
+// channel it returned has closed: nil for a real Ctrl-Q/Ctrl-] detach,
+// ErrSessionEnded when the program running inside tmux exited on its own.
+// Reading before the channel closes is a race; the channel close is the
+// synchronization point this relies on.
+func (t *TmuxSession) LastAttachOutcome() error {
+	return t.attachOutcome
+}
+
 func (t *TmuxSession) Attach() (chan struct{}, error) {
-	t.attachCh = make(chan struct{})
+	// Captured locally and returned from that copy, never by re-reading
+	// t.attachCh at the end of this function: board #317's ended-without-
+	// detach path can now finish (DetachSafely, nilling t.attachCh) before
+	// this function itself reaches its own return statement, when the pty
+	// EOFs about as fast as a goroutine can be scheduled - a data race
+	// between that write and a read of the struct field here.
+	ch := make(chan struct{})
+	t.attachCh = ch
+	t.attachOutcome = nil
 
 	// Put the real terminal into raw mode for the duration of the attach -
 	// see stdinRawState's own comment for why this loop needs it regardless
@@ -314,6 +361,17 @@ func (t *TmuxSession) Attach() (chan struct{}, error) {
 	t.wg.Add(1)
 	t.ctx, t.cancel = context.WithCancel(context.Background())
 
+	// monitorWindowSize adds its own two goroutines to t.wg before returning
+	// (it starts them, doesn't wait for them). Called here, before either
+	// goroutine below is spawned, so t.wg's count is never at risk of
+	// reaching zero prematurely: the copy-loop goroutine below can (board
+	// #317) finish and hand off to DetachSafely - which waits on t.wg and
+	// then nils t.ctx/t.wg - the moment its own io.Copy returns, which can
+	// be near-instant against a pty that's already gone. Calling
+	// monitorWindowSize after spawning that goroutine would race its
+	// t.wg.Add(2) against DetachSafely's t.wg.Wait()/nil-out.
+	t.monitorWindowSize()
+
 	// The first goroutine should terminate when the ptmx is closed. We use the
 	// waitgroup to wait for it to finish.
 	// The 2nd one returns when you press escape to Detach. It doesn't need to be
@@ -321,17 +379,27 @@ func (t *TmuxSession) Attach() (chan struct{}, error) {
 	// all the other ones.
 	go func() {
 		defer t.wg.Done()
-		_, _ = io.Copy(os.Stdout, t.ptmx)
-		// When io.Copy returns, it means the connection was closed
-		// This could be due to normal detach or Ctrl-D
-		// Check if the context is done to determine if it was a normal detach
-		select {
-		case <-t.ctx.Done():
-			// Normal detach, do nothing
-		default:
-			// If context is not done, it was likely an abnormal termination (Ctrl-D)
-			// Print warning message
-			fmt.Fprintf(os.Stderr, "\n\033[31mError: Session terminated without detaching. Use Ctrl-Q (or Ctrl-]) to properly detach from tmux sessions.\033[0m\n")
+		// When io.Copy returns, the connection was closed - either a normal
+		// detach (Detach already cancelled the context and owns the rest of
+		// teardown) or the program running inside tmux exited on its own
+		// (Ctrl-D, `exit`, a crash: the context is still live). Board #317:
+		// this used to print a red stderr line and stop, leaving attachCh
+		// unclosed forever in the second case - nothing else was ever going
+		// to call Detach, so the caller's <-ch blocked and the cockpit never
+		// came back. Record the outcome instead, and finish the teardown
+		// itself when nobody else will.
+		outcome := t.runAttachCopyLoop(t.ctx, os.Stdout, t.ptmx)
+		t.attachOutcome = outcome
+		if outcome != nil {
+			// DetachSafely closes attachCh, cancels the context and waits on
+			// t.wg - run it in its own goroutine so this one's deferred
+			// wg.Done() above fires first; calling it inline here would
+			// deadlock DetachSafely's wg.Wait() against this very goroutine.
+			go func() {
+				if err := t.DetachSafely(); err != nil {
+					log.WarningLog.Printf("cleanup after attach ended without detach: %v", err)
+				}
+			}()
 		}
 	}()
 
@@ -383,8 +451,7 @@ func (t *TmuxSession) Attach() (chan struct{}, error) {
 		}
 	}()
 
-	t.monitorWindowSize()
-	return t.attachCh, nil
+	return ch, nil
 }
 
 // restoreStdinRawState reverses whatever Attach's own term.MakeRaw call did
@@ -447,10 +514,30 @@ func (t *TmuxSession) DetachSafely() error {
 // Detach disconnects from the current tmux session. It panics if detaching fails. At the moment, there's no
 // way to recover from a failed detach.
 func (t *TmuxSession) Detach() {
+	// Board #317: nothing to detach - DetachSafely already tore this attach
+	// cycle down (t.ptmx is nil, same invariant DetachSafely itself checks
+	// via t.attachCh). Without this guard, t.ptmx.Close() below returns
+	// os.ErrInvalid on a nil receiver and this function panics on a normal,
+	// already-finished cycle - reachable from the stdin-reading goroutine's
+	// own leftover Ctrl-Q/Ctrl-] handling (see the deferred close below).
+	if t.ptmx == nil {
+		return
+	}
+
 	// TODO: control flow is a bit messy here. If there's an error,
 	// I'm not sure if we get into a bad state. Needs testing.
 	defer func() {
-		close(t.attachCh)
+		// Board #317: attachCh can already be nil here - the stdin-reading
+		// goroutine that calls Detach on a Ctrl-Q/Ctrl-] byte has no way to
+		// be cancelled (os.Stdin.Read is a blocking syscall, not a select),
+		// so it outlives an ended-without-detach cycle's own DetachSafely
+		// teardown; a keystroke it reads afterwards (meant for the NEXT
+		// attach on this same TmuxSession) reaches this same deferred close
+		// on an already-nil channel - close(nil) panics unconditionally, so
+		// this is checked exactly like DetachSafely already checks it.
+		if t.attachCh != nil {
+			close(t.attachCh)
+		}
 		t.attachCh = nil
 		t.cancel = nil
 		t.ctx = nil

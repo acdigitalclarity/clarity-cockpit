@@ -774,12 +774,25 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.instanceChanged()
 	case instanceAttachFinishedMsg:
 		// A tracked instance's tea.Exec attach (attachInstanceCmd) returned -
-		// detached (ctrl-q) or never started. Either way the terminal is back
-		// under bubbletea's own control by the time this message is handled
-		// (tea.Exec's callback runs after RestoreTerminal - exec.go).
+		// detached (ctrl-q), the program inside tmux ended on its own without
+		// a detach (board #317), or never started. Either way the terminal is
+		// back under bubbletea's own control by the time this message is
+		// handled (tea.Exec's callback runs after RestoreTerminal - exec.go).
 		m.state = stateDefault
 		if msg.err != nil {
 			return m, m.handleError(msg.err)
+		}
+		if selected := m.list.GetSelectedInstance(); selected != nil && selected.AttachEndedWithoutDetach() {
+			// The program running inside tmux exited on its own - nothing
+			// called Detach. Land back on the list the same way a dead
+			// session found on reload does: Paused, no error box, no red
+			// line (session/instance.go Start's own Paused-on-missing-
+			// session path).
+			selected.SetStatus(session.Paused)
+			return m, tea.Batch(
+				m.instanceChanged(),
+				m.setStatus(fmt.Sprintf("%s ended; r or enter resumes it", selected.Title)),
+			)
 		}
 		// Front-door slice 7: if this attach was the owner's own login pane
 		// (handleLoginKey), flip its Program back to the normal launch now
@@ -1644,17 +1657,42 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 		if selected == nil {
 			return m, nil
 		}
+		if selected.Paused() {
+			// Board #317: enter on a Paused row resumes it, exactly what the
+			// r key does, then attaches straight into it - the owner should
+			// never need both keys to get back into a lane that ended on
+			// its own. Checked BEFORE the NoWorktree "own terminal" guard
+			// below on purpose: every board #317 lane this leg fixes IS a
+			// NoWorktree lane (clarity-attach lanes and every "n"-created
+			// lane both are - session.startNewLane), and a Paused NoWorktree
+			// lane has a dead tmux session almost by definition, so the
+			// TmuxAlive()-based guard below would otherwise intercept every
+			// single one of them with a misleading "runs in your own
+			// terminal" line instead of actually resuming - proven live
+			// (leg report) before this ordering was fixed.
+			if err := selected.Resume(); err != nil {
+				return m, m.handleError(err)
+			}
+			return m.showHelpScreen(helpTypeInstanceAttach{}, func() tea.Cmd {
+				return attachInstanceCmd(m.list.Attach)
+			})
+		}
 		if selected.NoWorktree && !selected.TmuxAlive() {
 			// This lane runs in the owner's own terminal (a Clarity session
 			// lane started via clarity-attach) - attaching here would start
 			// a SECOND Claude in the same folder (slice 8 rule 2). Say so
 			// plainly rather than silently no-op-ing or (the pre-fix bug)
 			// walking a git-worktree resume path that does not exist for a
-			// NoWorktree instance.
+			// NoWorktree instance. Never reached for a Paused row (above) -
+			// only for a non-Paused status whose session died without being
+			// reconciled yet (e.g. the tmux server itself died mid-session).
 			return m, m.setStatus("this lane runs in your own terminal; tab to Terminal for a shell in its folder")
 		}
-		if selected.Paused() || selected.Status == session.Loading || !selected.TmuxAlive() {
-			return m, nil
+		if selected.Status == session.Loading {
+			return m, m.setStatus("starting; try again in a moment")
+		}
+		if !selected.TmuxAlive() {
+			return m, m.setStatus("tmux not alive for this lane")
 		}
 		// A tracked row attaches through its own tmux session regardless of
 		// which tab is active (DECISIONS.md slice 6: "Enter on a tracked row
