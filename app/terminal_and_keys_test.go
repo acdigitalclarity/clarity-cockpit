@@ -121,6 +121,19 @@ func homeWithMockedTerminal(t *testing.T, termStartFails bool) *home {
 // active, when that lane's term_ shell failed to open - the footer shows
 // the "no terminal yet" line, never a claimed attach to the owner's own
 // terminal.
+//
+// Board slice 9: Enter no longer runs the attach inline inside Update() (the
+// bug being fixed here was exactly that inline blocking read of os.Stdin
+// racing bubbletea's own reader - see app/attach_exec.go). Enter now returns
+// a tea.Cmd wrapping tea.Exec, which only a real Program can run (it hands
+// bubbletea's own terminal reader off and back on - see the passing
+// end-to-end proof in the leg report, not reproducible headless). What IS
+// unit-testable here, and is tested in the two steps below: (1) Enter
+// dispatches something (a non-nil Cmd) rather than silently no-op'ing, and
+// (2) once the executor's result comes back as a terminalAttachFinishedMsg
+// (exactly what tea.Exec's callback would send after a failed
+// AttachTerminal, termStartFails=true here), Update() sets the same footer
+// line the old inline code used to set synchronously.
 func TestKeyEnter_ExternalRow_TerminalTab_NoShellYet_ShowsFooterLine(t *testing.T) {
 	h := homeWithMockedTerminal(t, true)
 	h.list.SetExternal([]clarity.ExternalLane{{Name: "scratchfix-ext", WorkDir: t.TempDir()}})
@@ -130,10 +143,82 @@ func TestKeyEnter_ExternalRow_TerminalTab_NoShellYet_ShowsFooterLine(t *testing.
 	pressGlobalKey(h, tea.KeyPressMsg{Code: tea.KeyTab})
 	require.Equal(t, ui.TerminalTab, h.tabbedWindow.GetActiveTab())
 
-	pressGlobalKey(h, tea.KeyPressMsg{Code: tea.KeyEnter})
+	_, cmd := pressGlobalKey(h, tea.KeyPressMsg{Code: tea.KeyEnter})
+	require.NotNil(t, cmd, "Enter on an attachable external row must dispatch the attach, not no-op")
+
+	// Simulate the framework delivering the executor's outcome: this is
+	// exactly the terminalAttachFinishedMsg attachTerminalCmd's callback
+	// sends once tea.Exec's blocking Run() returns the AttachTerminal error
+	// (attach_exec.go).
+	_, _ = h.Update(terminalAttachFinishedMsg{err: fmt.Errorf("no session")})
 
 	require.Equal(t, "no terminal for this lane yet: press tab to Terminal first", h.statusText)
 	require.Equal(t, stateDefault, h.state)
+}
+
+// TestAttachExec_Run_BlocksUntilChannelClosesThenReturnsNil proves the new
+// tea.Exec adapter (attach_exec.go) keeps the current blocking contract:
+// Run() does not return until the started attach's own channel closes
+// (session/tmux/tmux.go closes it on Detach) - the same handoff moment the
+// old inline `<-ch` used to wait on inside Update().
+func TestAttachExec_Run_BlocksUntilChannelClosesThenReturnsNil(t *testing.T) {
+	ch := make(chan struct{})
+	started := make(chan struct{})
+	a := &attachExec{start: func() (chan struct{}, error) {
+		close(started)
+		return ch, nil
+	}}
+
+	done := make(chan error, 1)
+	go func() { done <- a.Run() }()
+
+	<-started
+	select {
+	case err := <-done:
+		t.Fatalf("Run() returned early with %v before the channel closed", err)
+	default:
+	}
+
+	close(ch)
+	require.NoError(t, <-done)
+}
+
+// TestAttachExec_Run_PropagatesStartError proves a start failure (the
+// tracked-instance-not-started / AttachTerminal-session-missing case) is
+// returned immediately, without ever waiting on a channel that will never
+// close.
+func TestAttachExec_Run_PropagatesStartError(t *testing.T) {
+	wantErr := fmt.Errorf("scratchfix start failed")
+	a := &attachExec{start: func() (chan struct{}, error) {
+		return nil, wantErr
+	}}
+	require.ErrorIs(t, a.Run(), wantErr)
+}
+
+// TestInstanceAttachFinishedMsg_Error routes the tracked-instance attach
+// callback's error through the same handleError path handleKeyPress's old
+// inline `if err != nil { m.handleError(err) }` used.
+func TestInstanceAttachFinishedMsg_Error(t *testing.T) {
+	h := homeWithMockedTerminal(t, false)
+	h.state = stateHelp
+
+	wantErr := fmt.Errorf("scratchfix attach failed")
+	_, _ = h.Update(instanceAttachFinishedMsg{err: wantErr})
+
+	require.Equal(t, stateDefault, h.state)
+	require.True(t, h.hasErr)
+}
+
+// TestInstanceAttachFinishedMsg_Success proves a clean detach (ctrl-q, no
+// error) returns to the default state without raising an error.
+func TestInstanceAttachFinishedMsg_Success(t *testing.T) {
+	h := homeWithMockedTerminal(t, false)
+	h.state = stateHelp
+
+	_, _ = h.Update(instanceAttachFinishedMsg{err: nil})
+
+	require.Equal(t, stateDefault, h.state)
+	require.False(t, h.hasErr)
 }
 
 // TestKeyCopy_ComposerOpen_CopiesComposerText proves c copies the

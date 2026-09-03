@@ -592,6 +592,23 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case instanceChangedMsg:
 		// Handle instance changed after confirmation action
 		return m, m.instanceChanged()
+	case instanceAttachFinishedMsg:
+		// A tracked instance's tea.Exec attach (attachInstanceCmd) returned -
+		// detached (ctrl-q) or never started. Either way the terminal is back
+		// under bubbletea's own control by the time this message is handled
+		// (tea.Exec's callback runs after RestoreTerminal - exec.go).
+		m.state = stateDefault
+		if msg.err != nil {
+			return m, m.handleError(msg.err)
+		}
+		return m, m.instanceChanged()
+	case terminalAttachFinishedMsg:
+		// A Terminal-tab external-lane attach (attachTerminalCmd) returned.
+		m.state = stateDefault
+		if msg.err != nil {
+			return m, m.setStatus("no terminal for this lane yet: press tab to Terminal first")
+		}
+		return m, nil
 	case instanceStartedMsg:
 		// Select the instance that just started (or failed)
 		m.list.SelectInstance(msg.instance)
@@ -1094,13 +1111,12 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 		}
 
 		// Show help screen before pausing
-		m.showHelpScreen(helpTypeInstanceCheckout{}, func() {
+		return m.showHelpScreen(helpTypeInstanceCheckout{}, func() tea.Cmd {
 			if err := selected.Pause(); err != nil {
-				m.handleError(err)
+				return m.handleError(err)
 			}
-			m.instanceChanged()
+			return m.instanceChanged()
 		})
-		return m, nil
 	case keys.KeyMoveUp:
 		if m.list.MoveUp() {
 			if err := m.storage.SaveInstances(m.list.GetInstances()); err != nil {
@@ -1146,17 +1162,11 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 		// is not the right answer - see DECISIONS.md slice 6).
 		if m.tabbedWindow.IsInTerminalTab() {
 			if ext, ok := m.list.GetSelectedExternalLane(); ok {
-				m.showHelpScreen(helpTypeInstanceAttach{}, func() {
-					ch, err := m.tabbedWindow.AttachTerminal(ext.Name)
-					if err != nil {
-						m.state = stateDefault
-						m.setStatus("no terminal for this lane yet: press tab to Terminal first")
-						return
-					}
-					<-ch
-					m.state = stateDefault
+				return m.showHelpScreen(helpTypeInstanceAttach{}, func() tea.Cmd {
+					return attachTerminalCmd(func() (chan struct{}, error) {
+						return m.tabbedWindow.AttachTerminal(ext.Name)
+					})
 				})
-				return m, nil
 			}
 		}
 		if m.list.NumInstances() == 0 {
@@ -1171,17 +1181,9 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 		// still attaches, upstream behaviour") - the Terminal tab merely
 		// mirrors that same session, it never owns a separate one for a
 		// tracked instance.
-		m.showHelpScreen(helpTypeInstanceAttach{}, func() {
-			ch, err := m.list.Attach()
-			if err != nil {
-				m.handleError(err)
-				return
-			}
-			<-ch
-			m.state = stateDefault
-			m.instanceChanged()
+		return m.showHelpScreen(helpTypeInstanceAttach{}, func() tea.Cmd {
+			return attachInstanceCmd(m.list.Attach)
 		})
-		return m, nil
 	case keys.KeyCopy:
 		return m, m.handleCopy()
 	case keys.KeyOpenFolder:
