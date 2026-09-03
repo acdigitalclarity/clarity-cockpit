@@ -73,7 +73,7 @@ func TestTranscriptWatch_RetargetsOnSelectionChange(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv(clarity.ClaudeProjectsRootEnvVar, root)
 
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	now := time.Now()
 	a := writeTrackedLaneFixture(t, root, "lane-a", now.Add(-time.Minute))
 	b := writeTrackedLaneFixture(t, root, "lane-b", now.Add(-time.Minute))
@@ -115,7 +115,7 @@ func TestTranscriptWatch_EventTriggersCacheRead(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv(clarity.ClaudeProjectsRootEnvVar, root)
 
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	now := time.Now()
 	inst := writeTrackedLaneFixture(t, root, "watched-lane", now.Add(-time.Minute))
 	h.list.AddInstance(inst)()
@@ -158,7 +158,7 @@ func TestTranscriptWatch_StaleGenerationIgnored(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv(clarity.ClaudeProjectsRootEnvVar, root)
 
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	now := time.Now()
 	inst := writeTrackedLaneFixture(t, root, "watched-lane", now.Add(-time.Minute))
 	h.list.AddInstance(inst)()
@@ -190,7 +190,7 @@ func TestTranscriptWatch_ClosesOnQuit(t *testing.T) {
 	scratchHome := t.TempDir()
 	t.Setenv("HOME", scratchHome) // config.GetConfigDir - never the real ~/.claude-squad store
 
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	state := config.LoadState()
 	storage, err := session.NewStorage(state)
 	require.NoError(t, err)

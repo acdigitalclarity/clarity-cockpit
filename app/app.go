@@ -57,6 +57,12 @@ const (
 	// send-into-tmux for the selected row, tracked instance or external
 	// lane alike (Digital Clarity workspace enhancement).
 	stateMsg
+	// stateSessionPicker is the v-key turn picker on the Session tab (slice
+	// 22, PART B): up/down move the highlight between the selected lane's
+	// own loaded turns, c copies the highlighted one, esc leaves - all
+	// intercepted here, same shape as stateMsg above, so ordinary list
+	// navigation is suspended while the picker is open.
+	stateSessionPicker
 )
 
 type home struct {
@@ -102,6 +108,13 @@ type home struct {
 	menu *ui.Menu
 	// tabbedWindow displays the tabbed window with preview and diff panes
 	tabbedWindow *ui.TabbedWindow
+	// sessionPane is the SAME *ui.SessionPane instance handed into
+	// tabbedWindow's own construction (ui.NewTabbedWindow) - kept here too
+	// (slice 22, PART B) so handleCopy/handleCopyTail/handleOpenPicker can
+	// reach its own copy/picker methods directly, without TabbedWindow (a
+	// different leg's own file, pane-19/pane-21) needing a new passthrough
+	// method for each one.
+	sessionPane *ui.SessionPane
 	// errBox displays error messages
 	errBox *ui.ErrBox
 	// statusBox displays ephemeral non-error status text - currently just
@@ -210,6 +223,7 @@ func newHome(ctx context.Context, program string, autoYes bool, noSplash bool) *
 		spinner:      spinner.New(spinner.WithSpinner(spinner.MiniDot)),
 		menu:         ui.NewMenu(),
 		tabbedWindow: ui.NewTabbedWindow(sessionPane, needsYouPane, ui.NewTerminalPane()),
+		sessionPane:  sessionPane,
 		errBox:       ui.NewErrBox(),
 		statusBox:    ui.NewStatusBox(),
 		storage:      storage,
@@ -785,7 +799,11 @@ func (m *home) handleMenuHighlighting(msg tea.KeyPressMsg) (cmd tea.Cmd, returnE
 		m.keySent = false
 		return nil, false
 	}
-	if m.state == statePrompt || m.state == stateHelp || m.state == stateConfirm || m.state == stateMsg {
+	// stateSessionPicker (slice 22, PART B) joins stateMsg here - the v-key
+	// picker's own up/down/c/esc dispatch is direct and single-pass, same
+	// reason stateMsg's composer typing is: the menu has no highlight state
+	// for any of those keys while a modal like this owns them outright.
+	if m.state == statePrompt || m.state == stateHelp || m.state == stateConfirm || m.state == stateMsg || m.state == stateSessionPicker {
 		return nil, false
 	}
 	// If it's in the global keymap, we should try to highlight it.
@@ -1050,6 +1068,36 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 		return m, nil
 	}
 
+	// Handle the Session tab's turn picker (v key, slice 22 PART B): esc/
+	// ctrl+c leave it (never the global quit - same shape as stateMsg's own
+	// ctrl+c above), up/down move the highlight, c copies it. Any other key
+	// is swallowed - the picker is modal, same as the composer.
+	if m.state == stateSessionPicker {
+		if msg.String() == "ctrl+c" || msg.Code == tea.KeyEsc {
+			m.sessionPane.ClosePicker()
+			m.state = stateDefault
+			return m, nil
+		}
+		name, ok := keys.GlobalKeyStringsMap[msg.String()]
+		if !ok {
+			return m, nil
+		}
+		switch name {
+		case keys.KeyUp:
+			m.sessionPane.PickerOlder()
+		case keys.KeyDown:
+			m.sessionPane.PickerNewer()
+		case keys.KeyCopy:
+			if text, lines, ok := m.sessionPane.PickerCopyText(); ok {
+				if err := clarity.CopyToClipboard(m.cmdExec, text); err != nil {
+					return m, m.handleError(err)
+				}
+				return m, m.setStatus(fmt.Sprintf("copied · turn (%d lines)", lines))
+			}
+		}
+		return m, nil
+	}
+
 	// Exit scrolling mode when ESC is pressed and the terminal pane is in
 	// scrolling mode. The Session tab has no equivalent "scroll mode" to
 	// exit - its turns are already fully loaded (bounded by maxTurns), so
@@ -1308,6 +1356,10 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 		})
 	case keys.KeyCopy:
 		return m, m.handleCopy()
+	case keys.KeyCopyTail:
+		return m, m.handleCopyTail()
+	case keys.KeyTurnPicker:
+		return m, m.handleOpenPicker()
 	case keys.KeyOpenFolder:
 		return m, m.handleOpenFolder()
 	default:
@@ -1315,32 +1367,88 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 	}
 }
 
-// handleCopy is the c key (design/cockpit-pane/DECISIONS.md slice 7): the
-// composer's current text when it is open, else the selected Needs-you
-// row's own title and number (clarity.FeedLine - the exact text the row
-// itself renders, "#nnn - <title>" for a board row), copied to the system
-// clipboard via the same helper the external-lane message path already
-// uses. A no-op when neither applies (no composer open, cursor not on a
-// Needs-you row) - never a claimed copy of nothing.
+// handleCopy is the c key (design/cockpit-pane/DECISIONS.md slice 7,
+// extended by slice 22 PART B): the composer's current text when it is
+// open; else the selected Needs-you row's own title and number
+// (clarity.FeedLine - the exact text the row itself renders, "#nnn -
+// <title>" for a board row) when the cursor sits on one - unchanged from
+// slice 7, tab-independent (GetSelectedNeedsYou only ever returns ok=true
+// for a Needs-you row's own selection, wherever the cursor happens to be);
+// else, on the Session tab, the SELECTED lane's own last turn as plain text
+// (the owner's own complaint this slice answers: "cant copy paste from the
+// session"). Copied to the system clipboard via the same helper the
+// external-lane message path already uses. A no-op when none of the three
+// applies - never a claimed copy of nothing.
 func (m *home) handleCopy() tea.Cmd {
-	var text string
-	switch {
-	case m.composer.IsOpen():
-		text = m.composer.Value()
-	default:
-		item, ok := m.list.GetSelectedNeedsYou()
-		if !ok {
+	if m.composer.IsOpen() {
+		text := m.composer.Value()
+		if text == "" {
 			return nil
 		}
-		text = clarity.FeedLine(item)
+		if err := clarity.CopyToClipboard(m.cmdExec, text); err != nil {
+			return m.handleError(err)
+		}
+		return m.setStatus("copied")
 	}
-	if text == "" {
+
+	if item, ok := m.list.GetSelectedNeedsYou(); ok {
+		text := clarity.FeedLine(item)
+		if text == "" {
+			return nil
+		}
+		if err := clarity.CopyToClipboard(m.cmdExec, text); err != nil {
+			return m.handleError(err)
+		}
+		return m.setStatus("copied")
+	}
+
+	if m.tabbedWindow == nil || !m.tabbedWindow.IsInSessionTab() {
+		return nil
+	}
+	text, lines, ok := m.sessionPane.LastTurnCopyText()
+	if !ok {
 		return nil
 	}
 	if err := clarity.CopyToClipboard(m.cmdExec, text); err != nil {
 		return m.handleError(err)
 	}
-	return m.setStatus("copied")
+	return m.setStatus(fmt.Sprintf("copied · last turn (%d lines)", lines))
+}
+
+// handleCopyTail is the C (shift-c) key (slice 22, PART B): copies the
+// Session tab's WHOLE loaded transcript tail as plain text - every turn
+// currently held (SessionPane.TailCopyText's own contract), not only the
+// lines scrolled into view. A no-op off the Session tab, or when nothing is
+// selected/the selected lane has no turns yet.
+func (m *home) handleCopyTail() tea.Cmd {
+	if m.tabbedWindow == nil || !m.tabbedWindow.IsInSessionTab() {
+		return nil
+	}
+	text, turns, ok := m.sessionPane.TailCopyText()
+	if !ok {
+		return nil
+	}
+	if err := clarity.CopyToClipboard(m.cmdExec, text); err != nil {
+		return m.handleError(err)
+	}
+	return m.setStatus(fmt.Sprintf("copied · %d turns", turns))
+}
+
+// handleOpenPicker is the v key (slice 22, PART B): opens the Session tab's
+// turn picker (SessionPane.OpenPicker), entering stateSessionPicker so
+// handleKeyPress's own early block above routes up/down/c/esc to it. A
+// no-op off the Session tab, or when the selected lane has no turns to pick
+// from (OpenPicker's own refusal) - the state is never entered with nothing
+// in the picker.
+func (m *home) handleOpenPicker() tea.Cmd {
+	if m.tabbedWindow == nil || !m.tabbedWindow.IsInSessionTab() {
+		return nil
+	}
+	if !m.sessionPane.OpenPicker() {
+		return nil
+	}
+	m.state = stateSessionPicker
+	return nil
 }
 
 // handleOpenFolder is the o key (design/cockpit-pane/DECISIONS.md slice 7):
@@ -2076,6 +2184,22 @@ func (m *home) View() tea.View {
 	// v1's tea.WithAltScreen() / tea.WithMouseCellMotion() program options -
 	// v2 declares them per-View instead (see Run above).
 	v.AltScreen = true
-	v.MouseMode = tea.MouseModeCellMotion
+	// Mouse capture is OFF (slice 22, PART A - the owner's own complaint:
+	// "cant copy paste from the session"). Finding: the mouse wheel scroll
+	// case (tea.MouseWheelMsg, ~line 623) was the ONLY consumer of mouse
+	// events anywhere in this app - cell-motion capture bought that one
+	// feature at the cost of the terminal's own native drag-select and copy
+	// EVERYWHERE, which is the very thing the owner reached for and could
+	// not get. Ruling: drag-select matters more than the wheel, so the
+	// mouse is released; shift+↑/shift+↓ (keys.KeyShiftUp/KeyShiftDown,
+	// already wired to the same ScrollUp/ScrollDown the wheel case called)
+	// remain the documented way to scroll every pane (app/help.go). The
+	// wheel case itself is left in place, dormant - same convention as
+	// KeyCheckout (keys/keys.go) and PreviewPane/DiffPane (ui/
+	// tabbed_window.go's own comment) - rather than deleted, in case mouse
+	// capture is ever worth its cost again. MouseModeNone is bubbletea's
+	// own zero value; set explicitly here rather than left implicit, so a
+	// future reader sees the choice, not an omission.
+	v.MouseMode = tea.MouseModeNone
 	return v
 }
