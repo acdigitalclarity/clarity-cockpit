@@ -196,3 +196,124 @@ func TestModelWindowLabel_EmptyModel_NotDerivable(t *testing.T) {
 	_, ok := ModelWindowLabel("")
 	require.False(t, ok, "an empty model name has nothing to derive a window word from")
 }
+
+// unsetMissingRegistry points AccountsRegistryEnvVar at a path that does not
+// exist, so LoadAccountsRegistry's nil-map branch runs rather than the real
+// machine's own registry - every claudeProjectsRoots test below wants that
+// isolation regardless of which env-var branch it exercises.
+func unsetMissingRegistry(t *testing.T) {
+	t.Helper()
+	t.Setenv(AccountsRegistryEnvVar, filepath.Join(t.TempDir(), "no-registry-here.json"))
+}
+
+// TestClaudeProjectsRoots_PluralEnvVarWins is precedence branch 1: the
+// plural, colon-separated var, when set, wins outright over everything else.
+func TestClaudeProjectsRoots_PluralEnvVarWins(t *testing.T) {
+	unsetMissingRegistry(t)
+	a, b := t.TempDir(), t.TempDir()
+	t.Setenv(ClaudeProjectsRootsEnvVar, a+":"+b)
+	t.Setenv(ClaudeProjectsRootEnvVar, "/should/never/be/read")
+
+	roots := claudeProjectsRoots()
+	require.Len(t, roots, 2)
+	require.Equal(t, a, roots[0].Path)
+	require.Equal(t, b, roots[1].Path)
+}
+
+// TestClaudeProjectsRoots_SingularEnvVarAloneBehavesAsBefore is precedence
+// branch 2, and the item (e) requirement: with the plural var unset, the
+// singular var alone still resolves to exactly one root, unchanged.
+func TestClaudeProjectsRoots_SingularEnvVarAloneBehavesAsBefore(t *testing.T) {
+	unsetMissingRegistry(t)
+	root := t.TempDir()
+	t.Setenv(ClaudeProjectsRootEnvVar, root)
+
+	roots := claudeProjectsRoots()
+	require.Len(t, roots, 1)
+	require.Equal(t, root, roots[0].Path)
+}
+
+// TestClaudeProjectsRoots_DefaultAloneWhenNoRegistry is precedence branch 3:
+// neither env var set and no registry resolves to just the default root.
+func TestClaudeProjectsRoots_DefaultAloneWhenNoRegistry(t *testing.T) {
+	unsetMissingRegistry(t)
+
+	roots := claudeProjectsRoots()
+	require.Len(t, roots, 1)
+	require.Equal(t, DefaultClaudeProjectsRoot, roots[0].Path)
+	require.Empty(t, roots[0].Account)
+}
+
+// TestClaudeProjectsRoots_DefaultPlusRegistryAccounts is precedence branch
+// 4: neither env var set, but the registry names accounts beyond the
+// default's own parent - each becomes an extra root, tagged, existing
+// directories only, the default's own account skipped as a duplicate.
+func TestClaudeProjectsRoots_DefaultPlusRegistryAccounts(t *testing.T) {
+	unsetMissingRegistry(t)
+
+	teamXDir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(teamXDir, "projects"), 0755))
+	teamGhostDir := t.TempDir() // no "projects" subdir created - must be skipped
+
+	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	writeRegistry(t, registryPath, `{
+		"accounts": {
+			"main": {"config_dir": "`+filepath.Dir(DefaultClaudeProjectsRoot)+`"},
+			"team-x": {"config_dir": "`+teamXDir+`"},
+			"team-ghost": {"config_dir": "`+teamGhostDir+`"}
+		}
+	}`)
+	t.Setenv(AccountsRegistryEnvVar, registryPath)
+
+	roots := claudeProjectsRoots()
+
+	var byPath = map[string]string{}
+	for _, r := range roots {
+		byPath[r.Path] = r.Account
+	}
+	require.Equal(t, "main", byPath[DefaultClaudeProjectsRoot], "the default root itself picks up its registry tag")
+	require.Equal(t, "team-x", byPath[filepath.Join(teamXDir, "projects")], "a registry account with an existing projects dir becomes an extra root")
+	require.NotContains(t, byPath, filepath.Join(teamGhostDir, "projects"), "a registry account whose projects dir does not exist is never added")
+	require.Len(t, roots, 2, "main is the default root, not a second copy of it")
+}
+
+// TestClaudeProjectsRoots_DedupesSameConfigDirAcrossTags proves the
+// "deduplicated" clause: two tags resolving to the same projects path never
+// produce two roots.
+func TestClaudeProjectsRoots_DedupesSameConfigDirAcrossTags(t *testing.T) {
+	unsetMissingRegistry(t)
+
+	sharedDir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(sharedDir, "projects"), 0755))
+
+	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	writeRegistry(t, registryPath, `{
+		"accounts": {
+			"team-x": {"config_dir": "`+sharedDir+`"},
+			"team-y": {"config_dir": "`+sharedDir+`"}
+		}
+	}`)
+	t.Setenv(AccountsRegistryEnvVar, registryPath)
+
+	roots := claudeProjectsRoots()
+	require.Len(t, roots, 2, "the default root plus one deduplicated extra, not two")
+}
+
+// TestNewestTranscript_ResolvesUnderLaneOwnRootNotDefault is item 4's own
+// requirement: a lane's transcript under a NON-default root still resolves,
+// proving the gauge no longer assumes every lane lives under the default.
+func TestNewestTranscript_ResolvesUnderLaneOwnRootNotDefault(t *testing.T) {
+	unsetMissingRegistry(t)
+	rootA, rootB := t.TempDir(), t.TempDir()
+	t.Setenv(ClaudeProjectsRootsEnvVar, rootA+":"+rootB)
+
+	lane := "/Users/allencoates/projects/Clarity/sessions/fixture-cross-root"
+	dir := filepath.Join(rootB, EncodeProjectDir(lane))
+	require.NoError(t, os.MkdirAll(dir, 0755))
+	path := filepath.Join(dir, "a.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte("{}\n"), 0644))
+
+	got, ok := NewestTranscript(lane)
+	require.True(t, ok)
+	require.Equal(t, path, got)
+}
