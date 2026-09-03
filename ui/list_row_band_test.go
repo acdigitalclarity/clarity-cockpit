@@ -60,7 +60,19 @@ func runHasContinuousBackground(s string) bool {
 // continuous rowBg band with no un-styled gap in it anywhere.
 func TestLaneRowSuffix_SelectedRow_OneContinuousBackground(t *testing.T) {
 	out := laneRowSuffix(selectedTitleStyle.GetBackground(), selectedTitleStyle.GetForeground(),
-		55, true, "waiting on you", time.Now(), true, true, true)
+		"", false, 55, true, "waiting on you", time.Now(), true, true, true)
+
+	require.True(t, runHasContinuousBackground(out), "raw: %q", out)
+}
+
+// TestLaneRowSuffix_SelectedRow_WithTag_OneContinuousBackground is DEFECT
+// 2's own tag-column variant (slice 5 item 2): the seat-tag segment
+// laneRowSuffix now inserts must carry rowBg forward exactly like every
+// other segment, or the same un-styled-gap defect reappears one column to
+// the left of where it was fixed.
+func TestLaneRowSuffix_SelectedRow_WithTag_OneContinuousBackground(t *testing.T) {
+	out := laneRowSuffix(selectedTitleStyle.GetBackground(), selectedTitleStyle.GetForeground(),
+		"tb", true, 55, true, "waiting on you", time.Now(), true, true, true)
 
 	require.True(t, runHasContinuousBackground(out), "raw: %q", out)
 }
@@ -71,7 +83,7 @@ func TestLaneRowSuffix_SelectedRow_OneContinuousBackground(t *testing.T) {
 // play, not just the widest row.
 func TestLaneRowSuffix_SelectedRow_NoWordOrTime_StillContinuous(t *testing.T) {
 	out := laneRowSuffix(selectedTitleStyle.GetBackground(), selectedTitleStyle.GetForeground(),
-		7, true, "idle", time.Now(), true, false, false)
+		"", false, 7, true, "idle", time.Now(), true, false, false)
 
 	require.True(t, runHasContinuousBackground(out), "raw: %q", out)
 }
@@ -98,7 +110,7 @@ func TestInstanceRenderer_SelectedRow_OneLine_OneContinuousBackground(t *testing
 	inst.SetContextFill(55, true)
 	inst.SetLaneState("waiting on you", time.Now(), true)
 
-	rendered := r.Render(inst, 1, true, false, true)
+	rendered := r.Render(inst, 1, true, false, true, false)
 	require.NotContains(t, rendered, "\n", "slice 19's own compact row: exactly one line, no second line left to join")
 
 	require.True(t, runHasContinuousBackground(rendered), "raw: %q", rendered)
@@ -122,7 +134,7 @@ func TestInstanceRenderer_SelectedRow_MarkerInColumn1_StateColourSurvives(t *tes
 	inst.SetContextFill(55, true)
 	inst.SetLaneState(clarity.StateWorking, time.Now(), true)
 
-	rendered := r.Render(inst, 1, true, false, true)
+	rendered := r.Render(inst, 1, true, false, true, false)
 	stripped := ansi.Strip(rendered)
 	require.True(t, strings.HasPrefix(stripped, "▌"), "column 1 of a selected row must be the marker: %q", stripped)
 	require.Contains(t, stripped, "working", "the state word itself must still be present")

@@ -629,6 +629,15 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.list.SetExternal(external)
 		}
 
+		// The fleet line under "Instances" (slice 5 item 3) reads the
+		// registry's own seat-tag set - loaded once per tick here, never by
+		// List.String() itself, the same push convention SetExternal/
+		// SetNeedsYou above already follow. A missing/unreadable registry
+		// (LoadAccountsRegistry's own nil-map case, most machines today)
+		// simply means fleetLine() has no seats to report and the line is
+		// dropped entirely, not an error.
+		m.list.SetAccountsRegistry(clarity.LoadAccountsRegistry())
+
 		// Same state derivation for every TRACKED instance, running or
 		// paused - a lane's transcript is exactly as file-only-derivable
 		// either way (see the context-fill comment just below, which
