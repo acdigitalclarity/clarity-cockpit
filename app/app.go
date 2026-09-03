@@ -2283,13 +2283,18 @@ func (m *home) handleNewLaneKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 // newLaneProgram builds the program string session.NewInstance launches
 // with - CLAUDE_CONFIG_DIR sits INSIDE the string, exactly the way
 // scripts/clarity's own open_session does it (research F11: the direct exec
-// path silently runs the default account otherwise). Nothing is prefixed
-// for the machine's own default config directory or for an unset one.
+// path silently runs the default account otherwise). A non-default seat's
+// program also carries clarity.EnvUnsetPrefix ahead of CLAUDE_CONFIG_DIR: a
+// cockpit pane inherits the tmux server's environment, which carries the
+// owner's shell ANTHROPIC_API_KEY, and that key outranks the seat's own
+// claude.ai login unless cleared first (observed on the max-2 seat).
+// Nothing is prefixed for the machine's own default config directory or for
+// an unset one.
 func newLaneProgram(base, configDir string) string {
 	if configDir == "" || clarity.IsDefaultConfigDir(configDir) {
 		return base
 	}
-	return fmt.Sprintf("CLAUDE_CONFIG_DIR=%s %s", configDir, base)
+	return fmt.Sprintf("%s CLAUDE_CONFIG_DIR=%s %s", clarity.EnvUnsetPrefix, configDir, base)
 }
 
 // clarityWrapperNew shells out to the real `clarity new ... --no-launch`

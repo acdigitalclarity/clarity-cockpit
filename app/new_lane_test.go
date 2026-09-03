@@ -127,11 +127,14 @@ func overlayStepAccount(t *testing.T, h *home) int {
 	return int(h.newLaneOverlay.Step())
 }
 
-// (f) the program string carries CLAUDE_CONFIG_DIR for a non-default seat
-// and nothing for main.
+// (f) the program string carries clarity.EnvUnsetPrefix and CLAUDE_CONFIG_DIR
+// for a non-default seat - the pane's tmux server environment carries the
+// owner's shell ANTHROPIC_API_KEY, which outranks the seat's own claude.ai
+// login unless cleared first (observed on the max-2 seat) - and nothing for
+// main.
 func TestNewLaneProgram_CarriesConfigDirOnlyForNonDefaultSeat(t *testing.T) {
 	require.Equal(t,
-		"CLAUDE_CONFIG_DIR=/Users/allencoates/.claude-team-b claude",
+		clarity.EnvUnsetPrefix+" CLAUDE_CONFIG_DIR=/Users/allencoates/.claude-team-b claude",
 		newLaneProgram("claude", "/Users/allencoates/.claude-team-b"))
 
 	require.Equal(t, "claude", newLaneProgram("claude", "/Users/allencoates/.claude"),
@@ -184,5 +187,5 @@ func TestClarityWrapperNew_WritesAccountAndModality_InstanceCarriesBoth(t *testi
 	require.NoError(t, err)
 	require.Equal(t, "team-b", inst.Account(), "the instance record must carry the account")
 	require.Equal(t, "project", inst.Modality(), "the instance record must carry the modality")
-	require.Equal(t, "CLAUDE_CONFIG_DIR="+teamBConfigDir+" claude", inst.Program)
+	require.Equal(t, clarity.EnvUnsetPrefix+" CLAUDE_CONFIG_DIR="+teamBConfigDir+" claude", inst.Program)
 }

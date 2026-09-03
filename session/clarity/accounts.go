@@ -23,6 +23,16 @@ const AccountsRegistryEnvVar = "CLARITY_ACCOUNTS_REGISTRY"
 // DefaultAccountsRegistryPath is the registry slice 1 landed at.
 const DefaultAccountsRegistryPath = "/Users/allencoates/.claude-accounts/registry.json"
 
+// EnvUnsetPrefix is the environment-clearing prefix a declared-seat launch
+// program carries ahead of CLAUDE_CONFIG_DIR, verbatim from scripts/clarity's
+// own env_unset_prefix. A cockpit pane inherits the tmux server's
+// environment, which carries the owner's shell ANTHROPIC_API_KEY (and any
+// stray CLAUDE_CODE_* session variable); left set, that key outranks the
+// seat's own claude.ai login (observed on the max-2 seat: "ANTHROPIC_API_KEY
+// or another auth source is set and takes precedence over your claude.ai
+// login"). Exported for slice 7's login program to reuse.
+const EnvUnsetPrefix = "env -u ANTHROPIC_API_KEY -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_BRIDGE_SESSION_ID -u CLAUDE_CODE_MESSAGING_SOCKET -u CLAUDE_CODE_MESSAGING_TOKEN -u CLAUDE_CODE_SSE_PORT -u CLAUDE_CODE_ENTRYPOINT"
+
 // registryAccount is the one field this package needs from an account's
 // registry entry - the rest (plan, purpose, default_modality) belong to
 // later slices and are left for encoding/json to discard.
