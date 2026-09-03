@@ -226,6 +226,90 @@ func TestInstanceAttachFinishedMsg_Success(t *testing.T) {
 	require.False(t, h.hasErr)
 }
 
+// delayedEOFPtyFactory stands in for a live tmux pty whose reader only
+// EOFs once the test closes w - unlike termPtyFactory's empty temp file
+// (an instant EOF, which races Attach's own setup goroutines rather than
+// reproducing "the program exited sometime after being attached").
+type delayedEOFPtyFactory struct {
+	sessionExists *bool
+	w             *os.File
+}
+
+func (f *delayedEOFPtyFactory) Start(cmd *exec.Cmd) (*os.File, error) {
+	*f.sessionExists = true
+	r, w, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	f.w = w
+	return r, nil
+}
+
+func (f *delayedEOFPtyFactory) Close() {}
+
+// TestInstanceAttachFinishedMsg_EndedWithoutDetach is board #317's own
+// reproduction, driven through the real Attach/DetachSafely plumbing rather
+// than a stubbed msg.err: a live tracked instance whose pty reader hits EOF
+// with no Ctrl-Q/Ctrl-], well after attach setup has settled (the real-world
+// shape - the program running inside tmux exits some time after being
+// attached, not instantly). Before this fix the channel Attach returned
+// never closed at all in this case, so <-ch below would hang forever; now
+// it closes and instanceAttachFinishedMsg's handler must land the instance
+// Paused, no error box, no red line, with the foot naming the lane.
+func TestInstanceAttachFinishedMsg_EndedWithoutDetach(t *testing.T) {
+	h := newComposerTestHome(t)
+
+	sessionExists := false
+	cmdExec := cmd_test.MockCmdExec{
+		RunFunc: func(cmd *exec.Cmd) error {
+			if strings.Contains(cmd.String(), "has-session") {
+				if sessionExists {
+					return nil
+				}
+				return fmt.Errorf("session does not exist")
+			}
+			return nil
+		},
+	}
+	ptyFactory := &delayedEOFPtyFactory{sessionExists: &sessionExists}
+
+	inst, err := session.NewInstance(session.InstanceOptions{
+		Title:      "scratchfix-ended",
+		Path:       t.TempDir(),
+		Program:    "claude",
+		NoWorktree: true,
+	})
+	require.NoError(t, err)
+	inst.SetTmuxSession(tmux.NewTmuxSessionWithDeps("scratchfix-ended", "claude", ptyFactory, cmdExec))
+	require.NoError(t, inst.Start(true))
+	h.list.AddInstance(inst)()
+
+	ch, err := inst.Attach()
+	require.NoError(t, err)
+
+	// Let monitorWindowSize's own 50ms debounce timer fire and settle
+	// before the pty EOFs, the same margin real usage always has (a lane
+	// runs for a while before its program exits) - closing the write end
+	// immediately would race Attach's own setup goroutines instead of
+	// testing the ended-without-detach path itself.
+	time.Sleep(150 * time.Millisecond)
+	require.NoError(t, ptyFactory.w.Close())
+
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("attach did not finish - the ended-without-detach path must still close the channel")
+	}
+	require.True(t, inst.AttachEndedWithoutDetach(),
+		"a pty EOF with no Ctrl-Q must be recorded as an ended attach, not a normal detach")
+
+	_, _ = h.Update(instanceAttachFinishedMsg{err: nil})
+
+	require.Equal(t, session.Paused, inst.Status, "an ended attach must land the instance Paused")
+	require.False(t, h.hasErr, "an ended attach shows no error box")
+	require.Equal(t, "scratchfix-ended ended; r or enter resumes it", h.statusText)
+}
+
 // TestKeyCopy_ComposerOpen_CopiesComposerText proves c copies the
 // composer's CURRENT text when it is open, over the Needs-you fallback.
 func TestKeyCopy_ComposerOpen_CopiesComposerText(t *testing.T) {
@@ -400,16 +484,50 @@ func noWorktreeAppFixtureLive(t *testing.T, h *home, title string) (inst *sessio
 
 // TestKeyEnter_TrackedNoWorktreeInstance_NoSession_ShowsFooterLine is
 // slice 8 rule 2's own Enter test, seen failing against the pre-fix code
-// (which silently no-op'd): Enter on a tracked NoWorktree row with no live
-// session must show the "runs in your own terminal" footer, never a silent
-// no-op and never a resume prompt.
+// (which silently no-op'd): Enter on a tracked NoWorktree row whose status
+// is still Running (never reconciled to Paused - the tmux server died out
+// from under it, not a formal Pause/board #317 end-of-attach) but whose
+// session is gone must show the "runs in your own terminal" footer, never
+// a silent no-op and never a resume prompt. Board #317 narrows this guard
+// to exactly this NOT-Paused case (app/app.go's own comment on the
+// reordering) - a Paused row now resumes instead, see the test below.
 func TestKeyEnter_TrackedNoWorktreeInstance_NoSession_ShowsFooterLine(t *testing.T) {
 	h := newComposerTestHome(t)
-	noWorktreeAppFixture(t, h, "scratchfix-attached")
+	_, exists := noWorktreeAppFixtureLive(t, h, "scratchfix-attached")
+	// Simulate the tmux server dying out from under a live lane without
+	// going through Pause() - Status stays Running, only the session is
+	// actually gone.
+	*exists = false
 
 	pressGlobalKey(h, tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	require.Equal(t, "this lane runs in your own terminal; tab to Terminal for a shell in its folder", h.statusText)
+}
+
+// TestKeyEnter_PausedTrackedInstance_ResumesAndAttaches is board #317 item
+// 3, driven off noWorktreeAppFixture - the real clarity-attach-paused shape
+// (Paused AND no live session), exactly what an ended-without-detach attach
+// (item 2) leaves behind, and exactly the shape the live proof (leg report)
+// found silently no-op'd before app/app.go's guard reordering fixed it: the
+// pre-existing NoWorktree "own terminal" guard used to intercept Paused
+// rows first, since a Paused NoWorktree lane has a dead session almost by
+// definition. Now Paused is checked first, so enter alone resumes, exactly
+// what r does, then dispatches the attach straight away - the owner should
+// never need both keys to get back into a lane that ended on its own.
+func TestKeyEnter_PausedTrackedInstance_ResumesAndAttaches(t *testing.T) {
+	h := newComposerTestHome(t)
+	// HelpScreensSeen already carries helpTypeInstanceAttach's own mask
+	// (1<<2, app/help.go) so showHelpScreen's onDismiss runs synchronously
+	// and Update returns the real attachInstanceCmd, not a help overlay.
+	h.appState = &config.State{HelpScreensSeen: 1 << 2}
+	inst, exists := noWorktreeAppFixture(t, h, "scratchfix-paused")
+
+	_, cmd := pressGlobalKey(h, tea.KeyPressMsg{Code: tea.KeyEnter})
+
+	require.True(t, *exists, "enter on a Paused row must resume the session, not silently no-op")
+	require.Equal(t, session.Running, inst.Status, "Resume must flip the instance back to Running")
+	require.NotNil(t, cmd, "enter on a Paused row must dispatch the attach, not no-op")
+	require.Empty(t, h.statusText, "a successful resume-then-attach shows no refusal footer")
 }
 
 // TestKeyResume_NoWorktreeInstance_Idle_ResumesSession is slice 8 rule 2's

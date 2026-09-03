@@ -475,6 +475,21 @@ func (i *Instance) Attach() (chan struct{}, error) {
 	return i.tmuxSession.Attach()
 }
 
+// AttachEndedWithoutDetach reports whether the instance's most recently
+// finished attach ended because the program running inside tmux exited on
+// its own (Ctrl-D, `exit`, a crash) rather than because Ctrl-Q/Ctrl-] was
+// pressed. Call only after the channel Attach returned has closed - board
+// #317: the caller should mark such an instance Paused instead of treating
+// it as a normal detach. Gated on Started() first, never tmuxSession alone
+// (mirrors RequiresCopyOnlySend's own comment above): a construction-only
+// test double never calls Start(), so it has no tmux session to check at all.
+func (i *Instance) AttachEndedWithoutDetach() bool {
+	if !i.started || i.tmuxSession == nil {
+		return false
+	}
+	return errors.Is(i.tmuxSession.LastAttachOutcome(), tmux.ErrSessionEnded)
+}
+
 func (i *Instance) SetPreviewSize(width, height int) error {
 	if !i.started || i.Status == Paused {
 		return fmt.Errorf("cannot set preview size for instance that has not been started or " +
