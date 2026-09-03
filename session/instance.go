@@ -101,6 +101,20 @@ type Instance struct {
 	// classification carried none.
 	laneAnsweredAt time.Time
 
+	// sessionAlive/sessionAliveOK cache this instance's own tmux-session
+	// existence, set once per discovery tick from the batched name set
+	// ListSessionNames answers in one call (slice 17c item 2: "one tmux
+	// call per pass, not per row") - SetSessionAlive/ApplyLiveSessionSet
+	// below, same contract as contextFillPct/laneState above (main event
+	// loop only, to avoid a data race with View). sessionAliveOK is false
+	// before the first discovery tick has run (a freshly loaded instance
+	// mid-boot, or any unit test that never calls SetSessionAlive at all -
+	// the existing 17b test fixtures across app/ui/session all fall here),
+	// in which case Alive() falls back to asking its own tmuxSession
+	// directly, exactly as it always has.
+	sessionAlive   bool
+	sessionAliveOK bool
+
 	// selectedBranch is the existing branch to start on (empty = new branch from HEAD)
 	selectedBranch string
 
@@ -545,26 +559,65 @@ func (i *Instance) TmuxAlive() bool {
 }
 
 // Alive reports whether a live process actually backs this tracked row
-// right now - its tmux session is set and reports itself present, AND the
-// instance is not Paused (cockpit-pane slice 17b, WoW ruling 3 Sep 22:3x:
-// "liveness, not age, is the test"). Guarded on tmuxSession != nil first,
-// never i.started alone (RequiresCopyOnlySend's own reasoning: an
-// unstarted instance's tmuxSession is nil and TmuxAlive dereferences it) -
-// this is the more direct of the two equivalent guards, and the one a test
-// double built via SetTmuxSession (never Start()ed for real, the
-// established seam session/instance_test.go and its callers across app/ui
-// already use for a "live tmux" fixture) still satisfies. Paused alone is
-// not enough either way: it is set explicitly (Pause(), pauseNoWorktree())
-// but a session can also die out from under a still-Running instance with
-// no state transition at all (the 3 Sep 18:47:57 incident - a bare `tmux
-// kill-server` took the whole server down while this process kept running,
-// so Status never moved off Running even though TmuxAlive() immediately
-// reads false). The callers that gate "waiting on you"/"stalled" on
-// liveness (ui/list.go's row render and sort, app/attention.go's
-// bell/title) both read this rather than either check alone, so the two
-// can never disagree about which tracked rows are dead.
+// right now - its tmux session, looked up by NAME, actually exists on the
+// socket (cockpit-pane slice 17c, WoW ruling 3 Sep: "liveness, not age, is
+// the test"; owner bar: "only a lane that is actually running can be
+// waiting on me"). Answered from the discovery tick's own batched session-
+// name set when one has been recorded (sessionAliveOK - see
+// SetSessionAlive/ApplyLiveSessionSet), falling back to a direct
+// TmuxAlive() call otherwise - a freshly loaded instance mid-boot, before
+// this process's first discovery tick has run, or any unit test built via
+// SetTmuxSession that never populates the cache at all (session/instance_
+// test.go and its callers across app/ui, unchanged by this slice).
+//
+// Deliberately NOT gated on !i.Paused() (slice 17c's own fix, cockpit-pane
+// slice 17b's original formula, kept here only in this comment as the
+// regression this replaces): a stored Paused status is authoritative only
+// when the session does NOT exist; when the store says Paused but the
+// session is genuinely still there - the exact shape a stale status left
+// over from the 3 Sep 18:47:57 `tmux kill-server` incident takes once the
+// lane's session comes back or never actually died - the lane is alive,
+// full stop, and laneLivenessState (ui/list.go) still decides the PAUSED
+// word for a row whose session really is gone; that path is unchanged.
 func (i *Instance) Alive() bool {
-	return i.tmuxSession != nil && i.TmuxAlive() && !i.Paused()
+	if i.sessionAliveOK {
+		return i.sessionAlive
+	}
+	return i.tmuxSession != nil && i.TmuxAlive()
+}
+
+// TmuxSessionName returns the tmux session name Alive()/DoesSessionExist
+// would check for this instance - "" when no tmux session has been
+// constructed yet (a construction-only test double that never calls
+// Start()/SetTmuxSession, never reachable in production - see
+// RequiresCopyOnlySend's own comment for the same guard). Used by
+// ApplyLiveSessionSet to look this instance up in a batched name set
+// without needing its own has-session call.
+func (i *Instance) TmuxSessionName() string {
+	if i.tmuxSession == nil {
+		return ""
+	}
+	return i.tmuxSession.SanitizedName()
+}
+
+// SetSessionAlive caches this instance's own liveness answer from the
+// discovery tick's batched session-name set (slice 17c item 2) - called
+// from the main event loop only (app.go's feedTickMsg handler, via
+// ApplyLiveSessionSet below), same contract as SetContextFill/SetLaneState.
+func (i *Instance) SetSessionAlive(alive bool) {
+	i.sessionAlive = alive
+	i.sessionAliveOK = true
+}
+
+// ApplyLiveSessionSet answers Alive for every instance in instances from a
+// single pre-fetched tmux session-name set (tmux.ListSessionNames) - the
+// batched replacement for a has-session call per tracked row (slice 17c
+// item 2). Pure: makes no tmux call of its own, so calling it costs
+// nothing beyond the one call the caller already paid for building names.
+func ApplyLiveSessionSet(instances []*Instance, names map[string]bool) {
+	for _, inst := range instances {
+		inst.SetSessionAlive(names[inst.TmuxSessionName()])
+	}
 }
 
 // RequiresCopyOnlySend reports whether this tracked instance has no live

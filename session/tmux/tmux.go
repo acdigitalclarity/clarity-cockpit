@@ -85,6 +85,32 @@ type TmuxSession struct {
 
 const TmuxPrefix = "claudesquad_"
 
+// tmuxSocketEnvVar names the environment variable an isolated test/rig
+// process sets to point every tmux command this package issues at a named
+// socket (slice 17c, TMUX SOCKET RULE: every tmux command names its
+// socket, TMUX_TMPDIR is never a fence). Unset in every real install, so a
+// real seat's own tmux calls stay byte-for-byte what they were before this
+// existed - a bare `exec.Command("tmux", args...)` with no -L, targeting
+// the one shared ambient default server the whole fleet already relies on.
+const tmuxSocketEnvVar = "CLARITY_TMUX_SOCKET"
+
+// socketArgs returns ["-L", name] when tmuxSocketEnvVar names a socket,
+// nil otherwise - prepended to every argument list tmuxCmd builds.
+func socketArgs() []string {
+	if s := os.Getenv(tmuxSocketEnvVar); s != "" {
+		return []string{"-L", s}
+	}
+	return nil
+}
+
+// tmuxCmd builds a tmux invocation, applying socketArgs() ahead of args -
+// the single choke point every exec.Command("tmux", ...) call in this file
+// now goes through, so the socket rule is enforced in one place rather than
+// re-applied at each call site.
+func tmuxCmd(args ...string) *exec.Cmd {
+	return exec.Command("tmux", append(socketArgs(), args...)...)
+}
+
 // ErrSessionNotFound is returned when the tmux session backing an instance is gone, which
 // happens whenever the tmux server dies (reboot, crash, `tmux kill-server`).
 var ErrSessionNotFound = errors.New("tmux session no longer exists")
@@ -133,13 +159,13 @@ func (t *TmuxSession) Start(workDir string) error {
 	}
 
 	// Create a new detached tmux session and start claude in it
-	cmd := exec.Command("tmux", "new-session", "-d", "-s", t.sanitizedName, "-c", workDir, t.program)
+	cmd := tmuxCmd("new-session", "-d", "-s", t.sanitizedName, "-c", workDir, t.program)
 
 	ptmx, err := t.ptyFactory.Start(cmd)
 	if err != nil {
 		// Cleanup any partially created session if any exists.
 		if t.DoesSessionExist() {
-			cleanupCmd := exec.Command("tmux", "kill-session", "-t", t.sanitizedName)
+			cleanupCmd := tmuxCmd("kill-session", "-t", t.sanitizedName)
 			if cleanupErr := t.cmdExec.Run(cleanupCmd); cleanupErr != nil {
 				err = fmt.Errorf("%v (cleanup error: %v)", err, cleanupErr)
 			}
@@ -168,13 +194,13 @@ func (t *TmuxSession) Start(workDir string) error {
 	ptmx.Close()
 
 	// Set history limit to enable scrollback (default is 2000, we'll use 10000 for more history)
-	historyCmd := exec.Command("tmux", "set-option", "-t", t.sanitizedName, "history-limit", "10000")
+	historyCmd := tmuxCmd("set-option", "-t", t.sanitizedName, "history-limit", "10000")
 	if err := t.cmdExec.Run(historyCmd); err != nil {
 		log.InfoLog.Printf("Warning: failed to set history-limit for session %s: %v", t.sanitizedName, err)
 	}
 
 	// Enable mouse scrolling for the session
-	mouseCmd := exec.Command("tmux", "set-option", "-t", t.sanitizedName, "mouse", "on")
+	mouseCmd := tmuxCmd("set-option", "-t", t.sanitizedName, "mouse", "on")
 	if err := t.cmdExec.Run(mouseCmd); err != nil {
 		log.InfoLog.Printf("Warning: failed to enable mouse scrolling for session %s: %v", t.sanitizedName, err)
 	}
@@ -226,7 +252,7 @@ func (t *TmuxSession) Restore() error {
 		return ErrSessionNotFound
 	}
 
-	ptmx, err := t.ptyFactory.Start(exec.Command("tmux", "attach-session", "-t", t.sanitizedName))
+	ptmx, err := t.ptyFactory.Start(tmuxCmd("attach-session", "-t", t.sanitizedName))
 	if err != nil {
 		return fmt.Errorf("error opening PTY: %w", err)
 	}
@@ -579,7 +605,7 @@ func (t *TmuxSession) Close() error {
 		t.ptmx = nil
 	}
 
-	cmd := exec.Command("tmux", "kill-session", "-t", t.sanitizedName)
+	cmd := tmuxCmd("kill-session", "-t", t.sanitizedName)
 	if err := t.cmdExec.Run(cmd); err != nil {
 		errs = append(errs, fmt.Errorf("error killing tmux session: %w", err))
 	}
@@ -616,14 +642,59 @@ func (t *TmuxSession) updateWindowSize(cols, rows int) error {
 
 func (t *TmuxSession) DoesSessionExist() bool {
 	// Using "-t name" does a prefix match, which is wrong. `-t=` does an exact match.
-	existsCmd := exec.Command("tmux", "has-session", fmt.Sprintf("-t=%s", t.sanitizedName))
+	existsCmd := tmuxCmd("has-session", fmt.Sprintf("-t=%s", t.sanitizedName))
 	return t.cmdExec.Run(existsCmd) == nil
+}
+
+// SanitizedName returns the tmux session name this TmuxSession was built
+// for - the same name DoesSessionExist checks and ListSessionNames' own
+// result set is keyed by (slice 17c item 2), so a caller can answer
+// liveness for many instances against ONE batched name set without asking
+// each TmuxSession to run its own has-session call.
+func (t *TmuxSession) SanitizedName() string {
+	return t.sanitizedName
+}
+
+// SanitizeName exposes toClaudeSquadTmuxName for a caller that has a raw
+// instance title but no TmuxSession yet (slice 17c item 2) - the exact
+// same sanitisation NewTmuxSession applies, so a name looked up this way
+// always matches SanitizedName's own result for the same title.
+func SanitizeName(title string) string {
+	return toClaudeSquadTmuxName(title)
+}
+
+// ListSessionNames answers every tmux session currently on the socket with
+// ONE call (`tmux list-sessions -F "#S"`) - the batched replacement for a
+// has-session call per lane (slice 17c item 2: "one tmux call per pass,
+// not per row"). "no server running" (tmux ls's own exit 1 with nothing to
+// list, the same case CleanupSessions below already treats as empty, not
+// an error) answers an empty set, never an error - a freshly booted
+// process with no tmux server running yet has zero live sessions, which is
+// simply true, not a failure to find out.
+func ListSessionNames(cmdExec cmd.Executor) (map[string]bool, error) {
+	listCmd := tmuxCmd("list-sessions", "-F", "#S")
+	output, err := cmdExec.Output(listCmd)
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return map[string]bool{}, nil
+		}
+		return nil, fmt.Errorf("failed to list tmux sessions: %w", err)
+	}
+
+	names := make(map[string]bool)
+	for _, line := range strings.Split(strings.TrimRight(string(output), "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		names[line] = true
+	}
+	return names, nil
 }
 
 // CapturePaneContent captures the content of the tmux pane
 func (t *TmuxSession) CapturePaneContent() (string, error) {
 	// Add -e flag to preserve escape sequences (ANSI color codes)
-	cmd := exec.Command("tmux", "capture-pane", "-p", "-e", "-J", "-t", t.sanitizedName)
+	cmd := tmuxCmd("capture-pane", "-p", "-e", "-J", "-t", t.sanitizedName)
 	output, err := t.cmdExec.Output(cmd)
 	if err != nil {
 		return "", fmt.Errorf("error capturing pane content: %v", err)
@@ -635,7 +706,7 @@ func (t *TmuxSession) CapturePaneContent() (string, error) {
 // start and end specify the starting and ending line numbers (use "-" for the start/end of history)
 func (t *TmuxSession) CapturePaneContentWithOptions(start, end string) (string, error) {
 	// Add -e flag to preserve escape sequences (ANSI color codes)
-	cmd := exec.Command("tmux", "capture-pane", "-p", "-e", "-J", "-S", start, "-E", end, "-t", t.sanitizedName)
+	cmd := tmuxCmd("capture-pane", "-p", "-e", "-J", "-S", start, "-E", end, "-t", t.sanitizedName)
 	output, err := t.cmdExec.Output(cmd)
 	if err != nil {
 		return "", fmt.Errorf("failed to capture tmux pane content with options: %v", err)
@@ -646,7 +717,7 @@ func (t *TmuxSession) CapturePaneContentWithOptions(start, end string) (string, 
 // CleanupSessions kills all tmux sessions that start with "session-"
 func CleanupSessions(cmdExec cmd.Executor) error {
 	// First try to list sessions
-	cmd := exec.Command("tmux", "ls")
+	cmd := tmuxCmd("ls")
 	output, err := cmdExec.Output(cmd)
 
 	// If there's an error and it's because no server is running, that's fine
@@ -666,7 +737,7 @@ func CleanupSessions(cmdExec cmd.Executor) error {
 
 	for _, match := range matches {
 		log.InfoLog.Printf("cleaning up session: %s", match)
-		if err := cmdExec.Run(exec.Command("tmux", "kill-session", "-t", match)); err != nil {
+		if err := cmdExec.Run(tmuxCmd("kill-session", "-t", match)); err != nil {
 			return fmt.Errorf("failed to kill tmux session %s: %v", match, err)
 		}
 	}

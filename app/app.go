@@ -8,6 +8,7 @@ import (
 	"claude-squad/session"
 	"claude-squad/session/clarity"
 	"claude-squad/session/git"
+	"claude-squad/session/tmux"
 	"claude-squad/ui"
 	"claude-squad/ui/overlay"
 	"claude-squad/ui/splash"
@@ -169,6 +170,14 @@ type home struct {
 	// the same cmd.Executor seam session/tmux already uses for tmux, so
 	// tests can inject a fake without touching the real clipboard.
 	cmdExec cmd.Executor
+	// liveSessionsThisTick is the discovery tick's own batched tmux
+	// session-name set (tmux.ListSessionNames, slice 17c item 2) - built
+	// once per feedTickMsg and read by both the tracked-instance liveness
+	// overlay (session.ApplyLiveSessionSet) and the external-lane overlay
+	// (clarity.ApplyLiveSessionSet) on that same tick, so the whole pass
+	// costs one tmux call rather than one per lane. Nil before the first
+	// tick, or when the most recent list call failed.
+	liveSessionsThisTick map[string]bool
 	// boardCache fetches and caches a Needs-you row's board issue body
 	// (clarity.BoardCache) - lazily initialized on first use, same pattern
 	// as laneTailCache below.
@@ -668,6 +677,27 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.tabbedWindow.NoticeNeedsYou(needsYouItems)
 		}
 
+		// Liveness for every lane, tracked and external alike, answered
+		// from ONE tmux call this tick (slice 17c item 2: "one tmux call
+		// per pass, not per row") - tmux.ListSessionNames replaces both a
+		// has-session call per tracked row (session.Instance.Alive, read
+		// by ui/list.go's render/sort and app/attention.go's bell/title)
+		// and DiscoverExternalLanes' own per-lane ExternalLaneAlive call
+		// below. A failed list (tmux not installed, or a transient error)
+		// leaves every instance's own cache unset, falling back to
+		// Alive()'s direct per-instance check rather than going dark. Nil-
+		// guarded the same way this tick's tabbedWindow calls above are: a
+		// lightweight test home built without one (fit_test.go's own
+		// context-fill fixture) must still take this tick cleanly.
+		if m.cmdExec != nil {
+			if liveSessions, err := tmux.ListSessionNames(m.cmdExec); err != nil {
+				log.WarningLog.Printf("list tmux sessions failed: %v", err)
+			} else {
+				session.ApplyLiveSessionSet(m.list.GetInstances(), liveSessions)
+				m.liveSessionsThisTick = liveSessions
+			}
+		}
+
 		// Refresh the external-lane rows on this same tick - exactly one
 		// glob per tick (clarity.DiscoverExternalLanes), same cadence as
 		// the feed above, never a tick of its own (the brief's requirement).
@@ -681,6 +711,16 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if external, err := clarity.DiscoverExternalLanes(clarity.TrackedExclusionPaths(trackedPaths)); err != nil {
 			log.WarningLog.Printf("discover external lanes failed: %v", err)
 		} else {
+			// Overlay the same batched session set onto the external rows
+			// (slice 17c item 2) - replaces DiscoverExternalLanes' own
+			// per-lane ExternalLaneAlive call for this tick's rows; a nil
+			// liveSessionsThisTick (the list call above failed) leaves
+			// every lane's Alive at whatever DiscoverExternalLanes itself
+			// already computed, so external liveness never regresses to
+			// "always false" just because the batched call had a bad tick.
+			if m.liveSessionsThisTick != nil {
+				clarity.ApplyLiveSessionSet(external, m.liveSessionsThisTick)
+			}
 			// The state word every lane row now carries (item 1): read
 			// through the shared cache keyed by each lane's own transcript
 			// path, so an external lane whose file has not changed since
