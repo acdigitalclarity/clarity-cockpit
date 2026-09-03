@@ -318,7 +318,7 @@ func TestSessionPane_HeaderLine2_TruncatesLeftNeverDropsBranchOrModel(t *testing
 // one still-RUNNING tool turn - the shape the Latency ruling's slice 12
 // tests exercise: a lane whose transcript's last record is an unmatched
 // tool_use, no tool_result yet.
-func openTurnInfo(toolAt time.Time, animFrame int, now time.Time) *SessionInfo {
+func openTurnInfo(toolAt time.Time, now time.Time) *SessionInfo {
 	info := fixtureInfo()
 	info.Tail.State = clarity.StateWorking
 	info.Tail.OpenTurn = true
@@ -326,55 +326,227 @@ func openTurnInfo(toolAt time.Time, animFrame int, now time.Time) *SessionInfo {
 		{Kind: clarity.TurnOwner, At: toolAt.Add(-time.Minute), Text: "run the long build"},
 		{Kind: clarity.TurnTool, At: toolAt, Tool: "Bash", Summary: "go build ./...", Result: clarity.ResultRunning},
 	}
-	info.AnimFrame = animFrame
 	info.Now = now
 	return info
 }
 
-// TestSessionPane_HeaderGlyph_AnimatesOnlyWhileTurnOpen is the Latency
-// ruling's own header requirement, seen failing before this leg's fix (the
-// header always drew laneStateGlyph's static "●" for StateWorking,
-// AnimFrame or no): a different AnimFrame value must draw a DIFFERENT
-// glyph out of animGlyphFrames while State is working and OpenTurn is true.
+// TestSessionPane_HeaderGlyph_AnimatesOnlyWhileTurnOpen is slice 14 rule 1's
+// own header requirement, seen failing before this leg's fix (the header's
+// glyph only ever advanced on SetInfo, i.e. the 500ms session tick - never
+// on the pane's own 100ms TickSpinner): a TickSpinner call must draw a
+// DIFFERENT glyph out of spinnerFrames while State is working and OpenTurn
+// is true, with NO new SetInfo call at all - proving the animation is
+// decoupled from the read.
 func TestSessionPane_HeaderGlyph_AnimatesOnlyWhileTurnOpen(t *testing.T) {
 	pinHome(t)
 	base := time.Date(2026, 9, 3, 10, 0, 0, 0, time.Local)
 
 	s := NewSessionPane()
 	s.SetSize(160, 34)
-	s.SetInfo(openTurnInfo(base, 0, base))
+	s.SetInfo(openTurnInfo(base, base))
 	line0 := strings.Split(s.String(), "\n")[0]
 
-	s.SetInfo(openTurnInfo(base, 1, base.Add(500*time.Millisecond)))
+	s.TickSpinner()
 	line1 := strings.Split(s.String(), "\n")[0]
 
-	require.NotEqual(t, line0, line1, "the header's own glyph column must advance between two session ticks while the turn is open")
-	require.Contains(t, line1, animGlyphFrames[1], "AnimFrame 1 must draw animGlyphFrames' own second frame")
+	require.NotEqual(t, line0, line1, "the header's own glyph column must advance on TickSpinner while the turn is open")
+	require.Contains(t, line1, spinnerFrames[1], "one TickSpinner call must draw spinnerFrames' own second frame")
+}
+
+// TestSessionPane_SpinnerAdvancesOnlyOnTickSpinner_NeverOnSetInfo is rule
+// 1's other half: two SetInfo calls carrying byte-identical data (an idle
+// session tick re-reading an unchanged file) must NOT move the spinner on
+// their own - only TickSpinner does.
+func TestSessionPane_SpinnerAdvancesOnlyOnTickSpinner_NeverOnSetInfo(t *testing.T) {
+	pinHome(t)
+	base := time.Date(2026, 9, 3, 10, 0, 0, 0, time.Local)
+
+	s := NewSessionPane()
+	s.SetSize(160, 34)
+	s.SetInfo(openTurnInfo(base, base))
+	line0 := strings.Split(s.String(), "\n")[0]
+
+	s.SetInfo(openTurnInfo(base, base)) // a second, identical SetInfo - no TickSpinner in between
+	line1 := strings.Split(s.String(), "\n")[0]
+
+	require.Equal(t, line0, line1, "a repeated SetInfo call must never advance the spinner on its own")
 }
 
 // TestSessionPane_HeaderGlyph_SettlesWhenTurnCloses is the ruling's other
 // half: the instant OpenTurn goes false (ClassifyState's own "turn closed"
 // case), the header glyph must stop cycling and settle to laneStateGlyph's
-// plain static glyph for that state - regardless of what AnimFrame now is.
+// plain static glyph for that state - regardless of how many times
+// TickSpinner has fired.
 func TestSessionPane_HeaderGlyph_SettlesWhenTurnCloses(t *testing.T) {
 	pinHome(t)
 	base := time.Date(2026, 9, 3, 10, 0, 0, 0, time.Local)
 
 	s := NewSessionPane()
 	s.SetSize(160, 34)
-	s.SetInfo(openTurnInfo(base, 3, base))
+	s.SetInfo(openTurnInfo(base, base))
+	s.TickSpinner()
+	s.TickSpinner()
+	s.TickSpinner()
 	openLine := strings.Split(s.String(), "\n")[0]
 
-	closed := openTurnInfo(base, 4, base.Add(time.Second))
+	closed := openTurnInfo(base, base.Add(time.Second))
 	closed.Tail.OpenTurn = false
 	closed.Tail.Turns[1].Result = clarity.ResultOK
 	closed.Tail.Turns[1].Duration = time.Second
 	s.SetInfo(closed)
+	s.TickSpinner()
 	closedLine := strings.Split(s.String(), "\n")[0]
 
 	staticGlyph, _ := laneStateGlyph(clarity.StateWorking)
 	require.Contains(t, closedLine, staticGlyph, "a closed turn must settle to the plain static glyph, never a cycled frame")
 	require.NotEqual(t, openLine, closedLine)
+}
+
+// thinkingLine returns the rendered pane's own "thinking ·" foot line,
+// failing the test if none is present.
+func thinkingLine(t *testing.T, out string) string {
+	t.Helper()
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "thinking ·") {
+			return l
+		}
+	}
+	t.Fatalf("no thinking line found in:\n%s", out)
+	return ""
+}
+
+// openTurnNoToolInfo is openTurnInfo's own sibling for rule 2's test: an
+// OPEN working turn whose last record is assistant TEXT, not a tool_use -
+// the "model is between records" shape the thinking line is for.
+func openTurnNoToolInfo(lastAt, now time.Time) *SessionInfo {
+	info := fixtureInfo()
+	info.Tail.State = clarity.StateWorking
+	info.Tail.OpenTurn = true
+	info.Tail.LastTurn = lastAt
+	info.Tail.Turns = []clarity.Turn{
+		{Kind: clarity.TurnOwner, At: lastAt.Add(-time.Minute), Text: "run the long build"},
+		{Kind: clarity.TurnAssistant, At: lastAt, Text: "still thinking about this one"},
+	}
+	info.Now = now
+	return info
+}
+
+// TestSessionPane_ThinkingLine_VisibleBetweenRecordsWhileOpen is rule 2's
+// own core case, seen failing before this leg's fix (no thinking line
+// existed at all): an open turn with no tool running shows "thinking ·
+// <elapsed>" at the foot of the turns, elapsed measured from the last
+// timestamped record.
+func TestSessionPane_ThinkingLine_VisibleBetweenRecordsWhileOpen(t *testing.T) {
+	pinHome(t)
+	base := time.Date(2026, 9, 3, 10, 0, 0, 0, time.Local)
+
+	s := NewSessionPane()
+	s.SetSize(160, 34)
+	s.SetInfo(openTurnNoToolInfo(base, base.Add(12*time.Second)))
+
+	require.Contains(t, s.String(), "thinking · 12s",
+		"the thinking line must show the spinner and the elapsed time since the last record")
+}
+
+// TestSessionPane_ThinkingLine_HiddenWhileToolRunning is rule 2's other
+// named case: a running tool line is already the indicator, so the
+// thinking line must NOT also show alongside it.
+func TestSessionPane_ThinkingLine_HiddenWhileToolRunning(t *testing.T) {
+	pinHome(t)
+	base := time.Date(2026, 9, 3, 10, 0, 0, 0, time.Local)
+
+	s := NewSessionPane()
+	s.SetSize(160, 34)
+	s.SetInfo(openTurnInfo(base, base.Add(5*time.Second)))
+
+	require.NotContains(t, s.String(), "thinking ·",
+		"a running tool line is already the indicator; the thinking line must not also show")
+}
+
+// TestSessionPane_ThinkingLine_HiddenWhenTurnClosed is rule 2's third named
+// case: the instant the turn closes, the thinking line disappears exactly
+// as the header glyph settles.
+func TestSessionPane_ThinkingLine_HiddenWhenTurnClosed(t *testing.T) {
+	pinHome(t)
+	base := time.Date(2026, 9, 3, 10, 0, 0, 0, time.Local)
+
+	s := NewSessionPane()
+	s.SetSize(160, 34)
+	info := openTurnNoToolInfo(base, base.Add(12*time.Second))
+	info.Tail.OpenTurn = false
+	s.SetInfo(info)
+
+	require.NotContains(t, s.String(), "thinking ·")
+}
+
+// TestSessionPane_ThinkingLine_DisappearsWhenToolLands is rule 2's own
+// "disappears the moment a new record lands": an open turn between records
+// shows it; the SAME lane a moment later with a tool_use now in flight must
+// no longer show it (the tool line takes over).
+func TestSessionPane_ThinkingLine_DisappearsWhenToolLands(t *testing.T) {
+	pinHome(t)
+	base := time.Date(2026, 9, 3, 10, 0, 0, 0, time.Local)
+
+	s := NewSessionPane()
+	s.SetSize(160, 34)
+	s.SetInfo(openTurnNoToolInfo(base, base.Add(12*time.Second)))
+	require.Contains(t, s.String(), "thinking ·")
+
+	s.SetInfo(openTurnInfo(base.Add(13*time.Second), base.Add(14*time.Second)))
+	require.NotContains(t, s.String(), "thinking ·")
+}
+
+// TestSessionPane_ThinkingLine_SpinnerAdvancesOnTickSpinner is rule 1
+// applied to the thinking line's own leading glyph, not just the header:
+// TickSpinner alone (no SetInfo) must change it.
+func TestSessionPane_ThinkingLine_SpinnerAdvancesOnTickSpinner(t *testing.T) {
+	pinHome(t)
+	base := time.Date(2026, 9, 3, 10, 0, 0, 0, time.Local)
+
+	s := NewSessionPane()
+	s.SetSize(160, 34)
+	s.SetInfo(openTurnNoToolInfo(base, base.Add(12*time.Second)))
+	line0 := thinkingLine(t, s.String())
+
+	s.TickSpinner()
+	line1 := thinkingLine(t, s.String())
+
+	require.NotEqual(t, line0, line1, "TickSpinner must advance the thinking line's own spinner glyph")
+}
+
+// TestSessionPane_TickSpinner_NeverDisturbsScrollPosition is rule 4's own
+// "the spinner frame alone does not rebuild the turns": scrolling away from
+// the bottom and then calling only TickSpinner (never SetInfo again) must
+// leave the scroll position exactly where it was - a content rebuild would
+// reset it via refreshViewport's own wasAtBottom logic, exactly the
+// flicker this rule forbids.
+func TestSessionPane_TickSpinner_NeverDisturbsScrollPosition(t *testing.T) {
+	base := time.Date(2026, 9, 2, 18, 0, 0, 0, time.Local)
+	var turns []clarity.Turn
+	for i := 0; i < 60; i++ {
+		turns = append(turns, clarity.Turn{
+			Kind: clarity.TurnOwner,
+			At:   base.Add(time.Duration(i) * time.Minute),
+			Text: fmt.Sprintf("turn number %d", i),
+		})
+	}
+	info := fixtureInfo()
+	info.Tail.Turns = turns
+
+	s := NewSessionPane()
+	s.SetSize(80, 20)
+	s.SetInfo(info)
+
+	for i := 0; i < 20; i++ {
+		s.ScrollUp()
+	}
+	offsetBefore := s.viewport.YOffset()
+
+	s.TickSpinner()
+	_ = s.String() // the same render call path a 100ms tick drives
+
+	require.Equal(t, offsetBefore, s.viewport.YOffset(),
+		"TickSpinner alone must never move the scroll position - that only happens on a genuine content rebuild")
 }
 
 // TestSessionPane_RunningToolLine_ElapsedAdvancesBetweenTicks is the
@@ -391,15 +563,15 @@ func TestSessionPane_RunningToolLine_ElapsedAdvancesBetweenTicks(t *testing.T) {
 	s := NewSessionPane()
 	s.SetSize(160, 34)
 
-	s.SetInfo(openTurnInfo(base, 0, base.Add(300*time.Millisecond)))
+	s.SetInfo(openTurnInfo(base, base.Add(300*time.Millisecond)))
 	early := toolLine(t, s.String())
 	require.Contains(t, early, "running", "an unmatched tool_use must show running, not a bare exit/error label")
 
-	s.SetInfo(openTurnInfo(base, 1, base.Add(800*time.Millisecond)))
+	s.SetInfo(openTurnInfo(base, base.Add(800*time.Millisecond)))
 	mid := toolLine(t, s.String())
 	require.NotEqual(t, early, mid, "the elapsed text must change tick to tick while the tool is still running")
 
-	s.SetInfo(openTurnInfo(base, 2, base.Add(1800*time.Millisecond)))
+	s.SetInfo(openTurnInfo(base, base.Add(1800*time.Millisecond)))
 	later := toolLine(t, s.String())
 	require.NotEqual(t, mid, later, "elapsed must keep advancing a further second later")
 }
