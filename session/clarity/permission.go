@@ -32,21 +32,61 @@ import "strings"
 const permissionPromptProceedLine = "Do you want to proceed?"
 const permissionPromptEscTrailerPrefix = "Esc to cancel"
 
+// sessionFeedbackSurveyWords are the four numbered option words the
+// harness's own end-of-session feedback survey carries together, in order,
+// on ONE line (board #315, owner addition 3 Sep 17:5x - "1 Bad 2 Fine 3
+// Good 0 Dismiss"; also seen with a "How was this session?" or "session
+// feedback" heading line above it). The anchor is the option line itself,
+// never the heading - the heading text is not confirmed stable across
+// harness versions, but these four words together are the survey's own
+// distinguishing shape. No REAL pane capture of this survey was available
+// to this leg (unlike PermissionPromptShapeExample's own real Bash-prompt
+// capture above) - this word list is built from the owner's description
+// alone and is UNTESTED against a live harness survey; re-verify against a
+// real capture before relying on it in production.
+var sessionFeedbackSurveyWords = []string{"Bad", "Fine", "Good", "Dismiss"}
+
+// isSessionFeedbackSurveyLine reports whether line carries the four
+// numbered option words together, in order - a heading line like "How was
+// this session?" or "session feedback" carries none of them, so this never
+// anchors on the heading.
+func isSessionFeedbackSurveyLine(line string) bool {
+	pos := 0
+	for _, word := range sessionFeedbackSurveyWords {
+		idx := strings.Index(line[pos:], word)
+		if idx < 0 {
+			return false
+		}
+		pos += idx + len(word)
+	}
+	return true
+}
+
 // IsPermissionPrompt reports whether pane's own last non-blank lines match
-// Claude Code's permission-prompt shape: a "Do you want to proceed?" line
-// followed (within a few lines, allowing for a varying number of numbered
-// options) by an "Esc to cancel ..." trailer. Anchored on those two lines
-// only - never the command/description text above them, which is a
-// different sentence for every tool - and never the number of options,
-// which varies by prompt. A capture with neither anchor (ordinary
-// conversation, a closed turn, a prompt scrolled out of view) reports
-// false.
+// EITHER of the two prompt shapes that block the input line and so read as
+// "needs a key" (board #315 item 6 - the session-feedback survey is a
+// second such shape, sitting alongside the original permission prompt):
+//
+//   - the harness's own permission prompt: a "Do you want to proceed?" line
+//     followed (within a few lines, allowing for a varying number of
+//     numbered options) by an "Esc to cancel ..." trailer. Anchored on
+//     those two lines only - never the command/description text above
+//     them, which is a different sentence for every tool - and never the
+//     number of options, which varies by prompt.
+//   - the harness's own session-feedback survey: a line carrying all four
+//     numbered option words (isSessionFeedbackSurveyLine).
+//
+// A capture with neither anchor (ordinary conversation, a closed turn, a
+// prompt scrolled out of view) reports false. A pure function over pane -
+// no state, no side effect.
 func IsPermissionPrompt(pane string) bool {
 	lines := nonBlankTail(pane, 12)
 	sawProceed := false
 	for _, l := range lines {
 		t := strings.TrimSpace(l)
 		switch {
+		case isSessionFeedbackSurveyLine(t):
+			return true
 		case strings.Contains(t, permissionPromptProceedLine):
 			sawProceed = true
 		case sawProceed && strings.HasPrefix(t, permissionPromptEscTrailerPrefix):

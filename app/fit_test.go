@@ -163,7 +163,14 @@ func TestView_NoLineExceedsWidth_NeedsYouTabSelected(t *testing.T) {
 			_, cmd := h.Update(feedTickMsg{})
 			require.NotNil(t, cmd)
 
-			h.list.Up() // the default tracked-group cursor wraps to the sole Needs-you row
+			// Walk Up until the cursor leaves the tracked group for the sole
+			// Needs-you row. newHome loads this machine's real store, so the
+			// default cursor's drawn position varies by machine; since board
+			// #315 Up walks the DRAWN order, a single Up only wraps from the
+			// first drawn row, so the walk is bounded by the tracked count.
+			for i := 0; i <= h.list.NumInstances() && h.list.GetSelectedInstance() != nil; i++ {
+				h.list.Up()
+			}
 			h.selectionChanged()
 			require.Equal(t, ui.NeedsYouTab, h.tabbedWindow.GetActiveTab(),
 				"selecting the Needs-you row must have switched the tab")

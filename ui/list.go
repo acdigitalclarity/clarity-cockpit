@@ -1285,6 +1285,41 @@ func (l *List) groupLens() [3]int {
 	return [3]int{len(l.needsYou), len(l.items), len(l.external)}
 }
 
+// drawnItemOrder returns the tracked-instance store indices (into l.items)
+// in the EXACT order String() draws their rows: named modality groups
+// first, in groupLanesByModality's own first-seen order, then the
+// no-modality catch-all - board #315's own fix. Before this, Down/Up walked
+// l.items in plain store (append) order while String() drew grouped rows
+// above the ungrouped catch-all, so the last-appended item (always where a
+// freshly created lane lands, session/AddInstance) could be mid-screen in
+// the render while Down/Up still treated it as the group's own end - four
+// Downs from the fleet's first row selected the wrong instance while the
+// highlight band sat on a row nowhere near the cursor's apparent position,
+// which read as dead arrows, and the cursor could fall straight out of the
+// tracked group into an empty external one, leaving GetSelectedInstance
+// nil and the Session tab on its splash resting frame. This is the single
+// ordering function both String() and Down/Up below now
+// share, so the drawn row and the row the cursor lands on cannot drift
+// apart.
+func (l *List) drawnItemOrder() []int {
+	groups := groupLanesByModality(l.items, l.external)
+	order := make([]int, 0, len(l.items))
+	for _, g := range groups {
+		order = append(order, g.itemIdx...)
+	}
+	return order
+}
+
+// indexOfInt returns the position of v in s, or -1 if v is not present.
+func indexOfInt(s []int, v int) int {
+	for i, x := range s {
+		if x == v {
+			return i
+		}
+	}
+	return -1
+}
+
 // currentGroup reports which group index (0/1/2, matching groupLens' own
 // order) the cursor is currently in.
 func (l *List) currentGroup() int {
@@ -1327,16 +1362,30 @@ func (l *List) Down() {
 		return
 	}
 	g := l.currentGroup()
-	if l.selectedIdx < lens[g]-1 {
+	if g == 1 {
+		// The tracked-items group walks drawnItemOrder, not raw store
+		// order (board #315) - the position within the DRAWN sequence,
+		// never l.selectedIdx itself, decides whether there is a next row.
+		order := l.drawnItemOrder()
+		if pos := indexOfInt(order, l.selectedIdx); pos >= 0 && pos < len(order)-1 {
+			l.selectedIdx = order[pos+1]
+			return
+		}
+	} else if l.selectedIdx < lens[g]-1 {
 		l.selectedIdx++
 		return
 	}
 	for step := 1; step <= 3; step++ {
 		next := (g + step) % 3
-		if lens[next] > 0 {
-			l.setGroup(next, 0)
-			return
+		if lens[next] == 0 {
+			continue
 		}
+		if next == 1 {
+			l.setGroup(next, l.drawnItemOrder()[0])
+		} else {
+			l.setGroup(next, 0)
+		}
+		return
 	}
 }
 
@@ -1396,16 +1445,29 @@ func (l *List) Up() {
 		return
 	}
 	g := l.currentGroup()
-	if l.selectedIdx > 0 {
+	if g == 1 {
+		// Same drawnItemOrder walk as Down, in reverse (board #315).
+		order := l.drawnItemOrder()
+		if pos := indexOfInt(order, l.selectedIdx); pos > 0 {
+			l.selectedIdx = order[pos-1]
+			return
+		}
+	} else if l.selectedIdx > 0 {
 		l.selectedIdx--
 		return
 	}
 	for step := 1; step <= 3; step++ {
 		prev := ((g-step)%3 + 3) % 3
-		if lens[prev] > 0 {
-			l.setGroup(prev, lens[prev]-1)
-			return
+		if lens[prev] == 0 {
+			continue
 		}
+		if prev == 1 {
+			order := l.drawnItemOrder()
+			l.setGroup(prev, order[len(order)-1])
+		} else {
+			l.setGroup(prev, lens[prev]-1)
+		}
+		return
 	}
 }
 
