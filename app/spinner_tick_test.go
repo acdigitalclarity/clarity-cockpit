@@ -21,7 +21,7 @@ func TestPreviewTick_AdvancesSpinner_SessionTickDoesNot(t *testing.T) {
 	t.Setenv(clarity.ClaudeProjectsRootEnvVar, root)
 	t.Setenv(clarity.FeedQueuePathEnvVar, filepath.Join(root, "no-such-queue.json"))
 
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	now := time.Now()
 	selected := writeTrackedLaneFixture(t, root, "spinner-lane", now.Add(-time.Minute))
 	h.list.AddInstance(selected)()
