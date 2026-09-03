@@ -2,16 +2,19 @@ package app
 
 import (
 	"claude-squad/cmd"
+	"claude-squad/config"
 	"claude-squad/session"
 	"claude-squad/session/clarity"
 	"claude-squad/ui"
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/require"
 )
 
@@ -188,4 +191,122 @@ func TestClarityWrapperNew_WritesAccountAndModality_InstanceCarriesBoth(t *testi
 	require.Equal(t, "team-b", inst.Account(), "the instance record must carry the account")
 	require.Equal(t, "project", inst.Modality(), "the instance record must carry the modality")
 	require.Equal(t, clarity.EnvUnsetPrefix+" CLAUDE_CONFIG_DIR="+teamBConfigDir+" claude", inst.Program)
+}
+
+// fixtureInstance builds a tracked instance carrying a title and modality
+// only - board #315's own fixture, this file's counterpart to
+// ui/list_frontdoor5_test.go's frontdoor5Instance (that helper lives in
+// package ui, unreachable from here).
+func fixtureInstance(t *testing.T, title, modality string) *session.Instance {
+	t.Helper()
+	inst, err := session.NewInstance(session.InstanceOptions{
+		Title:      title,
+		Path:       t.TempDir(),
+		Program:    "echo",
+		NoWorktree: true,
+		Modality:   modality,
+	})
+	require.NoError(t, err)
+	return inst
+}
+
+// highlightedRowTitleApp is app package's own copy of ui/list_test.go's
+// highlightedRowTitle - parses the render's own "▌" marker line rather than
+// reading l.selectedIdx, so this is independent proof of which row the
+// screen visibly highlights.
+func highlightedRowTitleApp(t *testing.T, render string, titles []string) string {
+	t.Helper()
+	for _, line := range strings.Split(ansi.Strip(render), "\n") {
+		if !strings.HasPrefix(line, "▌") {
+			continue
+		}
+		for _, title := range titles {
+			if strings.Contains(line, title) {
+				return title
+			}
+		}
+	}
+	return ""
+}
+
+// TestNewLaneFinish_SelectionLandsOnDrawnPosition is board #315's own
+// message-level proof: this starts from EXACTLY the state startNewLane
+// itself already sets synchronously on the overlay's finishing enter
+// (app.go's startNewLane, stateDefault + newLaneOverlay=nil, before the
+// wrapper/tmux work even begins) and drives the async newLaneStartedMsg
+// that completes the flow - the overlay's own three-step UI is covered by
+// this file's other tests already. Four ungrouped existing lanes (store
+// index 0-3) plus two grouped ones (4-5, "enhancement"/"project") mirror
+// the owner's own fleet at the moment of his first wizard run; the new lane
+// joins the SAME "enhancement" group as build-night, appended at store
+// index 6 - exactly where AddInstance+SetSelectedInstance(NumInstances()-1)
+// (app.go's newLaneStartedMsg handler) leaves it.
+func TestNewLaneFinish_SelectionLandsOnDrawnPosition(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	storage, err := session.NewStorage(config.LoadState())
+	require.NoError(t, err)
+
+	h := newComposerTestHome(t)
+	h.storage = storage
+	h.state = stateDefault
+	h.newLaneOverlay = nil
+
+	h.list.AddInstance(fixtureInstance(t, "existing-1", ""))
+	h.list.AddInstance(fixtureInstance(t, "existing-2", ""))
+	h.list.AddInstance(fixtureInstance(t, "existing-3", ""))
+	h.list.AddInstance(fixtureInstance(t, "existing-4", ""))
+	h.list.AddInstance(fixtureInstance(t, "build-night", "enhancement"))
+	h.list.AddInstance(fixtureInstance(t, "p2p-supply-chain", "project"))
+	h.list.SetSize(46, 40)
+
+	newInst := fixtureInstance(t, "repro315", "enhancement")
+
+	model, _ := h.Update(newLaneStartedMsg{instance: newInst})
+	h2, ok := model.(*home)
+	require.True(t, ok)
+
+	require.Equal(t, stateDefault, h2.state, "the finishing enter must leave stateDefault")
+	require.Nil(t, h2.newLaneOverlay, "the finishing enter must clear the overlay pointer")
+	require.Same(t, newInst, h2.list.GetSelectedInstance(), "the selection must be the new instance")
+
+	titles := []string{"existing-1", "existing-2", "existing-3", "existing-4", "build-night", "p2p-supply-chain", "repro315"}
+	stripped := ansi.Strip(h2.list.String())
+	require.Equal(t, "repro315", highlightedRowTitleApp(t, stripped, titles),
+		"the highlight band must be on the new instance's own row")
+
+	// The new row sits INSIDE its modality group's render block: after the
+	// " Enhancement " heading and before the next heading (" Project ") -
+	// never above every heading (board #315's own "rendered at the TOP of
+	// the list, outside the grouped order").
+	headingIdx := strings.Index(stripped, " Enhancement ")
+	nextHeadingIdx := strings.Index(stripped, " Project ")
+	rowIdx := strings.Index(stripped, "repro315")
+	require.Greater(t, headingIdx, -1)
+	require.Greater(t, nextHeadingIdx, -1)
+	require.True(t, rowIdx > headingIdx && rowIdx < nextHeadingIdx,
+		"the new lane's row must render between its own heading and the next one")
+
+	// One Down must move to the NEXT drawn row, staying on a tracked row -
+	// board #315's own "arrow keys were dead" / "Session tab showed the
+	// splash": the old code read the new instance's raw store index (the
+	// list's own last index) as the tracked group's own END, so a Down from
+	// there fell straight out into the (empty) external group, leaving
+	// GetSelectedInstance nil - exactly what the Session tab reads as its
+	// splash resting frame (app.go's selectedSessionInfo).
+	h2.list.Down()
+	require.Equal(t, ui.RowKindTracked, h2.list.SelectedRowKind(),
+		"one Down after the finishing enter must stay on a tracked row, never fall into external/needs-you")
+	sel := h2.list.GetSelectedInstance()
+	require.NotNil(t, sel, "GetSelectedInstance must never go nil here - a nil selection is what the Session tab reads as the splash")
+	// The next DRAWN row after repro315 (drawnItemOrder: build-night,
+	// repro315, p2p-supply-chain, existing-1..4) is p2p-supply-chain - a
+	// raw-store-order Down instead would wrap off the end (repro315 sits at
+	// the highest store index) straight back to store index 0
+	// ("existing-1"), which this pins against directly rather than settling
+	// for "any other row".
+	require.Equal(t, "p2p-supply-chain", sel.Title,
+		"one Down must land on the NEXT DRAWN row, not wrap to raw store index 0")
+	stripped2 := ansi.Strip(h2.list.String())
+	require.Equal(t, "p2p-supply-chain", highlightedRowTitleApp(t, stripped2, titles),
+		"the highlight band must have moved to the same row the selection did")
 }

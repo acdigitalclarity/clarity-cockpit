@@ -75,3 +75,38 @@ func TestIsPermissionPrompt_EscTrailerAloneWithoutProceedLine_False(t *testing.T
 func TestIsPermissionPrompt_EmptyPane_False(t *testing.T) {
 	require.False(t, IsPermissionPrompt(""))
 }
+
+// sessionFeedbackSurveyPane is board #315's own survey shape (owner
+// addition, 3 Sep 17:5x): a heading line above the four numbered options -
+// no REAL pane capture of this was available to this leg, built from the
+// owner's own description (see permission.go's sessionFeedbackSurveyWords
+// doc comment); UNTESTED against a live harness survey.
+const sessionFeedbackSurveyPane = `⏺ Session complete.
+
+ How was this session?
+
+ 1. Bad   2. Fine   3. Good   0. Dismiss
+
+`
+
+func TestIsPermissionPrompt_SessionFeedbackSurvey_MatchesTrue(t *testing.T) {
+	require.True(t, IsPermissionPrompt(sessionFeedbackSurveyPane))
+}
+
+// TestIsPermissionPrompt_SessionFeedbackSurvey_HeadingAloneWithoutOptionsLine_False
+// pins the anchor to the FOUR-OPTION line, never the heading text above it
+// (the brief's own "match the four-option line, not the heading") - a
+// heading with no options line at all must not match.
+func TestIsPermissionPrompt_SessionFeedbackSurvey_HeadingAloneWithoutOptionsLine_False(t *testing.T) {
+	pane := "⏺ Session complete.\n\n How was this session?\n\n"
+	require.False(t, IsPermissionPrompt(pane))
+}
+
+// TestIsPermissionPrompt_SessionFeedbackSurvey_AlternateHeading_MatchesTrue
+// proves the detector anchors on the option words regardless of which
+// heading text (or none) sits above them - "session feedback" is the
+// brief's own second-named heading variant.
+func TestIsPermissionPrompt_SessionFeedbackSurvey_AlternateHeading_MatchesTrue(t *testing.T) {
+	pane := "⏺ session feedback\n\n 1. Bad   2. Fine   3. Good   0. Dismiss\n\n"
+	require.True(t, IsPermissionPrompt(pane))
+}
