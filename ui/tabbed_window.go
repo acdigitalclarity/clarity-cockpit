@@ -181,6 +181,14 @@ func (w *TabbedWindow) SetSessionFleetCounts(live, waiting int) {
 	w.session.SetFleetCounts(live, waiting)
 }
 
+// TickSpinner advances the Session pane's header/thinking-line spinner by
+// one frame (slice 14 rule 1) - called once per app.go's 100ms animation
+// tick, regardless of which tab is active, the same "always cheap, always
+// running" treatment SetSessionInfo above gets.
+func (w *TabbedWindow) TickSpinner() {
+	w.session.TickSpinner()
+}
+
 // SetNeedsYouInfo replaces the Needs-you tab's data for the selected row
 // (nil when the cursor is not on one - the pane then shows its own plain
 // message). Never gated on the active tab, same reasoning as

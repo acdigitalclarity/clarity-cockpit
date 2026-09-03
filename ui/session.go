@@ -90,15 +90,6 @@ type SessionInfo struct {
 	// the rest of this info was computed from, not a fresh time.Now() at
 	// render time.
 	Now time.Time
-	// AnimFrame is app.go's own 500ms session-tick counter (design/
-	// cockpit-pane/DECISIONS.md's Latency ruling: "while the selected
-	// lane's turn is open the header state glyph animates ... one step per
-	// 500 ms tick"). headerGlyph cycles animGlyphFrames by this value only
-	// while State is StateWorking and OpenTurn is true; every other state
-	// ignores it and shows its own static glyph. Threaded from app.go
-	// rather than derived from Now, so a test can drive the animation
-	// deterministically without depending on wall-clock timing.
-	AnimFrame int
 }
 
 // SessionPane renders the Session tab: the header, the turns (oldest first,
@@ -121,6 +112,15 @@ type SessionPane struct {
 	turnsSig sessionTurnsSignature
 
 	live, waiting int // fleet counters for the resting frame (splash.FleetCounts)
+
+	// spinnerFrame is the header glyph's and the thinking line's own 100ms
+	// animation counter (slice 14, rule 1: "decoupled from the read") -
+	// advanced by TickSpinner only, never by SetInfo, so a smooth spinner
+	// never depends on - and never triggers - a transcript read or a turns
+	// rebuild (rule 4's "the spinner frame alone does not rebuild the
+	// turns"). Read fresh by String() every render, same as the rest of
+	// s.info's own header fields.
+	spinnerFrame int
 
 	viewport viewport.Model // the scrollable turns region only, not the whole pane
 
@@ -268,6 +268,15 @@ func (s *SessionPane) SetFleetCounts(live, waiting int) {
 	s.live, s.waiting = live, waiting
 }
 
+// TickSpinner advances the header/thinking-line spinner by one frame - a
+// bare counter increment, called once per app.go's 100ms animation tick
+// (slice 14 rule 1). It never touches s.info, s.turnsSig or the viewport,
+// so it never triggers refreshViewport - the spinner's own smoothness is
+// entirely independent of when the transcript was last actually read.
+func (s *SessionPane) TickSpinner() {
+	s.spinnerFrame++
+}
+
 // fixedTopRows is the header/rule/divider row cost above the turns region -
 // 3 rows normally (two header lines, one rule), plus the "⋯ earlier in this
 // session" divider when the tail was cut.
@@ -381,15 +390,25 @@ func (s *SessionPane) String() string {
 	}
 
 	turnsHeight := s.turnsAreaHeight()
-	s.viewport.SetHeight(turnsHeight)
+	// The thinking line (rule 2) is drawn fresh every String() call, never
+	// stored in the viewport's own cached content (turnsSig/refreshViewport)
+	// - it steals one row off the BOTTOM of the turns region for itself, so
+	// its own spinner frame changing every 100ms never needs (and never
+	// triggers) a viewport content rebuild (rule 4).
+	showThinking := s.thinkingLineVisible() && turnsHeight > 0
+	viewportHeight := turnsHeight
+	if showThinking {
+		viewportHeight--
+	}
+	s.viewport.SetHeight(viewportHeight)
 	s.viewport.SetWidth(s.contentWidth())
 	body := strings.Split(s.viewport.View(), "\n")
-	if turnsHeight <= 0 {
+	if viewportHeight <= 0 {
 		body = nil
-	} else if len(body) < turnsHeight {
-		body = append(body, make([]string, turnsHeight-len(body))...)
-	} else if len(body) > turnsHeight {
-		body = body[:turnsHeight]
+	} else if len(body) < viewportHeight {
+		body = append(body, make([]string, viewportHeight-len(body))...)
+	} else if len(body) > viewportHeight {
+		body = body[:viewportHeight]
 	}
 	// Sticky continued header (SESSION-READING-SPEC.md): when the viewport's
 	// own top visible row is a prose turn's CONTINUATION (never its own
@@ -402,6 +421,9 @@ func (s *SessionPane) String() string {
 				body[0] = fitRow(renderContinuedLabel(tag), s.contentWidth())
 			}
 		}
+	}
+	if showThinking {
+		body = append(body, s.renderThinkingLine())
 	}
 	lines = append(lines, body...)
 
@@ -477,24 +499,86 @@ func fitsBox(content string, width, height int) bool {
 	return true
 }
 
-// animGlyphFrames is the header's own "loady thing" (the owner's words, 3
-// Sep 09:2x) - the Latency ruling's cycle, one frame per 500ms session
-// tick, shown only while a turn is genuinely open.
-var animGlyphFrames = []string{"●", "◐", "○", "◑"}
+// spinnerFrames is the header's and the thinking line's own braille cycle
+// (slice 14 rule 1, "the Claude Code look" - the owner's own reference,
+// 3 Sep 11:0x), one frame per 100ms animation tick (TickSpinner), shown
+// only while a turn is genuinely open. Replaces the old four-glyph
+// animGlyphFrames cycle (retired, slice 14): that cycle advanced once per
+// 500ms session tick and looked "jerky" (the owner's own word) for exactly
+// that reason.
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 // headerGlyph is renderHeaderLine1's own glyph: laneStateGlyph's static
 // glyph for every state except an OPEN working turn (State working, Tail.
-// OpenTurn true), which instead cycles animGlyphFrames by info.AnimFrame -
+// OpenTurn true), which instead cycles spinnerFrames by s.spinnerFrame -
 // the header IS the loading indicator while work is genuinely in flight,
 // and settles back to the plain "●" the instant ClassifyState reports the
-// turn closed (OpenTurn false), same tick.
+// turn closed (OpenTurn false), same tick. s.spinnerFrame advances on its
+// own 100ms tick (TickSpinner), never on the transcript's own read cadence,
+// so the animation is smooth regardless of how often the lane's data is
+// actually re-read.
 func (s *SessionPane) headerGlyph() (string, lipgloss.Style) {
 	t := s.info.Tail
 	if t.State == clarity.StateWorking && t.OpenTurn {
-		frame := animGlyphFrames[s.info.AnimFrame%len(animGlyphFrames)]
+		frame := spinnerFrames[s.spinnerFrame%len(spinnerFrames)]
 		return frame, laneStateAccentStyle
 	}
 	return laneStateGlyph(t.State)
+}
+
+// lastTurnIsRunningTool reports whether turns' own last (most recently
+// appended, i.e. most recent) entry is an unmatched tool_use - the Latency
+// ruling's own "a tool line IS running" test (buildTurns appends a tool
+// Turn at its tool_use record's own position, which stays put even once a
+// later tool_result resolves it in place - so an unresolved call is always
+// the list's own last entry for as long as it stays open).
+func lastTurnIsRunningTool(turns []clarity.Turn) bool {
+	if len(turns) == 0 {
+		return false
+	}
+	last := turns[len(turns)-1]
+	return last.Kind == clarity.TurnTool && last.Result == clarity.ResultRunning
+}
+
+// thinkingLineVisible is rule 2's own gate: the selected lane's turn is
+// open, State is genuinely Working (never Stalled - a stalled turn gets its
+// own state-line clause instead, never this footer), and no tool line is
+// currently running (a running tool's own "running <elapsed>" is already
+// the indicator - showing both would say the same thing twice).
+func (s *SessionPane) thinkingLineVisible() bool {
+	t := s.info.Tail
+	if t.State != clarity.StateWorking || !t.OpenTurn {
+		return false
+	}
+	return !lastTurnIsRunningTool(t.Turns)
+}
+
+// formatElapsedShort renders the thinking line's own "since the last
+// timestamped record" clock: whole seconds under a minute ("12s"), whole
+// minutes beyond that ("3m") - session/clarity/tail.go's roundAge shape,
+// duplicated here since that helper is private to its own package and this
+// is the only other place that needs it.
+func formatElapsedShort(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	d = d.Round(time.Second)
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	return fmt.Sprintf("%dm", int(d.Minutes()))
+}
+
+// renderThinkingLine draws rule 2's own foot line: the spinner (accent)
+// followed by "thinking · <elapsed>" (muted) - elapsed measured from
+// Tail.LastTurn, the last TIMESTAMPED record ClassifyState anchored its
+// open-turn read on, against s.info.Now (deterministic in tests, same
+// convention as minutesAgo/renderStateLine).
+func (s *SessionPane) renderThinkingLine() string {
+	t := s.info.Tail
+	frame := laneStateAccentStyle.Render(spinnerFrames[s.spinnerFrame%len(spinnerFrames)])
+	rest := sessionMutedStyle.Render(fmt.Sprintf(" thinking · %s", formatElapsedShort(s.info.Now.Sub(t.LastTurn))))
+	return fitRow(frame+rest, s.contentWidth())
 }
 
 // renderHeaderLine1 is "<lane>  ...  <glyph> <state>[ · N agents]   ctx
