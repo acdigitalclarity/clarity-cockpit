@@ -2,11 +2,16 @@ package ui
 
 import (
 	"math"
+	"math/rand"
+	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"charm.land/lipgloss/v2"
 	"charm.land/lipgloss/v2/compat"
 	"claude-squad/log"
+	"claude-squad/session/clarity"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -35,15 +40,50 @@ var (
 )
 
 // Butterfly on the tab bar (slice 21, owner's own words: "need some
-// serenity while working so many things"). Two glyphs read as open and
-// closed wings and are both proven single-width (StringWidth == 1,
-// tabbed_window_test.go's TestButterfly_FramesAreSingleWidth): U+029A/
-// U+025E, a mirror pair of lowercase IPA letters chosen over the emoji/
-// symbol candidates (rendered side by side in a scratch tmux pane at 164
-// columns, PROOF section of this leg's report) for reading as a small,
-// calm, rounded wing-open/wing-closed pair rather than a technical glyph
-// ("⌘") or a single ornament with no natural "closed" counterpart ("ꕥ").
-var butterflyFrames = [2]string{"ʚ", "ɞ"}
+// serenity while working so many things"; slice 23, "butterfly is cool -
+// can we improve it?"). At rest it beats through a four-step cycle -
+// closed, half, open, half - rather than slice 21's plain two-glyph
+// toggle (design refinement 1). The two endpoints are unchanged from slice
+// 21: U+029A ʚ (closed) and U+025E ɞ (open), a mirror pair of lowercase
+// IPA letters chosen over the emoji/symbol candidates (rendered side by
+// side in a scratch tmux pane at 164 columns, slice 21's own PROOF
+// section) for reading as a small, calm, rounded wing pair rather than a
+// technical glyph ("⌘") or a single ornament with no natural "closed"
+// counterpart ("ꕥ"). The half-beat glyph is new this slice: of the
+// candidates the brief names (ʘ, ɵ, θ, ɸ, all proven single-width by
+// TestButterfly_FramesAreSingleWidth below), ʘ (U+0298, a circle with a
+// centre dot) reads as an eye or a pupil rather than a wing, and θ/ɸ
+// (U+03B8, U+0278) are both common Greek letters - exactly the "reads as a
+// technical glyph" objection slice 21's own doc comment above raises
+// against "⌘", now against a maths symbol instead of a keyboard one. ɵ
+// (U+0275, LATIN SMALL LETTER BARRED O - a round body with a single
+// horizontal bar through it) stays in the same obscure lowercase-IPA
+// register as ʚ/ɞ and reads as the wings held flat and spread mid-beat,
+// symmetric between ʚ's left-open curl and ɞ's right-open curl rather than
+// leaning toward either - rendered against all four candidates side by
+// side (scratch tmux pane, isolated socket, this leg's own PROOF section)
+// to make that call. butterflyFrames[1] and [3] are the same glyph - the
+// half-beat looks identical rising into the open wingspan and falling back
+// out of it, so the cycle only needs three distinct glyphs to draw four
+// steps.
+var butterflyFrames = [4]string{"ʚ", "ɵ", "ɞ", "ɵ"}
+
+// Named indices into butterflyFrames - butterflyClosedFrame/OpenFrame are
+// also the two-state toggle the faster in-flight beat alternates between
+// (tickFastBeat below): a flight is quick enough that cycling through the
+// half-beat glyphs too would just look busy, not calm, so it skips them.
+const (
+	butterflyClosedFrame = 0
+	butterflyOpenFrame   = 2
+)
+
+// butterflyRestFrameTicks is how many 100ms ticks each of the four rest
+// frames holds before advancing to the next - design refinement 1's "one
+// beat per ~1.5s, easing so the open state holds longest": the four values
+// sum to 15 ticks (1.5s) for one full closed-half-open-half cycle, and the
+// open frame (index 2) holds twice as long as each of the other three -
+// the calmest point in the beat is the one it lingers on.
+var butterflyRestFrameTicks = [4]int{3, 3, 6, 3}
 
 // butterflyStyle is a single accent, not the two-tone body/wing scheme the
 // design offers as an alternative - two colours flickering on every rest
@@ -56,19 +96,70 @@ var butterflyStyle = lipgloss.NewStyle().
 	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#0f7f83"), Dark: lipgloss.Color("#54E6EA")})
 
 const (
-	// butterflyFlapTicksRest is how many 100ms ticks separate one rest flap
-	// from the next - "flaps once every 1.2s or so".
-	butterflyFlapTicksRest = 12
 	// butterflyFlapTicksFlying is the faster in-flight flap cadence -
-	// "wings beating faster in flight".
+	// "wings beating faster in flight" - shared by a tab-change flight and
+	// a meaningful-flight notice alike.
 	butterflyFlapTicksFlying = 3
 	// butterflyFlightTicks is how many 100ms ticks a flight between tabs
 	// takes - "drifts... over about 1.5s on the 100ms tick", and well
-	// inside the "ends... within 20 ticks" test bound.
+	// inside the "ends... within 20 ticks" test bound. A notice's own
+	// outbound and inbound legs (below) reuse this same duration.
 	butterflyFlightTicks = 15
 	// butterflyWobbleCycles is how many full sine wobbles a flight makes
 	// end to end - "a gentle wander (a sine wobble of one column)".
 	butterflyWobbleCycles = 2.0
+)
+
+// Idle wander (design refinement 2): every 45-90s at rest the butterfly
+// lifts off, drifts a few columns one way, pauses, and returns - never
+// while a real flight (tab change or notice) is under way, and never
+// leaving the tab bar's own width (butterflyStartWander below clamps it).
+const (
+	// butterflyWanderMinTicks/MaxTicks bound the random gap between one
+	// wander and the next - 45-90s at the shared 100ms tick.
+	butterflyWanderMinTicks = 450
+	butterflyWanderMaxTicks = 900
+	// butterflyWanderMinDriftCols/MaxDriftCols is how far a wander drifts -
+	// "three to six columns one way".
+	butterflyWanderMinDriftCols = 3
+	butterflyWanderMaxDriftCols = 6
+	// butterflyWanderTravelTicks is each leg's own duration (out, then
+	// back) - shorter than a tab-change flight (butterflyFlightTicks): a
+	// few columns is a much smaller trip than tab to tab, and the wander is
+	// meant to read as a small aside, not a second flight.
+	butterflyWanderTravelTicks = 10
+	// butterflyWanderPauseTicks is how long it lingers at the far point
+	// before heading back.
+	butterflyWanderPauseTicks = 8
+)
+
+// butterflyWanderTicksEnvVar lets a manual proof run force the idle wander
+// onto a short, fixed schedule instead of waiting out the real 45-90s
+// window - read once at construction (NewTabbedWindow), the same
+// test/proof-only env-var seam ui/terminal.go's own
+// CLARITY_TEST_FORBID_TMUX already uses in this package. Unset (or
+// non-positive) in every real run - main.go never sets it.
+const butterflyWanderTicksEnvVar = "CLARITY_BUTTERFLY_WANDER_TICKS"
+
+// butterflyNoticeHoverTicks is how long a notice flight hovers over the
+// Needs-you tab before heading back - design refinement 3's "about three
+// seconds".
+const butterflyNoticeHoverTicks = 30
+
+// Notice-flight phases (butterflyNoticePhase) - a new Needs-you row starts
+// a short round trip to the Needs-you tab and back, at the faster
+// in-flight beat throughout, including the hover.
+const (
+	butterflyNoticeOut = iota
+	butterflyNoticeHover
+	butterflyNoticeBack
+)
+
+// Idle-wander phases (butterflyWanderPhase).
+const (
+	butterflyWanderOut = iota
+	butterflyWanderPause
+	butterflyWanderBack
 )
 
 // SessionTab replaces the old PreviewTab (design/cockpit-pane/DECISIONS.md
@@ -109,18 +200,46 @@ type TabbedWindow struct {
 	needsYou *NeedsYouPane
 	terminal *TerminalPane
 
-	// Butterfly state (slice 21) - see the butterflyFrames/butterflyStyle
-	// doc comment above and TickButterfly/butterflyPosition below for the
-	// state machine. SetButterflyEnabled defaults true (NewTabbedWindow);
-	// wiring the --no-butterfly flag and matching config key into it is the
-	// caller's job (main.go/config.go), outside this file's own fence.
+	// Butterfly state (slice 21, extended slice 23) - see the
+	// butterflyFrames/butterflyStyle doc comment above and
+	// TickButterfly/butterflyPosition below for the state machine.
+	// SetButterflyEnabled defaults true (NewTabbedWindow); wiring the
+	// --no-butterfly flag and matching config key into it is the caller's
+	// job (main.go/config.go), outside this file's own fence.
 	butterflyEnabled    bool
 	butterflyRestTab    int  // the tab index the butterfly rests over, or flies towards
-	butterflyFlying     bool // mid-flight between two tabs
+	butterflyFlying     bool // mid-flight between two tabs (a real tab change)
 	butterflyFlightTick int  // 0..butterflyFlightTicks-1 while flying
 	butterflyFromCol    int  // column (tab-row coordinate space) the current flight departs from
 	butterflyFlapPhase  int  // ticks since the last frame flip
-	butterflyFrame      int  // 0 or 1, indexes butterflyFrames
+	butterflyFrame      int  // indexes butterflyFrames (0..3)
+
+	// Idle wander (slice 23, design refinement 2) - see startWander/
+	// tickWander/butterflyWanderPosition. butterflyRand is seeded from the
+	// clock at construction (design's own words); butterflyWanderTicksOverride,
+	// non-zero only under butterflyWanderTicksEnvVar, fixes the gap for a
+	// manual proof run instead of drawing it from the real 45-90s range.
+	butterflyRand                *rand.Rand
+	butterflyWanderTicksOverride int
+	butterflyTicksUntilWander    int  // ticks remaining until the next wander, counted down only while truly at rest
+	butterflyWandering           bool // mid-wander (out, paused, or heading back)
+	butterflyWanderPhase         int  // butterflyWanderOut/Pause/Back
+	butterflyWanderTick          int  // ticks elapsed in the current wander phase
+	butterflyWanderFromCol       int  // the wander's own rest column (where it lifted off, and returns to)
+	butterflyWanderToCol         int  // the far column the wander drifts out to
+
+	// Meaningful flights (slice 23, design refinement 3) - see
+	// NoticeNeedsYou/tickNotice/butterflyNoticePosition.
+	// butterflySeenIssues is the set of board issue numbers the last call
+	// has already seen - nil until the first call, which only primes it
+	// (see NoticeNeedsYou's own doc comment for why).
+	butterflySeenIssues        map[int]bool
+	butterflyNoticing          bool // mid-notice (flying out, hovering, or flying back)
+	butterflyNoticeNeedsFlight bool // false when the notice started already on the Needs-you tab - hover only, no flight legs
+	butterflyNoticePhase       int  // butterflyNoticeOut/Hover/Back
+	butterflyNoticeTick        int  // ticks elapsed in the current notice phase
+	butterflyNoticeFromCol     int  // the column the outbound leg departs from
+	butterflyNoticeReturnTab   int  // the tab that was active when the notice started - where the inbound leg lands
 }
 
 // NewTabbedWindow wires the three tabs: Session (slice 3's replacement for
@@ -130,17 +249,44 @@ type TabbedWindow struct {
 // both kept in the tree, dormant - nothing upstream is thrown away, neither
 // simply has a tab slot pointed at it any more.
 func NewTabbedWindow(session *SessionPane, needsYou *NeedsYouPane, terminal *TerminalPane) *TabbedWindow {
-	return &TabbedWindow{
+	w := &TabbedWindow{
 		tabs: []string{
 			"Session",
 			"Needs you",
 			"Terminal",
 		},
-		session:          session,
-		needsYou:         needsYou,
-		terminal:         terminal,
-		butterflyEnabled: true,
+		session:                      session,
+		needsYou:                     needsYou,
+		terminal:                     terminal,
+		butterflyEnabled:             true,
+		butterflyRand:                rand.New(rand.NewSource(time.Now().UnixNano())),
+		butterflyWanderTicksOverride: butterflyWanderTicksOverrideFromEnv(),
 	}
+	w.butterflyTicksUntilWander = w.nextWanderTicks()
+	return w
+}
+
+// butterflyWanderTicksOverrideFromEnv reads butterflyWanderTicksEnvVar once
+// at construction - see its own doc comment above.
+func butterflyWanderTicksOverrideFromEnv() int {
+	v := os.Getenv(butterflyWanderTicksEnvVar)
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+// nextWanderTicks draws the gap, in ticks, until the next idle wander -
+// the real 45-90s random range, or the fixed proof-only override.
+func (w *TabbedWindow) nextWanderTicks() int {
+	if w.butterflyWanderTicksOverride > 0 {
+		return w.butterflyWanderTicksOverride
+	}
+	return butterflyWanderMinTicks + w.butterflyRand.Intn(butterflyWanderMaxTicks-butterflyWanderMinTicks+1)
 }
 
 // AdjustPreviewWidth adjusts the width of the preview pane to be 90% of the
@@ -253,39 +399,247 @@ func (w *TabbedWindow) SetButterflyEnabled(enabled bool) {
 	w.butterflyEnabled = enabled
 }
 
+// ToggleButterflyEnabled flips the butterfly on or off (design refinement
+// 4: "b (shift-b, capital) toggles the butterfly live"). Wiring the actual
+// keypress to this method is app.go's own key-dispatch table
+// (keys/keys.go, app.go's key switch), both outside this file's fence -
+// this method is the capability the key-dispatch leg calls, the same way
+// it already calls Toggle/SetActiveTab/ScrollUp for the keys it owns.
+func (w *TabbedWindow) ToggleButterflyEnabled() {
+	w.butterflyEnabled = !w.butterflyEnabled
+}
+
 // TickButterfly advances the tab-bar butterfly's animation by one 100ms
 // tick - the same previewTickMsg tick TickSpinner above rides (app.go's
 // only forwarding line for this slice). It only ever touches this small
 // state struct, never the pane content underneath, so the cost is the
 // same "bare counter increment" TickSpinner's own doc comment claims -
 // drawing happens in String() below, once, on whichever tick asks for a
-// render.
+// render. A notice (slice 23 rule 3) takes priority over a plain tab
+// flight, which takes priority over an idle wander, which only ever starts
+// while genuinely at rest.
 func (w *TabbedWindow) TickButterfly() {
 	if !w.butterflyEnabled {
 		return
 	}
-	flapTicks := butterflyFlapTicksRest
-	if w.butterflyFlying {
-		flapTicks = butterflyFlapTicksFlying
-		w.butterflyFlightTick++
-		if w.butterflyFlightTick >= butterflyFlightTicks {
-			w.butterflyFlying = false
-			w.butterflyFlightTick = 0
+
+	if w.butterflyFlying || w.butterflyNoticing {
+		w.tickFastBeat()
+	} else {
+		w.tickRestBeat()
+	}
+
+	switch {
+	case w.butterflyNoticing:
+		w.tickNotice()
+	case w.butterflyFlying:
+		w.tickFlight()
+	case w.butterflyWandering:
+		w.tickWander()
+	default:
+		w.butterflyTicksUntilWander--
+		if w.butterflyTicksUntilWander <= 0 {
+			w.startWander()
 		}
 	}
+}
+
+// tickFastBeat is the faster wing-beat a real flight or a notice draws
+// (design rule 1's "wings beating faster in flight"): a plain two-state
+// toggle between the closed and open frames, skipping the two half-beat
+// frames the slow rest cycle uses below - a flight is over quickly enough
+// that a four-step cycle would just look busy, not calm.
+func (w *TabbedWindow) tickFastBeat() {
 	w.butterflyFlapPhase++
-	if w.butterflyFlapPhase >= flapTicks {
+	if w.butterflyFlapPhase >= butterflyFlapTicksFlying {
 		w.butterflyFlapPhase = 0
-		w.butterflyFrame = 1 - w.butterflyFrame
+		if w.butterflyFrame == butterflyClosedFrame {
+			w.butterflyFrame = butterflyOpenFrame
+		} else {
+			w.butterflyFrame = butterflyClosedFrame
+		}
 	}
+}
+
+// tickRestBeat is the four-step "closed, half, open, half" beat at rest
+// (design refinement 1): each frame holds for its own share of
+// butterflyRestFrameTicks before advancing, wrapping back to closed after
+// the second half-beat.
+func (w *TabbedWindow) tickRestBeat() {
+	w.butterflyFlapPhase++
+	if w.butterflyFlapPhase >= butterflyRestFrameTicks[w.butterflyFrame] {
+		w.butterflyFlapPhase = 0
+		w.butterflyFrame = (w.butterflyFrame + 1) % len(butterflyFrames)
+	}
+}
+
+// tickFlight advances an in-progress tab-change flight, settling it once
+// butterflyFlightTicks have elapsed (design rule 2).
+func (w *TabbedWindow) tickFlight() {
+	w.butterflyFlightTick++
+	if w.butterflyFlightTick >= butterflyFlightTicks {
+		w.butterflyFlying = false
+		w.butterflyFlightTick = 0
+	}
+}
+
+// tickNotice advances an in-progress notice through its three phases -
+// flying out to the Needs-you tab, hovering, then flying back to whichever
+// tab was active when the notice started (or, when the notice began
+// already on the Needs-you tab, hovering only - butterflyNoticeNeedsFlight
+// is false and the Back phase is skipped entirely).
+func (w *TabbedWindow) tickNotice() {
+	w.butterflyNoticeTick++
+	switch w.butterflyNoticePhase {
+	case butterflyNoticeOut:
+		if w.butterflyNoticeTick >= butterflyFlightTicks {
+			w.butterflyNoticePhase = butterflyNoticeHover
+			w.butterflyNoticeTick = 0
+		}
+	case butterflyNoticeHover:
+		if w.butterflyNoticeTick >= butterflyNoticeHoverTicks {
+			if w.butterflyNoticeNeedsFlight {
+				w.butterflyNoticePhase = butterflyNoticeBack
+				w.butterflyNoticeTick = 0
+			} else {
+				w.butterflyNoticing = false
+				w.butterflyNoticeTick = 0
+			}
+		}
+	case butterflyNoticeBack:
+		if w.butterflyNoticeTick >= butterflyFlightTicks {
+			w.butterflyNoticing = false
+			w.butterflyNoticeTick = 0
+		}
+	}
+}
+
+// startWander begins one idle-wander trip from the current rest column
+// (design refinement 2): a random drift of three to six columns, clamped
+// so it never leaves the tab bar's own width. A width of zero (collapsed
+// layout) or a clamp that leaves nowhere to go both just reschedule the
+// next attempt rather than wander in place.
+func (w *TabbedWindow) startWander() {
+	if w.width <= 0 {
+		w.butterflyTicksUntilWander = w.nextWanderTicks()
+		return
+	}
+	col, _ := w.butterflyPosition()
+	drift := butterflyWanderMinDriftCols + w.butterflyRand.Intn(butterflyWanderMaxDriftCols-butterflyWanderMinDriftCols+1)
+	if w.butterflyRand.Intn(2) == 0 {
+		drift = -drift
+	}
+	target := col + drift
+	maxCol := w.width + windowStyle.GetHorizontalFrameSize() - 1
+	if target < 0 {
+		target = 0
+	}
+	if target > maxCol {
+		target = maxCol
+	}
+	if target == col {
+		w.butterflyTicksUntilWander = w.nextWanderTicks()
+		return
+	}
+	w.butterflyWandering = true
+	w.butterflyWanderPhase = butterflyWanderOut
+	w.butterflyWanderTick = 0
+	w.butterflyWanderFromCol = col
+	w.butterflyWanderToCol = target
+}
+
+// tickWander advances an in-progress wander through its three phases -
+// drifting out, pausing at the far point, then drifting back - rescheduling
+// the next wander once it lands.
+func (w *TabbedWindow) tickWander() {
+	w.butterflyWanderTick++
+	switch w.butterflyWanderPhase {
+	case butterflyWanderOut:
+		if w.butterflyWanderTick >= butterflyWanderTravelTicks {
+			w.butterflyWanderPhase = butterflyWanderPause
+			w.butterflyWanderTick = 0
+		}
+	case butterflyWanderPause:
+		if w.butterflyWanderTick >= butterflyWanderPauseTicks {
+			w.butterflyWanderPhase = butterflyWanderBack
+			w.butterflyWanderTick = 0
+		}
+	case butterflyWanderBack:
+		if w.butterflyWanderTick >= butterflyWanderTravelTicks {
+			w.butterflyWandering = false
+			w.butterflyWanderTick = 0
+			w.butterflyTicksUntilWander = w.nextWanderTicks()
+		}
+	}
+}
+
+// NoticeNeedsYou is app.go's own feed-tick hook (design refinement 3):
+// called every feed tick with the freshly ranked Needs-you rows, it starts
+// a short flight to the Needs-you tab the moment a row carrying a board
+// issue number this call has never seen before appears - "the feed rebuild
+// brings a Needs-you row that was not there before". The very first call
+// only primes the seen-set and never flies: every row already on the board
+// when the cockpit starts would otherwise "arrive" as new the moment the
+// first tick runs, sending the butterfly off on a flight nobody asked for.
+// A tick that reports the exact same rows as last time (the common case -
+// RankedNeedsYou/DiscoverExternalLanes both re-read on the same 3s cadence)
+// never flies either - only a number this call has not already recorded.
+func (w *TabbedWindow) NoticeNeedsYou(items []clarity.FeedItem) {
+	firstCall := w.butterflySeenIssues == nil
+	seenNow := make(map[int]bool, len(items))
+	isNew := false
+	for _, item := range items {
+		n, ok := clarity.BoardIssueNumber(item.Source)
+		if !ok {
+			continue
+		}
+		seenNow[n] = true
+		if !firstCall && !w.butterflySeenIssues[n] {
+			isNew = true
+		}
+	}
+	w.butterflySeenIssues = seenNow
+	if firstCall || !isNew || !w.butterflyEnabled {
+		return
+	}
+	w.startNotice()
+}
+
+// startNotice begins a notice: a hover only, in place, if the Needs-you
+// tab is already active ("If the Needs you tab IS the active tab it just
+// hovers in place" - design refinement 3), otherwise a full flight out,
+// hover, then flight back to whatever tab was active. Cancels any
+// in-progress wander or tab flight first, capturing the current column as
+// the outbound leg's own departure point the same way
+// butterflyOnActiveTabChanged does for a real tab change.
+func (w *TabbedWindow) startNotice() {
+	if w.activeTab == NeedsYouTab {
+		w.butterflyWandering = false
+		w.butterflyNoticing = true
+		w.butterflyNoticeNeedsFlight = false
+		w.butterflyNoticePhase = butterflyNoticeHover
+		w.butterflyNoticeTick = 0
+		w.butterflyNoticeReturnTab = w.activeTab
+		return
+	}
+	col, _ := w.butterflyPosition()
+	w.butterflyWandering = false
+	w.butterflyFlying = false
+	w.butterflyFlightTick = 0
+	w.butterflyNoticing = true
+	w.butterflyNoticeNeedsFlight = true
+	w.butterflyNoticePhase = butterflyNoticeOut
+	w.butterflyNoticeTick = 0
+	w.butterflyNoticeFromCol = col
+	w.butterflyNoticeReturnTab = w.activeTab
 }
 
 // butterflyOnActiveTabChanged starts a flight from wherever the butterfly
 // currently sits (its rest column, or - if a second tab change interrupts
-// an earlier flight - its current in-flight column) to the newly active
-// tab. A no-op if the active tab did not actually change (Toggle/
-// SetActiveTab call this unconditionally; most SetActiveTab calls in
-// app.go re-assert the tab that is already active).
+// an earlier flight, wander or notice - its current in-flight column) to
+// the newly active tab. A no-op if the active tab did not actually change
+// (Toggle/SetActiveTab call this unconditionally; most SetActiveTab calls
+// in app.go re-assert the tab that is already active).
 func (w *TabbedWindow) butterflyOnActiveTabChanged(prevActiveTab int) {
 	if w.activeTab == prevActiveTab || !w.butterflyEnabled {
 		return
@@ -294,6 +648,8 @@ func (w *TabbedWindow) butterflyOnActiveTabChanged(prevActiveTab int) {
 		col, _ := w.butterflyPosition()
 		w.butterflyFromCol = col
 	}
+	w.butterflyWandering = false
+	w.butterflyNoticing = false
 	w.butterflyRestTab = w.activeTab
 	w.butterflyFlying = true
 	w.butterflyFlightTick = 0
@@ -314,46 +670,121 @@ func (w *TabbedWindow) butterflyTabCenterCol(tab int) int {
 	return tab*tabWidth + width/2
 }
 
-// butterflyPosition returns the butterfly's current column and which row
-// it draws on: 0 is the tab bar's own border row (rest, and the start/end
-// instant of every flight), -1 is the free spacer row directly above it
-// (used only mid-flight - String()'s own "lifts off" row, the design's
-// "one row up if there is a free row" branch; the tab bar always has one
-// here, see this leg's report). At rest, or once a flight has run its
-// course, this is a pure function of butterflyRestTab; mid-flight it
-// linearly interpolates from butterflyFromCol with a gentle sine wander
-// and a short overshoot that settles back onto the target exactly as the
-// flight ends (design rule 2).
-func (w *TabbedWindow) butterflyPosition() (col int, row int) {
-	target := w.butterflyTabCenterCol(w.butterflyRestTab)
-	if !w.butterflyFlying {
-		return target, 0
-	}
-
-	t := float64(w.butterflyFlightTick) / float64(butterflyFlightTicks)
-	base := float64(w.butterflyFromCol) + t*float64(target-w.butterflyFromCol)
-
+// butterflyFlightFrac is the shared "in flight" math every kind of
+// airborne movement this file animates uses: a fraction t (0..1) of the
+// way from fromCol to toCol, with a gentle sine wobble throughout the
+// design's own "gentle wander" rule asks for, and - only when overshoot is
+// set, the tab-change flights and notice legs but not the idle wander - a
+// short overshoot-and-settle in the final stretch (design rule 2). lifted
+// reports whether this instant belongs on the free spacer row rather than
+// the tab bar's own border row - lift off shortly after leaving, land
+// shortly before arriving, so the flight visibly departs from and returns
+// to the border row rather than teleporting onto the spacer row.
+func butterflyFlightFrac(fromCol, toCol int, t float64, overshoot bool) (col int, lifted bool) {
+	base := float64(fromCol) + t*float64(toCol-fromCol)
 	wobble := math.Sin(2*math.Pi*butterflyWobbleCycles*t) * (1 - t)
 
-	overshoot := 0.0
-	const overshootStart = 0.8
-	if t >= overshootStart {
-		dir := 1.0
-		if target < w.butterflyFromCol {
-			dir = -1.0
+	extra := 0.0
+	if overshoot {
+		const overshootStart = 0.8
+		if t >= overshootStart {
+			dir := 1.0
+			if toCol < fromCol {
+				dir = -1.0
+			}
+			extra = 2 * dir * math.Sin(math.Pi*(t-overshootStart)/(1-overshootStart))
 		}
-		overshoot = 2 * dir * math.Sin(math.Pi*(t-overshootStart)/(1-overshootStart))
 	}
 
-	col = int(math.Round(base + wobble + overshoot))
-	// Lift off shortly after leaving, land shortly before arriving - the
-	// row0 edges are what makes the flight visibly depart from and return
-	// to the border row rather than teleporting onto the spacer row.
-	row = -1
-	if t < 0.12 || t > 0.88 {
-		row = 0
+	col = int(math.Round(base + wobble + extra))
+	lifted = t >= 0.12 && t <= 0.88
+	return col, lifted
+}
+
+// butterflyPosition returns the butterfly's current column and which row
+// it draws on: 0 is the tab bar's own border row (rest, and the start/end
+// instant of every flight, notice or wander leg), -1 is the free spacer
+// row directly above it (String()'s own "lifts off" row, the design's "one
+// row up if there is a free row" branch; the tab bar always has one here,
+// see this leg's report). A notice takes priority over a plain tab flight,
+// which takes priority over an idle wander, which is a pure function of
+// butterflyRestTab whenever none of the three is under way.
+func (w *TabbedWindow) butterflyPosition() (col int, row int) {
+	if w.butterflyNoticing {
+		return w.butterflyNoticePosition()
 	}
-	return col, row
+	if w.butterflyFlying {
+		return w.butterflyFlightPosition()
+	}
+	if w.butterflyWandering {
+		return w.butterflyWanderPosition()
+	}
+	return w.butterflyTabCenterCol(w.butterflyRestTab), 0
+}
+
+// butterflyFlightPosition is a real tab-change flight's own position -
+// unchanged behaviour from slice 21, now expressed via the shared
+// butterflyFlightFrac helper.
+func (w *TabbedWindow) butterflyFlightPosition() (col int, row int) {
+	target := w.butterflyTabCenterCol(w.butterflyRestTab)
+	t := float64(w.butterflyFlightTick) / float64(butterflyFlightTicks)
+	c, lifted := butterflyFlightFrac(w.butterflyFromCol, target, t, true)
+	if lifted {
+		return c, -1
+	}
+	return c, 0
+}
+
+// butterflyNoticePosition is a notice's own position across its three
+// phases: flying out to the Needs-you tab's centre, hovering there, then
+// flying back to whatever tab was active when the notice started.
+func (w *TabbedWindow) butterflyNoticePosition() (col int, row int) {
+	target := w.butterflyTabCenterCol(NeedsYouTab)
+	switch w.butterflyNoticePhase {
+	case butterflyNoticeOut:
+		t := float64(w.butterflyNoticeTick) / float64(butterflyFlightTicks)
+		c, lifted := butterflyFlightFrac(w.butterflyNoticeFromCol, target, t, true)
+		if lifted {
+			return c, -1
+		}
+		return c, 0
+	case butterflyNoticeBack:
+		home := w.butterflyTabCenterCol(w.butterflyNoticeReturnTab)
+		t := float64(w.butterflyNoticeTick) / float64(butterflyFlightTicks)
+		c, lifted := butterflyFlightFrac(target, home, t, true)
+		if lifted {
+			return c, -1
+		}
+		return c, 0
+	default: // butterflyNoticeHover
+		return target, 0
+	}
+}
+
+// butterflyWanderPosition is an idle wander's own position across its
+// three phases: drifting out, pausing at the far point (lifted, on the
+// free spacer row throughout the pause), then drifting back - the wobble
+// design refinement 2 asks for ("drifts... with the flight wobble"), but
+// no overshoot: a wander is a small aside, not a second flight.
+func (w *TabbedWindow) butterflyWanderPosition() (col int, row int) {
+	switch w.butterflyWanderPhase {
+	case butterflyWanderOut:
+		t := float64(w.butterflyWanderTick) / float64(butterflyWanderTravelTicks)
+		c, lifted := butterflyFlightFrac(w.butterflyWanderFromCol, w.butterflyWanderToCol, t, false)
+		if lifted {
+			return c, -1
+		}
+		return c, 0
+	case butterflyWanderPause:
+		return w.butterflyWanderToCol, -1
+	default: // butterflyWanderBack
+		t := float64(w.butterflyWanderTick) / float64(butterflyWanderTravelTicks)
+		c, lifted := butterflyFlightFrac(w.butterflyWanderToCol, w.butterflyWanderFromCol, t, false)
+		if lifted {
+			return c, -1
+		}
+		return c, 0
+	}
 }
 
 // butterflyOverlay splices frame (the current wing glyph) into line at
