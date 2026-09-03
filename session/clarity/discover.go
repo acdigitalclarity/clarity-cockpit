@@ -46,6 +46,18 @@ type ExternalLane struct {
 	Fill           Fill
 	FillOK         bool
 
+	// Account is the seat tag the root this lane's transcript sat under
+	// resolves to (claudeProjectsRoots' own resolution) - derived, never
+	// declared twice, per FRONTDOOR-SPEC.md "Discovery across roots". "" for
+	// a root the registry names no account for.
+	Account string
+
+	// Modality is read from the lane folder's own .claude/CLAUDE.md
+	// Modality: line (WorkDir below), mirroring scripts/clarity's
+	// session_modality(). "" when WorkDir is empty, the folder does not
+	// exist, or the line is absent.
+	Modality string
+
 	// WorkDir is the lane's own working directory, read straight from the
 	// transcript's "cwd" field (readTranscriptCwd below) - the same value
 	// TrackedExclusionPaths matching already reads, kept here too so the
@@ -68,10 +80,11 @@ type ExternalLane struct {
 // externalTranscriptRow is the pre-dedupe intermediate the discovery loop
 // builds before collapsing to one row per lane name.
 type externalTranscriptRow struct {
-	lane string
-	path string
-	mod  time.Time
-	cwd  string // "" when the transcript's own cwd field could not be read
+	lane    string
+	path    string
+	mod     time.Time
+	cwd     string // "" when the transcript's own cwd field could not be read
+	account string // the root this row's transcript sat under resolves to
 }
 
 // laneNameFromTranscriptDir mirrors fleet_dashboard.py's lane derivation
@@ -167,40 +180,76 @@ func readTranscriptCwd(transcriptPath string) (cwd string, ok bool) {
 	return "", false
 }
 
-// DiscoverExternalLanes derives the list of live external lanes: every
-// ~/.claude/projects/<encoded>/*.jsonl transcript whose mtime is within
-// ExternalLiveWindow, minus any path containing "memory", minus any lane
-// name starting with "subagents", minus any lane whose transcript's own
-// "cwd" field is already present in excludeDirs (see TrackedExclusionPaths
-// - a lane Claude Squad already tracks as an instance is never ALSO shown
-// as an external row) - collapsed to the single newest transcript per lane
-// name, sorted newest-first. A nil or empty excludeDirs is valid (no
-// exclusions).
-func DiscoverExternalLanes(excludeDirs map[string]bool) ([]ExternalLane, error) {
-	pattern := filepath.Join(claudeProjectsRoot(), "*", "*.jsonl")
-	matches, err := filepath.Glob(pattern)
-	if err != nil {
-		return nil, err
+// modalityFromLaneDir reads the Modality: line from lanePath's own
+// .claude/CLAUDE.md, mirroring scripts/clarity's session_modality() (grep -i
+// '^Modality:' | sed 's/^Modality:[[:space:]]*//'). "" when lanePath is
+// empty, the folder does not exist, or the line is absent - never an error,
+// since most external lanes predate this convention.
+func modalityFromLaneDir(lanePath string) string {
+	if lanePath == "" {
+		return ""
 	}
+	data, err := os.ReadFile(filepath.Join(lanePath, ".claude", "CLAUDE.md"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if v, ok := claudeMDFieldValue(line, "Modality"); ok {
+			return v
+		}
+	}
+	return ""
+}
 
+// claudeMDFieldValue reports whether line declares field as a "Field:"
+// prefix (case-insensitive, matching the shell's grep -i) and returns its
+// trimmed value.
+func claudeMDFieldValue(line, field string) (value string, ok bool) {
+	trimmed := strings.TrimSpace(line)
+	prefix := field + ":"
+	if len(trimmed) < len(prefix) || !strings.EqualFold(trimmed[:len(prefix)], prefix) {
+		return "", false
+	}
+	return strings.TrimSpace(trimmed[len(prefix):]), true
+}
+
+// DiscoverExternalLanes derives the list of live external lanes: every
+// <root>/<encoded>/*.jsonl transcript across every root claudeProjectsRoots()
+// names, whose mtime is within ExternalLiveWindow, minus any path containing
+// "memory", minus any lane name starting with "subagents", minus any lane
+// whose transcript's own "cwd" field is already present in excludeDirs (see
+// TrackedExclusionPaths - a lane Claude Squad already tracks as an instance
+// is never ALSO shown as an external row) - collapsed to the single newest
+// transcript per (account, lane name) pair, sorted newest-first. The same
+// lane name under two different roots is two rows (different seats) - the
+// dedupe is scoped to one root's own lanes, never across roots. A nil or
+// empty excludeDirs is valid (no exclusions).
+func DiscoverExternalLanes(excludeDirs map[string]bool) ([]ExternalLane, error) {
 	now := time.Now()
 	var rows []externalTranscriptRow
-	for _, p := range matches {
-		if strings.Contains(p, "memory") {
-			continue
+	for _, root := range claudeProjectsRoots() {
+		pattern := filepath.Join(root.Path, "*", "*.jsonl")
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			return nil, err
 		}
-		info, statErr := os.Stat(p)
-		if statErr != nil {
-			continue
+		for _, p := range matches {
+			if strings.Contains(p, "memory") {
+				continue
+			}
+			info, statErr := os.Stat(p)
+			if statErr != nil {
+				continue
+			}
+			if now.Sub(info.ModTime()) > ExternalLiveWindow {
+				continue
+			}
+			lane := laneNameFromTranscriptDir(filepath.Dir(p))
+			if strings.HasPrefix(lane, "subagents") {
+				continue
+			}
+			rows = append(rows, externalTranscriptRow{lane: lane, path: p, mod: info.ModTime(), account: root.Account})
 		}
-		if now.Sub(info.ModTime()) > ExternalLiveWindow {
-			continue
-		}
-		lane := laneNameFromTranscriptDir(filepath.Dir(p))
-		if strings.HasPrefix(lane, "subagents") {
-			continue
-		}
-		rows = append(rows, externalTranscriptRow{lane: lane, path: p, mod: info.ModTime()})
 	}
 
 	// Newest first, so the per-lane dedupe below keeps each lane's newest
@@ -211,10 +260,11 @@ func DiscoverExternalLanes(excludeDirs map[string]bool) ([]ExternalLane, error) 
 	seen := make(map[string]bool, len(rows))
 	out := make([]ExternalLane, 0, len(rows))
 	for _, r := range rows {
-		if seen[r.lane] {
+		key := r.account + "\x00" + r.lane
+		if seen[key] {
 			continue
 		}
-		seen[r.lane] = true
+		seen[key] = true
 		cwd, cwdOK := readTranscriptCwd(r.path)
 		if cwdOK && excludeDirs[filepath.Clean(cwd)] {
 			continue
@@ -228,6 +278,8 @@ func DiscoverExternalLanes(excludeDirs map[string]bool) ([]ExternalLane, error) 
 			Fill:           fill,
 			FillOK:         ok,
 			WorkDir:        cwd,
+			Account:        r.account,
+			Modality:       modalityFromLaneDir(cwd),
 		})
 	}
 	return out, nil

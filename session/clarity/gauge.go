@@ -16,12 +16,21 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
 // ClaudeProjectsRootEnvVar overrides the default ~/.claude/projects root.
-// Set only for tests; the real CLI relies on the default.
+// Set only for tests; the real CLI relies on the default. Superseded by
+// ClaudeProjectsRootsEnvVar when that is set, but kept honoured on its own
+// exactly as before - every existing test and fixture recipe keys on it.
 const ClaudeProjectsRootEnvVar = "CLARITY_CLAUDE_PROJECTS_ROOT"
+
+// ClaudeProjectsRootsEnvVar is the plural, colon-separated sibling of
+// ClaudeProjectsRootEnvVar: multiple roots for multiple accounts' config
+// directories. Takes precedence over the singular var when set. Set only
+// for tests; the real CLI relies on the default-plus-registry branch below.
+const ClaudeProjectsRootsEnvVar = "CLARITY_CLAUDE_PROJECTS_ROOTS"
 
 // DefaultClaudeProjectsRoot is the standard location of Claude Code's
 // per-project transcript directories on this machine.
@@ -44,11 +53,104 @@ type Fill struct {
 	Basis  string
 }
 
-func claudeProjectsRoot() string {
-	if root := os.Getenv(ClaudeProjectsRootEnvVar); root != "" {
-		return root
+// ProjectsRoot pairs one discovery root with the seat tag it came from -
+// "" when no registry account's config_dir resolves to this root. The
+// default root itself carries a tag too, whenever the registry names an
+// account whose config_dir is the default's parent (typically "main").
+type ProjectsRoot struct {
+	Path    string
+	Account string
+}
+
+// claudeProjectsRoots resolves the roots this package glob-searches, in
+// precedence order: the plural env var if set; else the singular env var
+// if set (today's exact behaviour, unchanged, so every existing test and
+// fixture recipe keeps working); else the default root plus one root per
+// registry account whose config_dir is not the default's own parent,
+// deduplicated, existing directories only. Every root's Account is
+// resolved against the registry by matching <config_dir>/projects to the
+// root's own path, regardless of which branch produced it.
+func claudeProjectsRoots() []ProjectsRoot {
+	registry := LoadAccountsRegistry()
+
+	var paths []string
+	switch {
+	case os.Getenv(ClaudeProjectsRootsEnvVar) != "":
+		paths = splitRootsList(os.Getenv(ClaudeProjectsRootsEnvVar))
+	case os.Getenv(ClaudeProjectsRootEnvVar) != "":
+		paths = []string{os.Getenv(ClaudeProjectsRootEnvVar)}
+	default:
+		paths = defaultAndRegistryRootPaths(registry)
 	}
-	return DefaultClaudeProjectsRoot
+
+	roots := make([]ProjectsRoot, 0, len(paths))
+	for _, p := range paths {
+		roots = append(roots, ProjectsRoot{Path: p, Account: tagForRoot(p, registry)})
+	}
+	return roots
+}
+
+// splitRootsList splits a colon-separated roots list, dropping empty
+// segments (a stray leading/trailing/doubled colon never yields a bare
+// root).
+func splitRootsList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ":") {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// defaultAndRegistryRootPaths builds the default branch's root list:
+// DefaultClaudeProjectsRoot always first, then <config_dir>/projects for
+// every registry account whose config_dir is not the default root's own
+// parent (that account IS the default root, already present), in tag-sorted
+// order for a deterministic result, deduplicated by cleaned path, and only
+// when the directory actually exists.
+func defaultAndRegistryRootPaths(registry map[string]string) []string {
+	paths := []string{DefaultClaudeProjectsRoot}
+	seen := map[string]bool{filepath.Clean(DefaultClaudeProjectsRoot): true}
+	defaultParent := filepath.Clean(filepath.Dir(DefaultClaudeProjectsRoot))
+
+	tags := make([]string, 0, len(registry))
+	for tag := range registry {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+
+	for _, tag := range tags {
+		cfgDir := registry[tag]
+		if filepath.Clean(cfgDir) == defaultParent {
+			continue
+		}
+		root := filepath.Clean(filepath.Join(cfgDir, "projects"))
+		if seen[root] {
+			continue
+		}
+		info, err := os.Stat(root)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		seen[root] = true
+		paths = append(paths, root)
+	}
+	return paths
+}
+
+// tagForRoot returns the registry tag whose config_dir's "projects"
+// subdirectory matches path (cleaned), or "" when no account resolves to
+// it - true of every root sourced from a plain env-var override with no
+// matching registry entry, and of a registry-less machine altogether.
+func tagForRoot(path string, registry map[string]string) string {
+	clean := filepath.Clean(path)
+	for tag, cfgDir := range registry {
+		if filepath.Clean(filepath.Join(cfgDir, "projects")) == clean {
+			return tag
+		}
+	}
+	return ""
 }
 
 // EncodeProjectDir mirrors the encoding Claude Code itself applies to a
@@ -64,30 +166,36 @@ func EncodeProjectDir(cwd string) string {
 // NewestTranscript returns the most-recently-modified *.jsonl transcript
 // under the lane's own project directory, matching
 // scripts/fleet_dashboard.py's per-lane "newest transcript" selection
-// (mtime descending, any path containing "memory" excluded). ok is false
-// when no transcript resolves, at which point the caller reports "n/a" -
-// never a stale or wrong-lane number.
+// (mtime descending, any path containing "memory" excluded). It searches
+// every root claudeProjectsRoots() names, not just the default, so a lane
+// launched on a second account's config directory still resolves under its
+// OWN root rather than being read against the default's (empty) copy. ok is
+// false when no transcript resolves, at which point the caller reports
+// "n/a" - never a stale or wrong-lane number.
 func NewestTranscript(lanePath string) (path string, ok bool) {
-	dir := filepath.Join(claudeProjectsRoot(), EncodeProjectDir(lanePath))
-	entries, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
-	if err != nil || len(entries) == 0 {
-		return "", false
-	}
+	encoded := EncodeProjectDir(lanePath)
 
 	var bestPath string
 	var bestMod int64 = -1
-	for _, p := range entries {
-		if strings.Contains(p, "memory") {
+	for _, root := range claudeProjectsRoots() {
+		dir := filepath.Join(root.Path, encoded)
+		entries, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+		if err != nil {
 			continue
 		}
-		info, statErr := os.Stat(p)
-		if statErr != nil {
-			continue
-		}
-		mt := info.ModTime().UnixNano()
-		if mt > bestMod {
-			bestMod = mt
-			bestPath = p
+		for _, p := range entries {
+			if strings.Contains(p, "memory") {
+				continue
+			}
+			info, statErr := os.Stat(p)
+			if statErr != nil {
+				continue
+			}
+			mt := info.ModTime().UnixNano()
+			if mt > bestMod {
+				bestMod = mt
+				bestPath = p
+			}
 		}
 	}
 	if bestPath == "" {

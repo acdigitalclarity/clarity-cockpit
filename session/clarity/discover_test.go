@@ -255,3 +255,107 @@ func TestLaneNameFromTranscriptDir_StripsKnownPrefixes(t *testing.T) {
 	require.Equal(t, "repos-clarity-squad",
 		laneNameFromTranscriptDir("/x/-Users-allencoates-repos-clarity-squad"))
 }
+
+// setUpTwoAccountRoots registers two registry accounts, each with its own
+// "projects" subdirectory under a fresh config directory, and points
+// CLARITY_CLAUDE_PROJECTS_ROOTS at both - the shape a two-seat fleet
+// actually has (root == <config_dir>/projects).
+func setUpTwoAccountRoots(t *testing.T, tagA, tagB string) (rootA, rootB string) {
+	t.Helper()
+	cfgA, cfgB := t.TempDir(), t.TempDir()
+	rootA = filepath.Join(cfgA, "projects")
+	rootB = filepath.Join(cfgB, "projects")
+	require.NoError(t, os.MkdirAll(rootA, 0755))
+	require.NoError(t, os.MkdirAll(rootB, 0755))
+
+	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	writeRegistry(t, registryPath, `{"accounts": {"`+tagA+`": {"config_dir": "`+cfgA+`"}, "`+tagB+`": {"config_dir": "`+cfgB+`"}}}`)
+	t.Setenv(AccountsRegistryEnvVar, registryPath)
+	t.Setenv(ClaudeProjectsRootsEnvVar, rootA+":"+rootB)
+	return rootA, rootB
+}
+
+// TestDiscoverExternalLanes_AcrossRootsEachCarriesItsAccount is item (b):
+// discovery over two temp roots yields two lanes, each carrying the seat
+// tag its own root resolves to.
+func TestDiscoverExternalLanes_AcrossRootsEachCarriesItsAccount(t *testing.T) {
+	rootA, rootB := setUpTwoAccountRoots(t, "team-a", "team-b")
+
+	mkTranscriptDir(t, rootA, "-Users-allencoates-projects-Clarity-sessions-fixture-a", "a.jsonl", time.Minute)
+	mkTranscriptDir(t, rootB, "-Users-allencoates-projects-Clarity-sessions-fixture-b", "a.jsonl", time.Minute)
+
+	lanes, err := DiscoverExternalLanes(nil)
+	require.NoError(t, err)
+	require.Len(t, lanes, 2)
+
+	byName := make(map[string]string, len(lanes))
+	for _, l := range lanes {
+		byName[l.Name] = l.Account
+	}
+	require.Equal(t, "team-a", byName["fixture-a"])
+	require.Equal(t, "team-b", byName["fixture-b"])
+}
+
+// TestDiscoverExternalLanes_SameLaneNameUnderTwoRootsIsTwoLanes is item (c):
+// the same lane name under two roots is two lanes (different seats), not
+// deduped against each other - only the within-a-root dedupe from slice 2
+// applies.
+func TestDiscoverExternalLanes_SameLaneNameUnderTwoRootsIsTwoLanes(t *testing.T) {
+	rootA, rootB := setUpTwoAccountRoots(t, "team-a", "team-b")
+
+	encoded := "-Users-allencoates-projects-Clarity-sessions-fixture-dual"
+	mkTranscriptDir(t, rootA, encoded, "a.jsonl", time.Minute)
+	mkTranscriptDir(t, rootB, encoded, "a.jsonl", time.Minute)
+
+	lanes, err := DiscoverExternalLanes(nil)
+	require.NoError(t, err)
+	require.Len(t, lanes, 2, "the same lane name under two different seats must be two rows")
+
+	seenAccounts := make(map[string]bool, 2)
+	for _, l := range lanes {
+		require.Equal(t, "fixture-dual", l.Name)
+		seenAccounts[l.Account] = true
+	}
+	require.True(t, seenAccounts["team-a"])
+	require.True(t, seenAccounts["team-b"])
+}
+
+// TestDiscoverExternalLanes_ReadsModalityFromLaneCLAUDEmd is item (d): the
+// Modality: line in a lane folder's own .claude/CLAUDE.md, mirroring
+// scripts/clarity's session_modality().
+func TestDiscoverExternalLanes_ReadsModalityFromLaneCLAUDEmd(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(ClaudeProjectsRootEnvVar, root)
+	t.Setenv(AccountsRegistryEnvVar, filepath.Join(t.TempDir(), "no-registry-here.json"))
+
+	lanePath := filepath.Join(t.TempDir(), "fixture-modality-lane")
+	require.NoError(t, os.MkdirAll(filepath.Join(lanePath, ".claude"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(lanePath, ".claude", "CLAUDE.md"),
+		[]byte("# Session\n\nAccount: team-b\nModality: bid\n"), 0644))
+
+	mkTranscriptDirWithCwd(t, root, "-Users-allencoates-projects-Clarity-sessions-fixture-modality", "a.jsonl", time.Minute, lanePath)
+
+	lanes, err := DiscoverExternalLanes(nil)
+	require.NoError(t, err)
+	require.Len(t, lanes, 1)
+	require.Equal(t, "bid", lanes[0].Modality)
+}
+
+// TestDiscoverExternalLanes_ModalityEmptyWhenNoCLAUDEmd proves the "empty
+// otherwise" half of the same rule: a lane folder with no .claude/CLAUDE.md
+// at all is not an error, just an empty Modality.
+func TestDiscoverExternalLanes_ModalityEmptyWhenNoCLAUDEmd(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(ClaudeProjectsRootEnvVar, root)
+	t.Setenv(AccountsRegistryEnvVar, filepath.Join(t.TempDir(), "no-registry-here.json"))
+
+	lanePath := filepath.Join(t.TempDir(), "fixture-no-md-lane")
+	require.NoError(t, os.MkdirAll(lanePath, 0755))
+
+	mkTranscriptDirWithCwd(t, root, "-Users-allencoates-projects-Clarity-sessions-fixture-no-md", "a.jsonl", time.Minute, lanePath)
+
+	lanes, err := DiscoverExternalLanes(nil)
+	require.NoError(t, err)
+	require.Len(t, lanes, 1)
+	require.Empty(t, lanes[0].Modality)
+}

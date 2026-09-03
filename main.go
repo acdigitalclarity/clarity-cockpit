@@ -290,8 +290,12 @@ var (
 				if ext.FillOK {
 					fillLabel = fmt.Sprintf("%d%%", ext.Fill.Pct)
 				}
-				fmt.Printf("%-32s ctx %-5s last write %s  (external - message only, cannot attach/kill)\n",
-					ext.Name, fillLabel, ext.LastWrite.Format("15:04:05"))
+				seat := ext.Account
+				if seat == "" {
+					seat = "-"
+				}
+				fmt.Printf("%-32s [%-6s] ctx %-5s last write %s  (external - message only, cannot attach/kill)\n",
+					ext.Name, seat, fillLabel, ext.LastWrite.Format("15:04:05"))
 			}
 			return nil
 		},
@@ -329,6 +333,22 @@ var (
 				os.Exit(1)
 			}
 
+			// The seat tag for this lane, resolved the same way discoverCmd's
+			// rows are - which root (claudeProjectsRoots) the lane's live
+			// transcript sat under. "" (no bracket printed) for a lane
+			// resolved via ResolveExistingLaneDir instead (not currently a
+			// live external row) or on a root the registry names no account
+			// for.
+			seat := ""
+			if external, err := clarity.DiscoverExternalLanes(nil); err == nil {
+				for _, ext := range external {
+					if clarity.MatchesQueriedLane(ext, lane) {
+						seat = ext.Account
+						break
+					}
+				}
+			}
+
 			tail, err := clarity.ReadLaneTail(transcriptPath, clarity.DefaultTailMaxBytes, laneTailTurnsFlag, time.Now())
 			if err != nil {
 				fmt.Printf("lane-tail: could not read %s: %v\n", transcriptPath, err)
@@ -345,7 +365,11 @@ var (
 				return nil
 			}
 
-			fmt.Println(clarity.RenderHeaderLine(lane, tail))
+			header := clarity.RenderHeaderLine(lane, tail)
+			if seat != "" {
+				header = fmt.Sprintf("%s [%s]", header, seat)
+			}
+			fmt.Println(header)
 			for _, turn := range tail.Turns {
 				for _, line := range clarity.RenderTurnLines(turn, 100) {
 					fmt.Println(line)
