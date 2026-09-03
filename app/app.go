@@ -32,6 +32,9 @@ const GlobalInstanceLimit = 10
 // entrance splash screen and starts directly in the instance list -
 // clarity-attach, discover and msg never call Run at all, so they never
 // show the splash regardless of this flag.
+// NoButterfly hides the tab-bar butterfly; set by main from the flag or config before Run.
+var NoButterfly bool
+
 func Run(ctx context.Context, program string, autoYes bool, noSplash bool) error {
 	// AltScreen and mouse-cell-motion (scroll) are now declared per-View,
 	// see (*home).View below - v2's declarative View fields replace v1's
@@ -223,6 +226,9 @@ func newHome(ctx context.Context, program string, autoYes bool, noSplash bool) *
 		laneTab:      ui.SessionTab,
 		needsYouTab:  ui.NeedsYouTab,
 		prevRowKind:  ui.RowKindTracked,
+	}
+	if NoButterfly {
+		h.tabbedWindow.SetButterflyEnabled(false)
 	}
 	if !noSplash {
 		h.splashModel = splash.New()
@@ -417,6 +423,8 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// (slice 14 rule 1): a bare counter increment, no file read - see
 		// SessionPane.TickSpinner's own doc comment.
 		m.tabbedWindow.TickSpinner()
+		// Slice 21's own tab-bar butterfly rides the same 100ms tick.
+		m.tabbedWindow.TickButterfly()
 		cmd := m.instanceChanged()
 		return m, tea.Batch(
 			cmd,

@@ -22,13 +22,14 @@ import (
 )
 
 var (
-	version      = "1.0.20"
-	programFlag  string
-	autoYesFlag  bool
-	daemonFlag   bool
-	noSplashFlag bool
-	binName      string
-	rootCmd      = &cobra.Command{
+	version         = "1.0.20"
+	programFlag     string
+	autoYesFlag     bool
+	daemonFlag      bool
+	noSplashFlag    bool
+	noButterflyFlag bool
+	binName         string
+	rootCmd         = &cobra.Command{
 		Use:   "claude-squad",
 		Short: "Clarity Workspace - Manage multiple AI agents like Claude Code, Aider, Codex, and Amp.",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -72,6 +73,7 @@ var (
 			if noSplashFlag {
 				noSplash = true
 			}
+			app.NoButterfly = cfg.NoButterfly || noButterflyFlag
 			if autoYes {
 				defer func() {
 					if err := daemon.LaunchDaemon(); err != nil {
@@ -415,6 +417,7 @@ func init() {
 		"[experimental] If enabled, all instances will automatically accept prompts")
 	rootCmd.Flags().BoolVar(&daemonFlag, "daemon", false, "Run a program that loads all sessions"+
 		" and runs autoyes mode on them.")
+	rootCmd.Flags().BoolVar(&noButterflyFlag, "no-butterfly", false, "Hide the butterfly that rests on the tab bar")
 	rootCmd.Flags().BoolVar(&noSplashFlag, "no-splash", false,
 		"Skip the entrance splash screen and start directly in the instance list")
 
