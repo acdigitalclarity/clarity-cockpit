@@ -1,9 +1,13 @@
 package ui
 
 import (
+	"math"
+	"strings"
+
 	"charm.land/lipgloss/v2"
 	"charm.land/lipgloss/v2/compat"
 	"claude-squad/log"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func tabBorderWithBottom(left, middle, right string) lipgloss.Border {
@@ -28,6 +32,43 @@ var (
 	windowStyle = lipgloss.NewStyle().
 			BorderForeground(highlightColor).
 			Border(lipgloss.NormalBorder(), false, true, true, true)
+)
+
+// Butterfly on the tab bar (slice 21, owner's own words: "need some
+// serenity while working so many things"). Two glyphs read as open and
+// closed wings and are both proven single-width (StringWidth == 1,
+// tabbed_window_test.go's TestButterfly_FramesAreSingleWidth): U+029A/
+// U+025E, a mirror pair of lowercase IPA letters chosen over the emoji/
+// symbol candidates (rendered side by side in a scratch tmux pane at 164
+// columns, PROOF section of this leg's report) for reading as a small,
+// calm, rounded wing-open/wing-closed pair rather than a technical glyph
+// ("⌘") or a single ornament with no natural "closed" counterpart ("ꕥ").
+var butterflyFrames = [2]string{"ʚ", "ɞ"}
+
+// butterflyStyle is a single accent, not the two-tone body/wing scheme the
+// design offers as an alternative - two colours flickering on every rest
+// flap is itself a form of colour pulsing, which the design's own rule 3
+// ("no colour pulsing") rules out; one calm accent is the calmer choice it
+// invites picking. Reuses the splash's own "openSkies" teal, the same
+// adaptive pair ui/session.go's sessionClaudeStyle already carries
+// (SESSION-READING-SPEC.md's colour roles).
+var butterflyStyle = lipgloss.NewStyle().
+	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#0f7f83"), Dark: lipgloss.Color("#54E6EA")})
+
+const (
+	// butterflyFlapTicksRest is how many 100ms ticks separate one rest flap
+	// from the next - "flaps once every 1.2s or so".
+	butterflyFlapTicksRest = 12
+	// butterflyFlapTicksFlying is the faster in-flight flap cadence -
+	// "wings beating faster in flight".
+	butterflyFlapTicksFlying = 3
+	// butterflyFlightTicks is how many 100ms ticks a flight between tabs
+	// takes - "drifts... over about 1.5s on the 100ms tick", and well
+	// inside the "ends... within 20 ticks" test bound.
+	butterflyFlightTicks = 15
+	// butterflyWobbleCycles is how many full sine wobbles a flight makes
+	// end to end - "a gentle wander (a sine wobble of one column)".
+	butterflyWobbleCycles = 2.0
 )
 
 // SessionTab replaces the old PreviewTab (design/cockpit-pane/DECISIONS.md
@@ -67,6 +108,19 @@ type TabbedWindow struct {
 	session  *SessionPane
 	needsYou *NeedsYouPane
 	terminal *TerminalPane
+
+	// Butterfly state (slice 21) - see the butterflyFrames/butterflyStyle
+	// doc comment above and TickButterfly/butterflyPosition below for the
+	// state machine. SetButterflyEnabled defaults true (NewTabbedWindow);
+	// wiring the --no-butterfly flag and matching config key into it is the
+	// caller's job (main.go/config.go), outside this file's own fence.
+	butterflyEnabled    bool
+	butterflyRestTab    int  // the tab index the butterfly rests over, or flies towards
+	butterflyFlying     bool // mid-flight between two tabs
+	butterflyFlightTick int  // 0..butterflyFlightTicks-1 while flying
+	butterflyFromCol    int  // column (tab-row coordinate space) the current flight departs from
+	butterflyFlapPhase  int  // ticks since the last frame flip
+	butterflyFrame      int  // 0 or 1, indexes butterflyFrames
 }
 
 // NewTabbedWindow wires the three tabs: Session (slice 3's replacement for
@@ -82,9 +136,10 @@ func NewTabbedWindow(session *SessionPane, needsYou *NeedsYouPane, terminal *Ter
 			"Needs you",
 			"Terminal",
 		},
-		session:  session,
-		needsYou: needsYou,
-		terminal: terminal,
+		session:          session,
+		needsYou:         needsYou,
+		terminal:         terminal,
+		butterflyEnabled: true,
 	}
 }
 
@@ -163,7 +218,9 @@ func (w *TabbedWindow) GetContentSize() (width, height int) {
 }
 
 func (w *TabbedWindow) Toggle() {
+	prev := w.activeTab
 	w.activeTab = (w.activeTab + 1) % len(w.tabs)
+	w.butterflyOnActiveTabChanged(prev)
 }
 
 // SetSessionInfo replaces the Session tab's data for the selected lane (nil
@@ -187,6 +244,131 @@ func (w *TabbedWindow) SetSessionFleetCounts(live, waiting int) {
 // running" treatment SetSessionInfo above gets.
 func (w *TabbedWindow) TickSpinner() {
 	w.session.TickSpinner()
+}
+
+// SetButterflyEnabled shows or hides the tab-bar butterfly (slice 21).
+// Enabled by default (NewTabbedWindow) - the --no-butterfly flag and the
+// matching config key are the caller's own wiring, outside this file.
+func (w *TabbedWindow) SetButterflyEnabled(enabled bool) {
+	w.butterflyEnabled = enabled
+}
+
+// TickButterfly advances the tab-bar butterfly's animation by one 100ms
+// tick - the same previewTickMsg tick TickSpinner above rides (app.go's
+// only forwarding line for this slice). It only ever touches this small
+// state struct, never the pane content underneath, so the cost is the
+// same "bare counter increment" TickSpinner's own doc comment claims -
+// drawing happens in String() below, once, on whichever tick asks for a
+// render.
+func (w *TabbedWindow) TickButterfly() {
+	if !w.butterflyEnabled {
+		return
+	}
+	flapTicks := butterflyFlapTicksRest
+	if w.butterflyFlying {
+		flapTicks = butterflyFlapTicksFlying
+		w.butterflyFlightTick++
+		if w.butterflyFlightTick >= butterflyFlightTicks {
+			w.butterflyFlying = false
+			w.butterflyFlightTick = 0
+		}
+	}
+	w.butterflyFlapPhase++
+	if w.butterflyFlapPhase >= flapTicks {
+		w.butterflyFlapPhase = 0
+		w.butterflyFrame = 1 - w.butterflyFrame
+	}
+}
+
+// butterflyOnActiveTabChanged starts a flight from wherever the butterfly
+// currently sits (its rest column, or - if a second tab change interrupts
+// an earlier flight - its current in-flight column) to the newly active
+// tab. A no-op if the active tab did not actually change (Toggle/
+// SetActiveTab call this unconditionally; most SetActiveTab calls in
+// app.go re-assert the tab that is already active).
+func (w *TabbedWindow) butterflyOnActiveTabChanged(prevActiveTab int) {
+	if w.activeTab == prevActiveTab || !w.butterflyEnabled {
+		return
+	}
+	if w.width > 0 {
+		col, _ := w.butterflyPosition()
+		w.butterflyFromCol = col
+	}
+	w.butterflyRestTab = w.activeTab
+	w.butterflyFlying = true
+	w.butterflyFlightTick = 0
+}
+
+// butterflyTabCenterCol returns the column, in the tab row's own
+// coordinate space (String()'s totalTabWidth below), directly above the
+// centre of tab index tab's name - the rest position, and every flight's
+// start and end point.
+func (w *TabbedWindow) butterflyTabCenterCol(tab int) int {
+	totalTabWidth := w.width + windowStyle.GetHorizontalFrameSize()
+	n := len(w.tabs)
+	tabWidth := totalTabWidth / n
+	width := tabWidth
+	if tab == n-1 {
+		width = totalTabWidth - tabWidth*(n-1)
+	}
+	return tab*tabWidth + width/2
+}
+
+// butterflyPosition returns the butterfly's current column and which row
+// it draws on: 0 is the tab bar's own border row (rest, and the start/end
+// instant of every flight), -1 is the free spacer row directly above it
+// (used only mid-flight - String()'s own "lifts off" row, the design's
+// "one row up if there is a free row" branch; the tab bar always has one
+// here, see this leg's report). At rest, or once a flight has run its
+// course, this is a pure function of butterflyRestTab; mid-flight it
+// linearly interpolates from butterflyFromCol with a gentle sine wander
+// and a short overshoot that settles back onto the target exactly as the
+// flight ends (design rule 2).
+func (w *TabbedWindow) butterflyPosition() (col int, row int) {
+	target := w.butterflyTabCenterCol(w.butterflyRestTab)
+	if !w.butterflyFlying {
+		return target, 0
+	}
+
+	t := float64(w.butterflyFlightTick) / float64(butterflyFlightTicks)
+	base := float64(w.butterflyFromCol) + t*float64(target-w.butterflyFromCol)
+
+	wobble := math.Sin(2*math.Pi*butterflyWobbleCycles*t) * (1 - t)
+
+	overshoot := 0.0
+	const overshootStart = 0.8
+	if t >= overshootStart {
+		dir := 1.0
+		if target < w.butterflyFromCol {
+			dir = -1.0
+		}
+		overshoot = 2 * dir * math.Sin(math.Pi*(t-overshootStart)/(1-overshootStart))
+	}
+
+	col = int(math.Round(base + wobble + overshoot))
+	// Lift off shortly after leaving, land shortly before arriving - the
+	// row0 edges are what makes the flight visibly depart from and return
+	// to the border row rather than teleporting onto the spacer row.
+	row = -1
+	if t < 0.12 || t > 0.88 {
+		row = 0
+	}
+	return col, row
+}
+
+// butterflyOverlay splices frame (the current wing glyph) into line at
+// visible column col, replacing exactly one column so line's own width is
+// unchanged (a card-line rule this leg's own tests hold it to: "the tab
+// bar line width is unchanged with the butterfly drawn"). ansi.Cut is
+// escape-code aware, so the border's own colour on either side of the
+// glyph survives untouched.
+func (w *TabbedWindow) butterflyOverlay(line string, col int) string {
+	width := ansi.StringWidth(line)
+	if col < 0 || col >= width {
+		return line
+	}
+	glyph := butterflyStyle.Render(butterflyFrames[w.butterflyFrame])
+	return ansi.Cut(line, 0, col) + glyph + ansi.Cut(line, col+1, width)
 }
 
 // SetNeedsYouInfo replaces the Needs-you tab's data for the selected row
@@ -271,7 +453,9 @@ func (w *TabbedWindow) SetActiveTab(tab int) {
 	if tab < 0 || tab >= len(w.tabs) {
 		return
 	}
+	prev := w.activeTab
 	w.activeTab = tab
+	w.butterflyOnActiveTabChanged(prev)
 }
 
 // AttachTerminal attaches to an external lane's own term_<lane> tmux
@@ -353,6 +537,22 @@ func (w *TabbedWindow) String() string {
 	}
 
 	row := lipgloss.JoinHorizontal(lipgloss.Top, renderedTabs...)
+
+	// Butterfly overlay (slice 21): the two blank rows above the tab bar
+	// (this used to be a single "\n" block - see git history - now built
+	// explicitly so the top-of-flight spacer row is addressable) and the
+	// tab row's own border line (row's first of its three lines - border,
+	// names, bottom border). Never drawn over the tab names one line down.
+	topSpacer := strings.Repeat(" ", totalTabWidth)
+	bottomSpacer := topSpacer
+	if w.butterflyEnabled {
+		if col, brow := w.butterflyPosition(); brow == -1 {
+			bottomSpacer = w.butterflyOverlay(bottomSpacer, col)
+		} else if lines := strings.SplitN(row, "\n", 2); len(lines) == 2 {
+			row = w.butterflyOverlay(lines[0], col) + "\n" + lines[1]
+		}
+	}
+
 	var content string
 	switch w.activeTab {
 	case SessionTab:
@@ -367,5 +567,5 @@ func (w *TabbedWindow) String() string {
 			w.width, w.height-2-windowStyle.GetVerticalFrameSize()-tabHeight,
 			lipgloss.Left, lipgloss.Top, content))
 
-	return lipgloss.JoinVertical(lipgloss.Left, "\n", row, window)
+	return lipgloss.JoinVertical(lipgloss.Left, topSpacer, bottomSpacer, row, window)
 }

@@ -417,6 +417,8 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// (slice 14 rule 1): a bare counter increment, no file read - see
 		// SessionPane.TickSpinner's own doc comment.
 		m.tabbedWindow.TickSpinner()
+		// Slice 21's own tab-bar butterfly rides the same 100ms tick.
+		m.tabbedWindow.TickButterfly()
 		cmd := m.instanceChanged()
 		return m, tea.Batch(
 			cmd,
