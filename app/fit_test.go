@@ -154,6 +154,39 @@ func TestView_NoLineExceedsWidth_NeedsYouTabSelected(t *testing.T) {
 	}
 }
 
+// TestView_NoLineExceedsWidth_TerminalTabSelected is slice 6/7's own FINISH
+// case (the brief's "every tab within the pane at 120x36, 164x45, 200x55"):
+// with the Terminal tab active (two Tab presses cycle Session -> Needs you
+// -> Terminal) on a TRACKED row (its own mirrored pane content), nothing
+// exceeds the pane at any of the three named sizes. Built through
+// homeWithMockedTerminal/trackedInstanceWithFakeTmux rather than newHome -
+// newHome loads this machine's REAL ~/.claude-squad state and would run a
+// real instance's Preview() through the real tmux binary the moment Tab
+// switches onto this tab (instanceChanged's own UpdateTerminal call), which
+// a unit test must never risk.
+func TestView_NoLineExceedsWidth_TerminalTabSelected(t *testing.T) {
+	for _, sz := range []struct{ w, h int }{{120, 36}, {164, 45}, {200, 55}} {
+		t.Run(fmt.Sprintf("%dx%d", sz.w, sz.h), func(t *testing.T) {
+			h := homeWithMockedTerminal(t, false)
+			inst := trackedInstanceWithFakeTmux(t, "a-tracked-lane", strings.Repeat("x", 300))
+			h.list.AddInstance(inst)
+			h.list.SetSelectedInstance(0)
+			h.updateHandleWindowSizeEvent(tea.WindowSizeMsg{Width: sz.w, Height: sz.h})
+
+			pressGlobalKey(h, tea.KeyPressMsg{Code: tea.KeyTab})
+			pressGlobalKey(h, tea.KeyPressMsg{Code: tea.KeyTab})
+			require.Equal(t, ui.TerminalTab, h.tabbedWindow.GetActiveTab(),
+				"two Tab presses from the Session default must land on the Terminal tab")
+
+			v := h.View()
+			for i, line := range strings.Split(v.Content, "\n") {
+				require.LessOrEqualf(t, ansi.StringWidth(line), sz.w,
+					"line %d exceeds terminal width %d: %q", i, sz.w, line)
+			}
+		})
+	}
+}
+
 // TestUpdateHandleWindowSizeEvent_CollapsesBelowThreshold documents the
 // OVERFLOW fix's stated decision: below collapsePreviewBelowWidth columns
 // the preview/diff pane is collapsed (zero width) rather than fought over,

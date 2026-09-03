@@ -293,6 +293,62 @@ func TestSessionPane_FitsAt120x36And164x45And200x55(t *testing.T) {
 	}
 }
 
+// TestTerminalPane_FitsAt120x36And164x45And200x55 is slice 6/7's own FINISH
+// requirement (the brief's "every tab within the pane at 120x36, 164x45,
+// 200x55; the fit tests gain Terminal-tab cases"): a tracked instance's own
+// mirrored content never exceeds the pane at any of the three named sizes.
+func TestTerminalPane_FitsAt120x36And164x45And200x55(t *testing.T) {
+	for _, sz := range []struct{ w, h int }{{120, 36}, {164, 45}, {200, 55}} {
+		t.Run(fmt.Sprintf("%dx%d", sz.w, sz.h), func(st *testing.T) {
+			w := NewTabbedWindow(NewSessionPane(), NewNeedsYouPane(), NewTerminalPane())
+			w.SetSize(sz.w, int(float32(sz.h)*0.9))
+			contentWidth, contentHeight := w.GetContentSize()
+			require.Greater(st, contentWidth, 0)
+			require.Greater(st, contentHeight, 0)
+
+			w.SetActiveTab(TerminalTab)
+			// A line wider than every terminal size under test (300 chars) -
+			// the fit requirement is on TerminalPane's own rendering, not on
+			// the fixture happening to be narrow already. makeStartedInstance
+			// is passed the OUTER t, never the subtest's own st: MockPtyFactory
+			// (preview_test.go) joins t.Name() straight into a temp file path,
+			// and a subtest's own Name() contains "/" (e.g.
+			// ".../TestTerminalPane_FitsAt.../120x36"), which filepath.Join
+			// then treats as an unmade subdirectory - the outer t's Name() has
+			// no such slash.
+			inst := makeStartedInstance(t, fmt.Sprintf("a-lane-%dx%d", sz.w, sz.h), strings.Repeat("x", 300))
+			defer func() { _ = inst.Kill() }()
+			require.NoError(st, w.UpdateTerminal(TerminalTarget{Kind: TerminalTargetTracked, Instance: inst}))
+
+			out := w.String()
+			for i, line := range strings.Split(out, "\n") {
+				require.LessOrEqualf(st, ansi.StringWidth(line), sz.w,
+					"line %d exceeds terminal width %d: %q", i, sz.w, line)
+			}
+		})
+	}
+}
+
+// TestTerminalPane_RestingFrame_FitsAt120x36And164x45And200x55 is the same
+// FINISH requirement for the "nothing selected" resting frame the Terminal
+// tab now shares with the Session tab (DECISIONS.md slice 6).
+func TestTerminalPane_RestingFrame_FitsAt120x36And164x45And200x55(t *testing.T) {
+	for _, sz := range []struct{ w, h int }{{120, 36}, {164, 45}, {200, 55}} {
+		t.Run(fmt.Sprintf("%dx%d", sz.w, sz.h), func(t *testing.T) {
+			w := NewTabbedWindow(NewSessionPane(), NewNeedsYouPane(), NewTerminalPane())
+			w.SetSize(sz.w, int(float32(sz.h)*0.9))
+			w.SetActiveTab(TerminalTab)
+			require.NoError(t, w.UpdateTerminal(TerminalTarget{Kind: TerminalTargetNone}))
+
+			out := w.String()
+			for i, line := range strings.Split(out, "\n") {
+				require.LessOrEqualf(t, ansi.StringWidth(line), sz.w,
+					"line %d exceeds terminal width %d: %q", i, sz.w, line)
+			}
+		})
+	}
+}
+
 // TestString_TrackedAndExternalRows_ShareCtxColumn is item 4's "one table"
 // requirement across row KINDS, not just within external rows
 // (TestString_ExternalRows_ColumnsLineUp covers that half): a tracked

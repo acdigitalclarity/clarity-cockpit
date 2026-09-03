@@ -1,9 +1,34 @@
+// Package ui: this file is the Terminal tab (design/cockpit-pane/
+// DECISIONS.md tab ruling 3, build slice 6). It shows two different things
+// depending on the selected row's own kind, resolved once per tick by the
+// caller (app.go's instanceChanged, mirroring SessionInfo's own "resolved
+// outside the pane" shape) into a TerminalTarget:
+//
+//   - a TRACKED instance: its own live tmux pane, mirrored exactly the way
+//     the dormant PreviewPane (ui/preview.go) used to show it under
+//     upstream's old "Preview" tab - instance.Preview()/PreviewFullHistory(),
+//     the same capture path, so a pending permission prompt in that lane is
+//     visible here even though the Session tab's own transcript view cannot
+//     show one. Attaching (Enter, outside this file - app.go) goes straight
+//     to the instance's own tmux session, exactly as it does on every other
+//     tab: this pane never owns a separate shell for a tracked row.
+//   - an EXTERNAL lane (runs in the owner's own terminal): a shell this
+//     pane opens lazily the first time the tab is viewed for that lane, as a
+//     tmux session named term_<lane> - upstream's own pre-existing
+//     mechanism for keeping one shell per instance, reused here verbatim
+//     (session name, lazy creation, Restore-or-Start, SetDetachedSize) but
+//     keyed by the external lane's own name instead of a tracked instance's
+//     title, since an external lane has no *session.Instance at all.
+//   - neither selected: the splash's resting frame, same as the Session tab
+//     (ui/session.go's own renderResting), never placeholder text.
 package ui
 
 import (
+	"claude-squad/cmd"
 	"claude-squad/log"
 	"claude-squad/session"
 	"claude-squad/session/tmux"
+	"claude-squad/ui/splash"
 	"fmt"
 	"os"
 	"strings"
@@ -20,32 +45,93 @@ var terminalPaneStyle = lipgloss.NewStyle().
 var terminalFooterStyle = lipgloss.NewStyle().
 	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#808080"), Dark: lipgloss.Color("#808080")})
 
-// terminalSession holds a cached tmux session for a specific instance.
+// terminalSession holds one external lane's cached term_<lane> tmux session.
 type terminalSession struct {
-	tmuxSession  *tmux.TmuxSession
-	worktreePath string
+	tmuxSession *tmux.TmuxSession
+	workDir     string
 }
 
-// TerminalPane manages shell tmux sessions in the worktree directory of selected instances.
-// Sessions are cached per instance so switching between instances preserves terminal state.
+// TerminalTargetKind classifies what the Terminal tab is currently showing -
+// resolved by the caller (app.go) from whichever row is selected, never
+// derived inside this pane.
+type TerminalTargetKind int
+
+const (
+	// TerminalTargetNone means nothing is selected - the pane shows the
+	// splash's resting frame.
+	TerminalTargetNone TerminalTargetKind = iota
+	// TerminalTargetTracked means a tracked instance is selected - the pane
+	// mirrors its own tmux pane.
+	TerminalTargetTracked
+	// TerminalTargetExternal means an external lane is selected - the pane
+	// shows (opening lazily if needed) that lane's own term_<lane> shell.
+	TerminalTargetExternal
+)
+
+// TerminalTarget is the Terminal tab's own per-tick input, resolved once by
+// app.go (instanceChanged) for whichever row is currently selected.
+type TerminalTarget struct {
+	Kind TerminalTargetKind
+	// Instance is set when Kind == TerminalTargetTracked.
+	Instance *session.Instance
+	// Lane is the external lane's own display name (ExternalLane.Name, the
+	// same string the composer and the row list use as the send/select
+	// target) - set when Kind == TerminalTargetExternal. It is also the
+	// term_<lane> session's own cache key and name suffix.
+	Lane string
+	// WorkDir is the external lane's own working directory
+	// (ExternalLane.WorkDir) - set when Kind == TerminalTargetExternal.
+	WorkDir string
+}
+
+// TerminalPane renders the Terminal tab: a tracked instance's own tmux
+// mirror, an external lane's lazily-opened term_<lane> shell, or the
+// splash's resting frame when nothing is selected.
 type TerminalPane struct {
 	mu            sync.Mutex
 	width, height int
-	sessions      map[string]*terminalSession // instanceTitle → session
-	currentTitle  string                      // currently displayed instance
-	content       string
-	fallback      bool
-	fallbackText  string
+
+	target TerminalTarget // as of the last UpdateContent call
+
+	external map[string]*terminalSession // external lane name -> its term_ session
+
+	content      string
+	fallback     bool
+	fallbackText string
+
+	live, waiting int // fleet counters for the resting frame (splash.FleetCounts)
 
 	isScrolling bool
 	viewport    viewport.Model
+
+	// newSession builds one external lane's own term_<lane> tmux.TmuxSession
+	// - tmux.NewTmuxSession by default, overridden in tests (same package,
+	// unexported field) to inject a mocked cmd.Executor/PtyFactory the same
+	// way session/tmux's own tests do, so the create-on-first-view/reuse/
+	// kill-on-close lifecycle can be proven without ever touching a real
+	// tmux binary.
+	newSession func(name, program string) *tmux.TmuxSession
 }
 
 func NewTerminalPane() *TerminalPane {
 	return &TerminalPane{
-		sessions: make(map[string]*terminalSession),
-		viewport: viewport.New(),
+		external:   make(map[string]*terminalSession),
+		viewport:   viewport.New(),
+		newSession: tmux.NewTmuxSession,
 	}
+}
+
+// NewTerminalPaneWithDeps returns a TerminalPane whose external term_<lane>
+// sessions are created through ptyFactory/cmdExec instead of the real tmux
+// binary - the cross-package counterpart to session/tmux's own
+// NewTmuxSessionWithDeps, for app-level tests that need a Terminal tab
+// without ever shelling out for real (app/terminal_and_keys_test.go).
+func NewTerminalPaneWithDeps(ptyFactory tmux.PtyFactory, cmdExec cmd.Executor) *TerminalPane {
+	tp := NewTerminalPane()
+	tp.newSession = func(name, program string) *tmux.TmuxSession {
+		return tmux.NewTmuxSessionWithDeps(name, program, ptyFactory, cmdExec)
+	}
+	return tp
 }
 
 func (t *TerminalPane) SetSize(width, height int) {
@@ -55,11 +141,22 @@ func (t *TerminalPane) SetSize(width, height int) {
 	t.height = height
 	t.viewport.SetWidth(width)
 	t.viewport.SetHeight(height)
-	if s, ok := t.sessions[t.currentTitle]; ok && s.tmuxSession != nil {
-		if err := s.tmuxSession.SetDetachedSize(width, height); err != nil {
-			log.InfoLog.Printf("terminal pane: failed to set detached size: %v", err)
+	if t.target.Kind == TerminalTargetExternal {
+		if s, ok := t.external[t.target.Lane]; ok && s.tmuxSession != nil {
+			if err := s.tmuxSession.SetDetachedSize(width, height); err != nil {
+				log.InfoLog.Printf("terminal pane: failed to set detached size: %v", err)
+			}
 		}
 	}
+}
+
+// SetFleetCounts records the resting frame's "lanes live"/"needs you"
+// counters, refreshed on the same feed tick as the Session tab's own
+// (app.go's updateSessionTabInfo).
+func (t *TerminalPane) SetFleetCounts(live, waiting int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.live, t.waiting = live, waiting
 }
 
 // setFallbackState sets the terminal pane to display a fallback message.
@@ -71,11 +168,32 @@ func (t *TerminalPane) setFallbackState(message string) {
 	t.content = ""
 }
 
-// UpdateContent captures the tmux pane output for the terminal session.
-func (t *TerminalPane) UpdateContent(instance *session.Instance) error {
+// UpdateContent resolves target into this tick's rendered content: a
+// tracked instance's own pane capture, an external lane's term_ shell
+// capture (creating it first if this is the first tick the tab has been
+// viewed for that lane), or nothing at all (String() draws the resting
+// frame for TerminalTargetNone).
+func (t *TerminalPane) UpdateContent(target TerminalTarget) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.target = target
 
+	switch target.Kind {
+	case TerminalTargetTracked:
+		return t.updateTrackedLocked(target.Instance)
+	case TerminalTargetExternal:
+		return t.updateExternalLocked(target.Lane, target.WorkDir)
+	default:
+		t.fallback = false
+		t.content = ""
+		return nil
+	}
+}
+
+// updateTrackedLocked mirrors the selected TRACKED instance's own tmux
+// pane - the dormant PreviewPane's own capture path (ui/preview.go's
+// UpdateContent), not a separate term_ shell. Caller must hold t.mu.
+func (t *TerminalPane) updateTrackedLocked(instance *session.Instance) error {
 	if instance == nil {
 		t.setFallbackState("Select an instance to open a terminal")
 		return nil
@@ -88,18 +206,37 @@ func (t *TerminalPane) UpdateContent(instance *session.Instance) error {
 		t.setFallbackState("Instance is not started yet.")
 		return nil
 	}
-
-	// Skip content updates while in scroll mode
 	if t.isScrolling {
+		// Full-history capture only happens lazily on entering scroll mode
+		// (enterScrollModeLocked below) - a mid-scroll tick must not
+		// overwrite the viewport's own content.
 		return nil
 	}
 
-	// Ensure we have a terminal session for this instance
-	if err := t.ensureSessionLocked(instance); err != nil {
+	content, err := instance.Preview()
+	if err != nil {
+		return fmt.Errorf("terminal pane: failed to capture content: %w", err)
+	}
+	t.fallback = false
+	t.content = content
+	return nil
+}
+
+// updateExternalLocked shows the EXTERNAL lane's own term_<lane> shell,
+// opening it first if this is the first tick the tab has been viewed for
+// this lane (ensureExternalSessionLocked). Caller must hold t.mu.
+func (t *TerminalPane) updateExternalLocked(lane, workDir string) error {
+	if lane == "" {
+		t.setFallbackState("Select a lane to open a terminal")
+		return nil
+	}
+	if t.isScrolling {
+		return nil
+	}
+	if err := t.ensureExternalSessionLocked(lane, workDir); err != nil {
 		return err
 	}
-
-	s, ok := t.sessions[t.currentTitle]
+	s, ok := t.external[lane]
 	if !ok || s.tmuxSession == nil || !s.tmuxSession.DoesSessionExist() {
 		t.setFallbackState("Terminal session not available.")
 		return nil
@@ -109,40 +246,26 @@ func (t *TerminalPane) UpdateContent(instance *session.Instance) error {
 	if err != nil {
 		return fmt.Errorf("terminal pane: failed to capture content: %w", err)
 	}
-
 	t.fallback = false
 	t.content = content
 	return nil
 }
 
-// ensureSession creates or reuses a cached terminal tmux session for the given instance.
-func (t *TerminalPane) ensureSession(instance *session.Instance) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.ensureSessionLocked(instance)
-}
-
-// ensureSessionLocked is the lock-free implementation of ensureSession.
-// Caller must hold t.mu.
-func (t *TerminalPane) ensureSessionLocked(instance *session.Instance) error {
-	if instance == nil || !instance.Started() || instance.Status == session.Paused {
+// ensureExternalSessionLocked creates or reuses the cached term_<lane> tmux
+// session for an external lane - upstream's own "one shell per instance"
+// mechanism (session name, lazy creation, Restore-or-Start,
+// SetDetachedSize), reused verbatim here but keyed by the lane's own name
+// rather than a tracked instance's title. Caller must hold t.mu.
+func (t *TerminalPane) ensureExternalSessionLocked(lane, workDir string) error {
+	if lane == "" || workDir == "" {
 		return nil
 	}
 
-	worktreePath := instance.GetWorktreePath()
-	if worktreePath == "" {
-		return nil
-	}
-
-	t.currentTitle = instance.Title
-
-	// Check if we already have a cached session for this instance
-	if s, ok := t.sessions[instance.Title]; ok {
+	if s, ok := t.external[lane]; ok {
 		if s.tmuxSession != nil && s.tmuxSession.DoesSessionExist() {
 			return nil
 		}
-		// Session died, remove stale entry and recreate below
-		delete(t.sessions, instance.Title)
+		delete(t.external, lane)
 	}
 
 	shell := os.Getenv("SHELL")
@@ -150,31 +273,26 @@ func (t *TerminalPane) ensureSessionLocked(instance *session.Instance) error {
 		shell = "/bin/sh"
 	}
 
-	termName := "term_" + instance.Title
-	ts := tmux.NewTmuxSession(termName, shell)
+	termName := "term_" + lane
+	ts := t.newSession(termName, shell)
 
-	// Check if session already exists (e.g. from a previous run)
 	if ts.DoesSessionExist() {
 		if err := ts.Restore(); err != nil {
 			// Session exists but can't restore, kill it and start fresh
 			_ = ts.Close()
-			ts = tmux.NewTmuxSession(termName, shell)
-			if err := ts.Start(worktreePath); err != nil {
+			ts = t.newSession(termName, shell)
+			if err := ts.Start(workDir); err != nil {
 				return fmt.Errorf("terminal pane: failed to start session: %w", err)
 			}
 		}
 	} else {
-		if err := ts.Start(worktreePath); err != nil {
+		if err := ts.Start(workDir); err != nil {
 			return fmt.Errorf("terminal pane: failed to start session: %w", err)
 		}
 	}
 
-	t.sessions[instance.Title] = &terminalSession{
-		tmuxSession:  ts,
-		worktreePath: worktreePath,
-	}
+	t.external[lane] = &terminalSession{tmuxSession: ts, workDir: workDir}
 
-	// Set the size
 	if t.width > 0 && t.height > 0 {
 		if err := ts.SetDetachedSize(t.width, t.height); err != nil {
 			log.InfoLog.Printf("terminal pane: failed to set size: %v", err)
@@ -184,13 +302,18 @@ func (t *TerminalPane) ensureSessionLocked(instance *session.Instance) error {
 	return nil
 }
 
-// Attach attaches to the terminal tmux session (full-screen).
-func (t *TerminalPane) Attach() (chan struct{}, error) {
+// Attach attaches to an external lane's own term_<lane> tmux session
+// (full-screen) - lane must already have been viewed at least once (its
+// session created lazily by UpdateContent/ensureExternalSessionLocked); a
+// tracked instance attaches through its own session instead (session.List's
+// Attach, the same path Enter uses on every other tab - app.go's KeyEnter
+// handler never routes a tracked row through here).
+func (t *TerminalPane) Attach(lane string) (chan struct{}, error) {
 	t.mu.Lock()
-	s, ok := t.sessions[t.currentTitle]
+	s, ok := t.external[lane]
 	if !ok || s.tmuxSession == nil {
 		t.mu.Unlock()
-		return nil, fmt.Errorf("no terminal session to attach to")
+		return nil, fmt.Errorf("no terminal session for lane %q", lane)
 	}
 	if !s.tmuxSession.DoesSessionExist() {
 		t.mu.Unlock()
@@ -201,38 +324,44 @@ func (t *TerminalPane) Attach() (chan struct{}, error) {
 	return ts.Attach()
 }
 
-// Close kills all cached terminal tmux sessions and cleans up.
+// Close kills every cached external term_<lane> session - called when the
+// cockpit quits (app.go's handleQuit), exactly as upstream tore down its
+// own term_ shells.
 func (t *TerminalPane) Close() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	for title, s := range t.sessions {
+	for lane, s := range t.external {
 		if s.tmuxSession != nil {
 			if err := s.tmuxSession.Close(); err != nil {
-				log.InfoLog.Printf("terminal pane: failed to close session for %s: %v", title, err)
+				log.InfoLog.Printf("terminal pane: failed to close session for %s: %v", lane, err)
 			}
 		}
 	}
-	t.sessions = make(map[string]*terminalSession)
-	t.currentTitle = ""
+	t.external = make(map[string]*terminalSession)
+	t.target = TerminalTarget{}
 	t.content = ""
 	t.fallback = false
 	t.fallbackText = ""
 }
 
-// CloseForInstance kills the cached terminal session for a specific instance.
-func (t *TerminalPane) CloseForInstance(title string) {
+// CloseForLane kills the cached term_<lane> session for one external lane
+// (e.g. when that lane is no longer discovered live) - named for the
+// external map this pane now owns (a tracked instance never has an entry
+// here, so calling this with a tracked instance's title is a harmless
+// no-op).
+func (t *TerminalPane) CloseForLane(lane string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if s, ok := t.sessions[title]; ok {
+	if s, ok := t.external[lane]; ok {
 		if s.tmuxSession != nil {
 			if err := s.tmuxSession.Close(); err != nil {
-				log.InfoLog.Printf("terminal pane: failed to close session for %s: %v", title, err)
+				log.InfoLog.Printf("terminal pane: failed to close session for %s: %v", lane, err)
 			}
 		}
-		delete(t.sessions, title)
+		delete(t.external, lane)
 	}
-	if t.currentTitle == title {
-		t.currentTitle = ""
+	if t.target.Kind == TerminalTargetExternal && t.target.Lane == lane {
+		t.target = TerminalTarget{}
 		t.content = ""
 		t.fallback = false
 		t.fallbackText = ""
@@ -252,6 +381,10 @@ func (t *TerminalPane) String() string {
 
 	if t.isScrolling {
 		return t.viewport.View()
+	}
+
+	if t.target.Kind == TerminalTargetNone {
+		return t.renderRestingLocked()
 	}
 
 	fallback := t.fallback
@@ -301,17 +434,44 @@ func (t *TerminalPane) String() string {
 	return terminalPaneStyle.Width(width).Render(contentStr)
 }
 
-// enterScrollMode captures the full terminal history and enters scroll mode.
-// Caller must hold t.mu.
-func (t *TerminalPane) enterScrollMode() error {
-	s, ok := t.sessions[t.currentTitle]
-	if !ok || s.tmuxSession == nil || !s.tmuxSession.DoesSessionExist() {
-		return nil
+// renderRestingLocked draws the splash's resting/peak frame, the same way
+// the Session tab does when nothing is selected (ui/session.go's own
+// renderResting) - never placeholder text. Caller must hold t.mu.
+func (t *TerminalPane) renderRestingLocked() string {
+	frame := splash.RenderFrame(t.width, t.height, -1, -1, t.live, t.waiting)
+	if !fitsBox(frame, t.width, t.height) {
+		frame = FallbackMark(t.width)
 	}
+	return lipgloss.Place(t.width, t.height, lipgloss.Center, lipgloss.Center, frame)
+}
 
-	content, err := s.tmuxSession.CapturePaneContentWithOptions("-", "-")
-	if err != nil {
-		return fmt.Errorf("terminal pane: failed to capture full history: %w", err)
+// enterScrollModeLocked captures the full pane history (tracked instance)
+// or full session history (external lane's term_ shell) and enters scroll
+// mode. Caller must hold t.mu.
+func (t *TerminalPane) enterScrollModeLocked() error {
+	var content string
+	var err error
+
+	switch t.target.Kind {
+	case TerminalTargetTracked:
+		if t.target.Instance == nil {
+			return nil
+		}
+		content, err = t.target.Instance.PreviewFullHistory()
+		if err != nil {
+			return fmt.Errorf("terminal pane: failed to capture full history: %w", err)
+		}
+	case TerminalTargetExternal:
+		s, ok := t.external[t.target.Lane]
+		if !ok || s.tmuxSession == nil || !s.tmuxSession.DoesSessionExist() {
+			return nil
+		}
+		content, err = s.tmuxSession.CapturePaneContentWithOptions("-", "-")
+		if err != nil {
+			return fmt.Errorf("terminal pane: failed to capture full history: %w", err)
+		}
+	default:
+		return nil
 	}
 
 	footer := terminalFooterStyle.Render("ESC to exit scroll mode")
@@ -327,7 +487,7 @@ func (t *TerminalPane) ScrollUp() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if !t.isScrolling {
-		return t.enterScrollMode()
+		return t.enterScrollModeLocked()
 	}
 	t.viewport.ScrollUp(1)
 	return nil
@@ -338,7 +498,7 @@ func (t *TerminalPane) ScrollDown() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if !t.isScrolling {
-		return t.enterScrollMode()
+		return t.enterScrollModeLocked()
 	}
 	t.viewport.ScrollDown(1)
 	return nil

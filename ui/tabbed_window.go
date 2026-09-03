@@ -4,7 +4,6 @@ import (
 	"charm.land/lipgloss/v2"
 	"charm.land/lipgloss/v2/compat"
 	"claude-squad/log"
-	"claude-squad/session"
 )
 
 func tabBorderWithBottom(left, middle, right string) lipgloss.Border {
@@ -157,12 +156,22 @@ func (w *TabbedWindow) SetNeedsYouInfo(info *NeedsYouInfo) {
 	w.needsYou.SetInfo(info)
 }
 
-// UpdateTerminal updates the terminal pane content. Only updates when terminal tab is active.
-func (w *TabbedWindow) UpdateTerminal(instance *session.Instance) error {
+// UpdateTerminal updates the terminal pane content for target (see
+// TerminalTarget's own doc comment) - only while the Terminal tab is
+// active, the same "don't do the work if nobody's looking" gate the tab
+// always carried.
+func (w *TabbedWindow) UpdateTerminal(target TerminalTarget) error {
 	if w.activeTab != TerminalTab {
 		return nil
 	}
-	return w.terminal.UpdateContent(instance)
+	return w.terminal.UpdateContent(target)
+}
+
+// SetTerminalFleetCounts passes the resting frame's "lanes live"/"needs
+// you" counters through to the Terminal pane, the same way
+// SetSessionFleetCounts does for the Session pane.
+func (w *TabbedWindow) SetTerminalFleetCounts(live, waiting int) {
+	w.terminal.SetFleetCounts(live, waiting)
 }
 
 // Add these new methods for handling scroll events
@@ -224,19 +233,23 @@ func (w *TabbedWindow) SetActiveTab(tab int) {
 	w.activeTab = tab
 }
 
-// AttachTerminal attaches to the terminal tmux session
-func (w *TabbedWindow) AttachTerminal() (chan struct{}, error) {
-	return w.terminal.Attach()
+// AttachTerminal attaches to an external lane's own term_<lane> tmux
+// session - a tracked row attaches through its own session instead
+// (session.List's Attach, app.go's KeyEnter handler), never through here.
+func (w *TabbedWindow) AttachTerminal(lane string) (chan struct{}, error) {
+	return w.terminal.Attach(lane)
 }
 
-// CleanupTerminal closes the terminal session
+// CleanupTerminal closes every cached term_<lane> session - called when the
+// cockpit quits (app.go's handleQuit).
 func (w *TabbedWindow) CleanupTerminal() {
 	w.terminal.Close()
 }
 
-// CleanupTerminalForInstance closes the cached terminal session for the given instance title.
-func (w *TabbedWindow) CleanupTerminalForInstance(title string) {
-	w.terminal.CloseForInstance(title)
+// CleanupTerminalForLane closes the cached term_<lane> session for one
+// external lane.
+func (w *TabbedWindow) CleanupTerminalForLane(lane string) {
+	w.terminal.CloseForLane(lane)
 }
 
 // IsTerminalInScrollMode returns true if the terminal pane is in scroll mode
