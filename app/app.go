@@ -32,6 +32,9 @@ const GlobalInstanceLimit = 10
 // entrance splash screen and starts directly in the instance list -
 // clarity-attach, discover and msg never call Run at all, so they never
 // show the splash regardless of this flag.
+// NoButterfly hides the tab-bar butterfly; set by main from the flag or config before Run.
+var NoButterfly bool
+
 func Run(ctx context.Context, program string, autoYes bool, noSplash bool) error {
 	// AltScreen and mouse-cell-motion (scroll) are now declared per-View,
 	// see (*home).View below - v2's declarative View fields replace v1's
@@ -161,13 +164,28 @@ type home struct {
 	// directly in a test (skipping newHome) still works.
 	laneTailCache *clarity.LaneTailCache
 
-	// sessionAnimFrame is sessionTickMsg's own 500ms counter (design/
-	// cockpit-pane/DECISIONS.md's Latency ruling) - incremented once per
-	// session tick and handed to the SELECTED lane's ui.SessionInfo as
-	// AnimFrame, driving the header glyph's animation while its turn is
-	// open. Zero value (a *home built directly in a test, skipping the
-	// tick loop) simply never animates - the static glyph still renders.
-	sessionAnimFrame int
+	// transcriptWatcher is the fsnotify seam (slice 14 rule 3) watching the
+	// SELECTED lane's own transcript file - nil until the first lane with a
+	// resolvable transcript is selected, lazily constructed by
+	// retargetTranscriptWatch. Injected directly by tests (same package,
+	// see watch_test.go) rather than through a factory - production code
+	// only ever constructs the real fsnotifyWatcher, lazily, on first use.
+	transcriptWatcher transcriptWatcher
+	// transcriptWatchPath is the path transcriptWatcher currently targets
+	// ("" = nothing) - retargetTranscriptWatch's own no-op guard against
+	// re-Watching the same path on every tick.
+	transcriptWatchPath string
+	// transcriptWatchGen is bumped on every retarget, tagging every
+	// transcriptChangedMsg/watchTranscriptCmd this watch produces so an
+	// event from a superseded watch (the selection has already moved on)
+	// is recognised as stale and discarded rather than triggering a read
+	// for a lane no longer selected.
+	transcriptWatchGen uint64
+	// transcriptDebounceGen is bumped on every transcriptChangedMsg -
+	// transcriptDebounceMsg only performs its read when its own gen still
+	// matches this, so a burst of several fsnotify events inside one
+	// debounce window collapses into exactly one cache read (rule 3).
+	transcriptDebounceGen uint64
 }
 
 func newHome(ctx context.Context, program string, autoYes bool, noSplash bool) *home {
@@ -208,6 +226,9 @@ func newHome(ctx context.Context, program string, autoYes bool, noSplash bool) *
 		laneTab:      ui.SessionTab,
 		needsYouTab:  ui.NeedsYouTab,
 		prevRowKind:  ui.RowKindTracked,
+	}
+	if NoButterfly {
+		h.tabbedWindow.SetButterflyEnabled(false)
 	}
 	if !noSplash {
 		h.splashModel = splash.New()
@@ -372,6 +393,7 @@ func (m *home) Init() tea.Cmd {
 			time.Sleep(sessionTickInterval)
 			return sessionTickMsg{}
 		},
+		m.retargetTranscriptWatch(),
 	}
 	if m.splashModel != nil {
 		cmds = append(cmds, m.splashModel.Tick())
@@ -397,6 +419,12 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusBox.Clear()
 		m.statusText = ""
 	case previewTickMsg:
+		// The header/thinking-line spinner's own 100ms animation tick
+		// (slice 14 rule 1): a bare counter increment, no file read - see
+		// SessionPane.TickSpinner's own doc comment.
+		m.tabbedWindow.TickSpinner()
+		// Slice 21's own tab-bar butterfly rides the same 100ms tick.
+		m.tabbedWindow.TickButterfly()
 		cmd := m.instanceChanged()
 		return m, tea.Batch(
 			cmd,
@@ -416,12 +444,19 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.laneTailCache == nil {
 			m.laneTailCache = clarity.NewLaneTailCache()
 		}
-		m.sessionAnimFrame++
 		m.updateSessionTabInfo(time.Now())
-		return m, func() tea.Msg {
+		// The fsnotify watch (slice 14 rule 3) follows the selection on
+		// this 500ms cadence, NEVER on the 100ms previewTickMsg animation
+		// tick (rule 1's own "no file read on it" - selectedTranscriptPath
+		// resolves via a filesystem glob, and previewTickMsg already ran
+		// ten times a second before this leg for unrelated reasons; folding
+		// the retarget in there measurably raised idle CPU in this leg's
+		// own proof and was removed for exactly that reason).
+		watchCmd := m.retargetTranscriptWatch()
+		return m, tea.Batch(watchCmd, func() tea.Msg {
 			time.Sleep(sessionTickInterval)
 			return sessionTickMsg{}
-		}
+		})
 	case keyupMsg:
 		m.menu.ClearKeydown()
 		return m, nil
@@ -697,6 +732,32 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case boardFetchedMsg:
 		return m, m.refreshNeedsYouTab()
+	case transcriptChangedMsg:
+		if msg.gen != m.transcriptWatchGen {
+			// Stale: a later retarget (the selection moved on) already
+			// superseded the watch this event came from.
+			return m, nil
+		}
+		m.transcriptDebounceGen++
+		gen := m.transcriptDebounceGen
+		return m, tea.Batch(
+			func() tea.Msg {
+				time.Sleep(transcriptDebounceInterval)
+				return transcriptDebounceMsg{gen: gen}
+			},
+			watchTranscriptCmd(m.transcriptWatcher, msg.gen),
+		)
+	case transcriptDebounceMsg:
+		if msg.gen != m.transcriptDebounceGen {
+			// A newer event superseded this one inside the debounce window
+			// (rule 3: several writes collapse into one read).
+			return m, nil
+		}
+		if m.laneTailCache == nil {
+			m.laneTailCache = clarity.NewLaneTailCache()
+		}
+		m.updateSessionTabInfo(time.Now())
+		return m, nil
 	}
 	return m, nil
 }
@@ -705,12 +766,22 @@ func (m *home) handleQuit() (tea.Model, tea.Cmd) {
 	if err := m.storage.SaveInstances(m.list.GetInstances()); err != nil {
 		return m, m.handleError(err)
 	}
-	// Kill every external lane's own term_<lane> shell (design/cockpit-pane/
-	// DECISIONS.md slice 6's own "killed when the cockpit quits, exactly as
-	// upstream tears down its term_ shells") - a tracked row's Terminal tab
-	// mirrors its own instance session and owns nothing here to close.
+	// Kill every cached term_ shell (design/cockpit-pane/DECISIONS.md slice
+	// 6's own "killed when the cockpit quits, exactly as upstream tears
+	// down its term_ shells") - a tracked row's own term_<title> shell and
+	// an external lane's own term_<lane> shell alike (slice 15: the
+	// Terminal tab is always a shell now, never a mirror of the instance's
+	// own Claude session, so CleanupTerminal closes a tracked row's shell
+	// too).
 	if m.tabbedWindow != nil {
 		m.tabbedWindow.CleanupTerminal()
+	}
+	// Close the fsnotify watch (slice 14 rule 3's own "closes on quit") -
+	// its background loop goroutine would otherwise outlive the program.
+	if m.transcriptWatcher != nil {
+		if err := m.transcriptWatcher.Close(); err != nil {
+			log.WarningLog.Printf("transcript watch close: %v", err)
+		}
 	}
 	return m, tea.Quit
 }
@@ -1437,7 +1508,10 @@ func (m *home) needsYouRowLane(item clarity.FeedItem) string {
 // waiting up to feedRefreshInterval for the next tick.
 func (m *home) selectionChanged() tea.Cmd {
 	m.syncTabToRowKind()
-	return m.refreshNeedsYouTab()
+	// The fsnotify watch (slice 14 rule 3's own "moves when the selection
+	// changes") follows an explicit Up/Down immediately, rather than
+	// waiting up to sessionTickInterval for its own 500ms retarget.
+	return tea.Batch(m.retargetTranscriptWatch(), m.refreshNeedsYouTab())
 }
 
 // syncTabToRowKind is slice 5's "selecting a Needs-you row changes the
@@ -1759,14 +1833,13 @@ func (m *home) selectedSessionInfo(now time.Time) *ui.SessionInfo {
 		}
 		ctxPct, ctxOK := selected.GetContextFill()
 		return &ui.SessionInfo{
-			Lane:      selected.Title,
-			WorkDir:   selected.Path,
-			Branch:    branch,
-			Tail:      tail,
-			CtxPct:    ctxPct,
-			CtxOK:     ctxOK,
-			Now:       now,
-			AnimFrame: m.sessionAnimFrame,
+			Lane:    selected.Title,
+			WorkDir: selected.Path,
+			Branch:  branch,
+			Tail:    tail,
+			CtxPct:  ctxPct,
+			CtxOK:   ctxOK,
+			Now:     now,
 		}
 	}
 
@@ -1776,13 +1849,12 @@ func (m *home) selectedSessionInfo(now time.Time) *ui.SessionInfo {
 			return nil
 		}
 		return &ui.SessionInfo{
-			Lane:      ext.Name,
-			WorkDir:   ext.WorkDir,
-			Tail:      tail,
-			CtxPct:    ext.Fill.Pct,
-			CtxOK:     ext.FillOK,
-			Now:       now,
-			AnimFrame: m.sessionAnimFrame,
+			Lane:    ext.Name,
+			WorkDir: ext.WorkDir,
+			Tail:    tail,
+			CtxPct:  ext.Fill.Pct,
+			CtxOK:   ext.FillOK,
+			Now:     now,
 		}
 	}
 

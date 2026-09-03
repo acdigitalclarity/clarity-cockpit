@@ -228,7 +228,7 @@ func TestInstanceAttachFinishedMsg_Success(t *testing.T) {
 // TestKeyCopy_ComposerOpen_CopiesComposerText proves c copies the
 // composer's CURRENT text when it is open, over the Needs-you fallback.
 func TestKeyCopy_ComposerOpen_CopiesComposerText(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	var copiedStdin string
 	h.cmdExec = cmd_test.MockCmdExec{
 		RunFunc: func(cmd *exec.Cmd) error {
@@ -251,7 +251,7 @@ func TestKeyCopy_ComposerOpen_CopiesComposerText(t *testing.T) {
 // selected Needs-you row's own title and number (clarity.FeedLine - the
 // exact text the row itself renders) when the composer is closed.
 func TestKeyCopy_NeedsYouRowSelected_CopiesFeedLine(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	h.list.SetNeedsYou([]clarity.FeedItem{{Lane: "#277", Title: "Owner: one settings act"}}, "")
 	h.list.Up() // the sole tracked-group cursor wraps to the sole Needs-you row (empty list otherwise)
 
@@ -274,7 +274,7 @@ func TestKeyCopy_NeedsYouRowSelected_CopiesFeedLine(t *testing.T) {
 // lane's own WorkDir with macOS `open`, through the stubbed executor, and
 // shows the "opened <path>" footer.
 func TestKeyOpenFolder_ExternalRow_OpensWorkDir(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	workDir := t.TempDir()
 	h.list.SetExternal([]clarity.ExternalLane{{Name: "scratchfix-ext", WorkDir: workDir}})
 	h.list.Down() // -> the external row
@@ -297,7 +297,7 @@ func TestKeyOpenFolder_ExternalRow_OpensWorkDir(t *testing.T) {
 // command run, no footer shown) when neither a tracked instance nor an
 // external lane is selected.
 func TestKeyOpenFolder_NothingSelected_NoOp(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 
 	ran := false
 	h.cmdExec = cmd_test.MockCmdExec{
@@ -362,7 +362,7 @@ func noWorktreeAppFixture(t *testing.T, h *home, title string) (inst *session.In
 // session must show the "runs in your own terminal" footer, never a silent
 // no-op and never a resume prompt.
 func TestKeyEnter_TrackedNoWorktreeInstance_NoSession_ShowsFooterLine(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	noWorktreeAppFixture(t, h, "scratchfix-attached")
 
 	pressGlobalKey(h, tea.KeyPressMsg{Code: tea.KeyEnter})
@@ -374,7 +374,7 @@ func TestKeyEnter_TrackedNoWorktreeInstance_NoSession_ShowsFooterLine(t *testing
 // "allowed" branch: an idle transcript means the owner's own terminal
 // looks abandoned, so r is allowed to start a fresh session.
 func TestKeyResume_NoWorktreeInstance_Idle_ResumesSession(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	inst, exists := noWorktreeAppFixture(t, h, "scratchfix-idle")
 	inst.SetLaneState(clarity.StateIdle, time.Now(), true)
 
@@ -390,7 +390,7 @@ func TestKeyResume_NoWorktreeInstance_Idle_ResumesSession(t *testing.T) {
 // live in the owner's own terminal) must never get a second session - r
 // shows the "nothing to resume" footer instead, and starts nothing.
 func TestKeyResume_NoWorktreeInstance_Working_RefusesWithFooter(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	inst, exists := noWorktreeAppFixture(t, h, "scratchfix-working")
 	inst.SetLaneState(clarity.StateWorking, time.Now(), true)
 
@@ -407,7 +407,7 @@ func TestKeyResume_NoWorktreeInstance_Working_RefusesWithFooter(t *testing.T) {
 // an actively working lane - never assumed idle just because nothing has
 // been read yet.
 func TestKeyResume_NoWorktreeInstance_NoTranscriptYet_RefusesWithFooter(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	_, exists := noWorktreeAppFixture(t, h, "scratchfix-no-transcript")
 
 	pressGlobalKey(h, tea.KeyPressMsg{Code: 'r', Text: "r"})
@@ -422,7 +422,7 @@ func TestKeyResume_NoWorktreeInstance_NoTranscriptYet_RefusesWithFooter(t *testi
 // nothing): o on a NoWorktree tracked row must open its own Path, falling
 // back off the (always-empty, for this instance) worktree path.
 func TestKeyOpenFolder_TrackedNoWorktreeInstance_OpensItsPath(t *testing.T) {
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	inst, _ := noWorktreeAppFixture(t, h, "scratchfix-openfolder")
 
 	var openedArgs []string

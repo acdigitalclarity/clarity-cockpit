@@ -48,6 +48,8 @@ type Config struct {
 	// instance list, same effect as the --no-splash flag (which overrides
 	// this when set).
 	NoSplash bool `json:"no_splash,omitempty"`
+	// NoButterfly hides the butterfly that rests on the tab bar.
+	NoButterfly bool `json:"no_butterfly,omitempty"`
 }
 
 // GetProgram returns the program to run. If Profiles is non-empty and

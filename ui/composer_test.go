@@ -199,6 +199,123 @@ func TestComposer_Render_NoLaneRow_NeverCarriesCopyOnlySuffix(t *testing.T) {
 	require.NotContains(t, title, "copy only")
 }
 
+// -- Render: slice 16, the composer wraps ---------------------------------
+//
+// The owner (3 Sep 11:2x, verbatim): "also this prompt bit doesnt wrap so i
+// cant see what im typing over a certain number of characters". These pin
+// the RULE's own behaviours: word-wrap growth, the five-line cap with an
+// always-visible cursor, an inserted newline surviving into the sent
+// value, and the two panes' scrollable region shrinking to make room.
+
+// composerWordsOfLen220 is a 220-character message built from 22 nine-
+// letter words - the PROOF's own paste length, chosen so it wraps to
+// exactly three lines at the width the RULE's own test names (100, giving
+// an inner wrap width of 100-4-2=94 columns, 9 words per line).
+func composerWordsOfLen220() string {
+	return strings.TrimSpace(strings.Repeat("aaaaaaaaa ", 22))
+}
+
+func TestComposer_Render_WrapsAtWordBoundaries_ThreeLinesAtWidth100(t *testing.T) {
+	c := NewComposer()
+	c.Open("ways-of-working", false)
+	c.Type(composerWordsOfLen220())
+
+	lines := c.Render(100, "ways-of-working")
+	// top border + N content rows + bottom border.
+	require.Len(t, lines, 5, "a 220-char message must wrap to 3 content rows at width 100")
+	require.Contains(t, ansi.Strip(lines[3]), composerCursor, "the cursor must be visible on the last wrapped row")
+	for _, l := range lines {
+		require.LessOrEqual(t, ansi.StringWidth(l), 100)
+	}
+}
+
+func TestComposer_Height_MatchesRenderLineCount(t *testing.T) {
+	c := NewComposer()
+	c.Open("lane-a", false)
+	c.Type(composerWordsOfLen220())
+
+	require.Equal(t, len(c.Render(100, "lane-a")), c.Height(100))
+}
+
+func TestComposer_Render_GrowthCapsAtFiveLines(t *testing.T) {
+	c := NewComposer()
+	c.Open("lane-a", false)
+	// composerWrapParagraph packs one 9-letter word per "aaaaaaaaa " unit,
+	// 9 fit per 94-column line at width 100 - 90 words is 10 wrapped lines,
+	// well past the five-line cap.
+	c.Type(strings.TrimSpace(strings.Repeat("aaaaaaaaa ", 90)))
+
+	lines := c.Render(100, "lane-a")
+	require.Len(t, lines, composerMaxVisibleLines+2, "growth must cap at five content rows, never more")
+	require.Contains(t, ansi.Strip(lines[len(lines)-2]), composerCursor, "the cursor stays on the always-visible last row once the box scrolls")
+}
+
+func TestComposer_InsertNewline_SurvivesIntoValue(t *testing.T) {
+	c := NewComposer()
+	c.Open("lane-a", false)
+	c.Type("first line")
+	c.InsertNewline()
+	c.Type("second line")
+
+	require.Equal(t, "first line\nsecond line", c.Value(), "a newline inserted with the chord must survive into the sent text")
+}
+
+func TestComposer_Render_InsertedNewlineShowsAsTwoRows(t *testing.T) {
+	c := NewComposer()
+	c.Open("lane-a", false)
+	c.Type("first")
+	c.InsertNewline()
+	c.Type("second")
+
+	lines := c.Render(60, "lane-a")
+	require.Len(t, lines, 4, "top + two content rows (one per side of the inserted newline) + bottom")
+	require.Contains(t, ansi.Strip(lines[1]), "first")
+	require.Contains(t, ansi.Strip(lines[2]), "second"+composerCursor)
+}
+
+// TestSessionPane_TurnsViewportShrinksWithComposerGrowth is the RULE's own
+// "the turns viewport above shrinks by the same rows so nothing overlaps",
+// read through ui/session.go's own turnsAreaHeight (unexported, same
+// package) rather than a full String() diff - the pane layout wiring this
+// leg's brief scopes in alongside composer.go itself.
+func TestSessionPane_TurnsViewportShrinksWithComposerGrowth(t *testing.T) {
+	pinHome(t)
+	s := NewSessionPane()
+	composer := NewComposer()
+	s.SetComposer(composer)
+	s.SetSize(100, 30)
+	s.SetInfo(fixtureInfo())
+
+	baseline := s.turnsAreaHeight()
+
+	composer.Open("ways-of-working", false)
+	oneLine := s.turnsAreaHeight()
+	require.Equal(t, baseline, oneLine, "opening on empty text is still the legacy one-line box - no shrink yet")
+
+	composer.Type(composerWordsOfLen220())
+	grown := s.turnsAreaHeight()
+	require.Equal(t, oneLine-2, grown, "a 1-row -> 3-row composer must cost the turns viewport exactly its 2 extra rows")
+}
+
+// TestNeedsYouPane_ContentAreaShrinksWithComposerGrowth is the same wiring
+// on the Needs-you tab's own scrollable region (ui/needsyou.go's
+// contentAreaHeight).
+func TestNeedsYouPane_ContentAreaShrinksWithComposerGrowth(t *testing.T) {
+	p := NewNeedsYouPane()
+	composer := NewComposer()
+	p.SetComposer(composer)
+	p.SetSize(100, 30)
+	p.SetInfo(&NeedsYouInfo{Lane: "ways-of-working"})
+
+	baseline := p.contentAreaHeight()
+
+	composer.Open("ways-of-working", false)
+	composer.Type(composerWordsOfLen220())
+	grown := p.contentAreaHeight()
+
+	require.Equal(t, baseline-2, grown, "a 1-row -> 3-row composer must cost the content area exactly its 2 extra rows")
+}
+
 func TestComposer_Render_NeverExceedsWidth(t *testing.T) {
 	c := NewComposer()
 	c.Open(strings.Repeat("a-very-long-lane-name-", 5), false)
