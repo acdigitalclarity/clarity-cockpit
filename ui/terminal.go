@@ -116,8 +116,26 @@ func NewTerminalPane() *TerminalPane {
 	return &TerminalPane{
 		external:   make(map[string]*terminalSession),
 		viewport:   viewport.New(),
-		newSession: tmux.NewTmuxSession,
+		newSession: newRealTmuxSession,
 	}
+}
+
+// newRealTmuxSession is NewTerminalPane's own default newSession - the real
+// tmux.NewTmuxSession, gated by CLARITY_TEST_FORBID_TMUX (slice 15b): the
+// fit tests in ui/fit_test.go and app/fit_test.go used to render the
+// Terminal tab through this exact factory, each creating a real
+// claudesquad_term_* session on the default tmux server on every go test
+// run. With CLARITY_TEST_FORBID_TMUX=1 (set in TestMain for the ui and app
+// packages, never for the real binary) this panics naming the session it
+// would have created instead of shelling out, so a construction site added
+// later that forgets to route through NewTerminalPaneWithDeps fails loudly
+// the first time it is actually exercised, rather than leaving a session
+// behind for someone to find and kill by hand.
+func newRealTmuxSession(name, program string) *tmux.TmuxSession {
+	if os.Getenv("CLARITY_TEST_FORBID_TMUX") == "1" {
+		panic(fmt.Sprintf("ui.TerminalPane: real tmux session factory reached for %q under CLARITY_TEST_FORBID_TMUX=1 - this test must be built with NewTerminalPaneWithDeps, never the default NewTerminalPane, wherever it renders the Terminal tab", name))
+	}
+	return tmux.NewTmuxSession(name, program)
 }
 
 // NewTerminalPaneWithDeps returns a TerminalPane whose external term_<lane>

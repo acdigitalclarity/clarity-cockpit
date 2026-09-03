@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"claude-squad/log"
 	"claude-squad/session"
 	"claude-squad/session/clarity"
 	"fmt"
@@ -258,7 +259,11 @@ func TestString_LaneRows_DropWordWhenCollapsed(t *testing.T) {
 func TestSessionPane_FitsAt120x36And164x45And200x55(t *testing.T) {
 	for _, sz := range []struct{ w, h int }{{120, 36}, {164, 45}, {200, 55}} {
 		t.Run(fmt.Sprintf("%dx%d", sz.w, sz.h), func(t *testing.T) {
-			w := NewTabbedWindow(NewSessionPane(), NewNeedsYouPane(), NewTerminalPane())
+			// The Terminal tab is never selected in this case, so its own
+			// TerminalPane never reaches ensureExternalSessionLocked - the
+			// fake factory here is never exercised, only the injection
+			// point every TerminalPane construction in this suite now uses.
+			w := NewTabbedWindow(NewSessionPane(), NewNeedsYouPane(), newTerminalPaneWithDeps(&MockPtyFactory{t: t, cmdExec: mockCmdExec("", false)}, mockCmdExec("", false)))
 			w.SetSize(sz.w, int(float32(sz.h)*0.9))
 			contentWidth, contentHeight := w.GetContentSize()
 			require.Greater(t, contentWidth, 0)
@@ -298,9 +303,26 @@ func TestSessionPane_FitsAt120x36And164x45And200x55(t *testing.T) {
 // 200x55; the fit tests gain Terminal-tab cases"): a tracked instance's own
 // mirrored content never exceeds the pane at any of the three named sizes.
 func TestTerminalPane_FitsAt120x36And164x45And200x55(t *testing.T) {
+	// The fake ptmx below is a plain temp file, not a real PTY - its own
+	// SetDetachedSize/pty.Setsize call fails (ENOTTY), the same as every
+	// other fake-tmux test in this package, and that failure path logs via
+	// log.InfoLog (terminal.go's ensureExternalSessionLocked), which is nil
+	// until log.Initialize runs.
+	log.Initialize(false)
+	defer log.Close()
 	for _, sz := range []struct{ w, h int }{{120, 36}, {164, 45}, {200, 55}} {
 		t.Run(fmt.Sprintf("%dx%d", sz.w, sz.h), func(st *testing.T) {
-			w := NewTabbedWindow(NewSessionPane(), NewNeedsYouPane(), NewTerminalPane())
+			// The Terminal tab's own term_<title> shell is opened lazily the
+			// moment UpdateTerminal below is called with a Tracked target -
+			// on the real factory this used to shell out to the real tmux
+			// binary on every go test run (the defect this fix closes). The
+			// window's own TerminalPane is built with a fake factory instead
+			// (newRecordingCmdExec is the same double the term_ lifecycle
+			// tests in terminal_test.go already use), backed by the same
+			// 300-char capture content the fit assertion below needs.
+			rec := newRecordingCmdExec(strings.Repeat("x", 300), false)
+			ptyFactory := &MockPtyFactory{t: t, cmdExec: rec.exec()}
+			w := NewTabbedWindow(NewSessionPane(), NewNeedsYouPane(), newTerminalPaneWithDeps(ptyFactory, rec.exec()))
 			w.SetSize(sz.w, int(float32(sz.h)*0.9))
 			contentWidth, contentHeight := w.GetContentSize()
 			require.Greater(st, contentWidth, 0)
@@ -315,7 +337,7 @@ func TestTerminalPane_FitsAt120x36And164x45And200x55(t *testing.T) {
 			// and a subtest's own Name() contains "/" (e.g.
 			// ".../TestTerminalPane_FitsAt.../120x36"), which filepath.Join
 			// then treats as an unmade subdirectory - the outer t's Name() has
-			// no such slash.
+			// no such slash. The same reason governs ptyFactory above: t, not st.
 			inst := makeStartedInstance(t, fmt.Sprintf("a-lane-%dx%d", sz.w, sz.h), strings.Repeat("x", 300))
 			defer func() { _ = inst.Kill() }()
 			require.NoError(st, w.UpdateTerminal(TerminalTarget{Kind: TerminalTargetTracked, Instance: inst}))
@@ -335,7 +357,10 @@ func TestTerminalPane_FitsAt120x36And164x45And200x55(t *testing.T) {
 func TestTerminalPane_RestingFrame_FitsAt120x36And164x45And200x55(t *testing.T) {
 	for _, sz := range []struct{ w, h int }{{120, 36}, {164, 45}, {200, 55}} {
 		t.Run(fmt.Sprintf("%dx%d", sz.w, sz.h), func(t *testing.T) {
-			w := NewTabbedWindow(NewSessionPane(), NewNeedsYouPane(), NewTerminalPane())
+			// TerminalTargetNone below never reaches ensureExternalSessionLocked
+			// either, but every TerminalPane construction in this suite still
+			// routes through the fake factory - never the real one.
+			w := NewTabbedWindow(NewSessionPane(), NewNeedsYouPane(), newTerminalPaneWithDeps(&MockPtyFactory{t: t, cmdExec: mockCmdExec("", false)}, mockCmdExec("", false)))
 			w.SetSize(sz.w, int(float32(sz.h)*0.9))
 			w.SetActiveTab(TerminalTab)
 			require.NoError(t, w.UpdateTerminal(TerminalTarget{Kind: TerminalTargetNone}))

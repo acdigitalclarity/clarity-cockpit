@@ -43,7 +43,7 @@ func TestSessionTick_RefreshesSelectedLaneOnly_RowsUntouched(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv(clarity.ClaudeProjectsRootEnvVar, root)
 
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	now := time.Now()
 	selected := writeTrackedLaneFixture(t, root, "selected-lane", now.Add(-time.Minute))
 	other := writeTrackedLaneFixture(t, root, "other-lane", now.Add(-time.Minute))
@@ -83,7 +83,7 @@ func TestFeedTick_StillUpdatesOtherRows_SessionTickDoesNot(t *testing.T) {
 	t.Setenv(clarity.ClaudeProjectsRootEnvVar, root)
 	t.Setenv(clarity.FeedQueuePathEnvVar, filepath.Join(root, "no-such-queue.json"))
 
-	h := newComposerTestHome()
+	h := newComposerTestHome(t)
 	now := time.Now()
 	selected := writeTrackedLaneFixture(t, root, "selected-lane", now.Add(-time.Minute))
 	other := writeTrackedLaneFixture(t, root, "other-lane", now.Add(-time.Minute))

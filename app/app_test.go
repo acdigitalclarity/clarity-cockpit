@@ -23,6 +23,16 @@ func TestMain(m *testing.M) {
 	log.Initialize(false)
 	defer log.Close()
 
+	// CLARITY_TEST_FORBID_TMUX (slice 15b): ui.NewTerminalPane's default
+	// newSession panics under this var instead of shelling out to the real
+	// tmux binary, naming the session it would have created - see
+	// ui/main_test.go's own TestMain for the full rationale. Every test
+	// that exercises the Terminal tab here already builds its own
+	// TerminalPane through ui.NewTerminalPaneWithDeps
+	// (homeWithMockedTerminal, newComposerTestHome); this is the guard
+	// against a future one that forgets to.
+	os.Setenv("CLARITY_TEST_FORBID_TMUX", "1")
+
 	// Run all tests
 	exitCode := m.Run()
 

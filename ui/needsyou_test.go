@@ -198,7 +198,9 @@ func TestNeedsYouPane_ScrollResetsOnDifferentRow(t *testing.T) {
 func TestNeedsYouPane_FitsAt120x36And164x45And200x55(t *testing.T) {
 	for _, sz := range []struct{ w, h int }{{120, 36}, {164, 45}, {200, 55}} {
 		t.Run(fmt.Sprintf("%dx%d", sz.w, sz.h), func(t *testing.T) {
-			w := NewTabbedWindow(NewSessionPane(), NewNeedsYouPane(), NewTerminalPane())
+			// Needs-you tab only - the Terminal tab's own fake factory is
+			// never exercised, only its injection point.
+			w := NewTabbedWindow(NewSessionPane(), NewNeedsYouPane(), newTerminalPaneWithDeps(&MockPtyFactory{t: t, cmdExec: mockCmdExec("", false)}, mockCmdExec("", false)))
 			w.SetSize(sz.w, int(float32(sz.h)*0.9))
 			w.SetActiveTab(NeedsYouTab)
 			contentWidth, contentHeight := w.GetContentSize()

@@ -14,7 +14,7 @@ import (
 // Terminal, Session first and the default (design/cockpit-pane/
 // DECISIONS.md slices 3 and 5).
 func TestTabbedWindow_SessionIsFirstAndDefaultTab(t *testing.T) {
-	w := NewTabbedWindow(NewSessionPane(), NewNeedsYouPane(), NewTerminalPane())
+	w := NewTabbedWindow(NewSessionPane(), NewNeedsYouPane(), newTerminalPaneWithDeps(&MockPtyFactory{t: t, cmdExec: mockCmdExec("", false)}, mockCmdExec("", false)))
 	require.Equal(t, 0, w.GetActiveTab(), "Session must be the default tab")
 	require.True(t, w.IsInSessionTab())
 	require.Equal(t, SessionTab, 0)
@@ -28,7 +28,7 @@ func TestTabbedWindow_SessionIsFirstAndDefaultTab(t *testing.T) {
 // (the same keys.KeyShiftUp/KeyShiftDown app.go already binds for
 // Preview/Needs-you/Terminal - this slice reuses them, no new binding).
 func TestTabbedWindow_ScrollKeys_DispatchToSessionPane(t *testing.T) {
-	w := NewTabbedWindow(NewSessionPane(), NewNeedsYouPane(), NewTerminalPane())
+	w := NewTabbedWindow(NewSessionPane(), NewNeedsYouPane(), newTerminalPaneWithDeps(&MockPtyFactory{t: t, cmdExec: mockCmdExec("", false)}, mockCmdExec("", false)))
 	w.SetSize(200, 40)
 	require.True(t, w.IsInSessionTab())
 
@@ -52,7 +52,7 @@ func TestTabbedWindow_ScrollKeys_DispatchToSessionPane(t *testing.T) {
 // wiring proof for the Needs-you tab (slice 5's "scroll with the same keys
 // as Session").
 func TestTabbedWindow_ScrollKeys_DispatchToNeedsYouPane(t *testing.T) {
-	w := NewTabbedWindow(NewSessionPane(), NewNeedsYouPane(), NewTerminalPane())
+	w := NewTabbedWindow(NewSessionPane(), NewNeedsYouPane(), newTerminalPaneWithDeps(&MockPtyFactory{t: t, cmdExec: mockCmdExec("", false)}, mockCmdExec("", false)))
 	w.SetSize(30, 20)
 	w.SetActiveTab(NeedsYouTab)
 	require.True(t, w.IsInNeedsYouTab())
