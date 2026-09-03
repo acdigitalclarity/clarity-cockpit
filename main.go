@@ -217,12 +217,13 @@ var (
 			}
 
 			fmt.Printf("clarity-attach: %q running %s in %s (no git worktree)\n", lane, program, lanePath)
-			fmt.Println("Attaching now - press ctrl-q to detach (the instance keeps running; `cs` lists it by lane name).")
+			fmt.Println("Attaching now - ctrl-q (or ctrl-]) returns to the cockpit (the instance keeps running; `cs` lists it by lane name).")
 
 			// Put our own stdin/stdout into raw mode for the duration of the
-			// attach so keystrokes (including ctrl-q to detach) pass straight
-			// through to the tmux session, the same way they do inside the
-			// full `cs` TUI (which runs its whole event loop in raw mode).
+			// attach so keystrokes (including ctrl-] or ctrl-q to detach) pass
+			// straight through to the tmux session, the same way they do
+			// inside the full `cs` TUI (which runs its whole event loop in
+			// raw mode).
 			if term.IsTerminal(int(os.Stdin.Fd())) {
 				oldState, rawErr := term.MakeRaw(int(os.Stdin.Fd()))
 				if rawErr != nil {

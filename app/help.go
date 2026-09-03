@@ -46,7 +46,9 @@ func (h helpTypeGeneral) toContent() string {
 		keyStyle.Render("↑/j, ↓/k")+descStyle.Render("  - Navigate between sessions"),
 		keyStyle.Render("J/K")+descStyle.Render("       - Reorder sessions"),
 		keyStyle.Render("↵")+descStyle.Render("         - Attach to the selected session"),
-		keyStyle.Render("ctrl-q")+descStyle.Render("    - Detach from session"),
+		keyStyle.Render("ctrl-]")+descStyle.Render(" (or ctrl-q) - returns to the cockpit"),
+		descStyle.Render("             If ctrl-q does not reach the terminal (VS Code swallows it), press ctrl-] instead, or add"),
+		descStyle.Render(`             "terminal.integrated.commandsToSkipShell": ["-workbench.action.quickOpenView"] to settings.json`),
 		"",
 		headerStyle.Render("Handoff:"),
 		keyStyle.Render("p")+descStyle.Render("         - Commit and push branch to github"),
@@ -90,7 +92,7 @@ func (h helpTypeInstanceAttach) toContent() string {
 	content := lipgloss.JoinVertical(lipgloss.Left,
 		titleStyle.Render("Attaching to Instance"),
 		"",
-		descStyle.Render("To detach from a session, press ")+keyStyle.Render("ctrl-q"),
+		descStyle.Render("To detach from a session, press ")+keyStyle.Render("ctrl-]")+descStyle.Render(" (or ")+keyStyle.Render("ctrl-q")+descStyle.Render(")"),
 	)
 	return content
 }
