@@ -12,8 +12,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"charm.land/bubbles/v2/viewport"
 	"charm.land/lipgloss/v2"
@@ -27,6 +29,23 @@ var sessionMutedStyle = lipgloss.NewStyle().
 var sessionTextStyle = lipgloss.NewStyle().
 	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#1a1a1a"), Dark: lipgloss.Color("#dddddd")})
 
+// sessionClaudeStyle is the reading layout's own CLAUDE tag colour
+// (SESSION-READING-SPEC.md's colour roles: "the splash's openSkies teal",
+// ui/splash/render.go:34's Dark value; Light is a new, darker-for-light-bg
+// variant since openSkies itself is a dark-ground colour with no light-mode
+// counterpart yet defined).
+var sessionClaudeStyle = lipgloss.NewStyle().
+	Bold(true).
+	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#0f7f83"), Dark: lipgloss.Color("#54E6EA")})
+
+// sessionRuleStyle is the reading layout's own dimmer-than-muted divider
+// colour (SESSION-READING-SPEC.md: "the pair at ui/menu.go:25-26" - menu.go's
+// own sepStyle values, repeated here rather than exported from menu.go so
+// this file's colour roles stay self-contained) - dim enough that a rule
+// never competes with a tag line for attention.
+var sessionRuleStyle = lipgloss.NewStyle().
+	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#DDDADA"), Dark: lipgloss.Color("#3C3C3C")})
+
 // sessionFixedBottomRows is the row cost of the bottom rule, the state
 // line and the three-line composer box - always reserved, regardless of how
 // much of the turns region above them is used (the "newest content pinned
@@ -34,9 +53,15 @@ var sessionTextStyle = lipgloss.NewStyle().
 // edge).
 const sessionFixedBottomRows = 5
 
-// sessionTurnIndent is the hanging indent owner/assistant body text wraps
-// under, below its own "hh:mm:ss   YOU|CLAUDE" header line.
-const sessionTurnIndent = "  "
+// sessionWideMinWidth is the pane-inner-width (the value SetSize actually
+// receives) threshold above which the reading layout's 1-column-each-side
+// padding and 2-column turn gutter apply (SESSION-READING-SPEC.md's own
+// rule of thumb: "gutter = 2 at 140 columns or wider, else 1" - stated
+// against the outer terminal width, translated here to this package's own
+// received width: a 140-column terminal's arithmetic - listWidthForTerminal
+// clamp(round(140*0.28),38,52)=39, tabsWidth=101, minus the pane's 2-column
+// border - lands on exactly 99).
+const sessionWideMinWidth = 99
 
 // SessionInfo is everything one Session-tab render needs for the SELECTED
 // lane, tracked or external - resolved once per feed tick (app.go's
@@ -99,10 +124,65 @@ type SessionPane struct {
 
 	viewport viewport.Model // the scrollable turns region only, not the whole pane
 
+	// lineMeta is buildTurnLines' own per-line bookkeeping, in lock-step with
+	// the lines last handed to viewport.SetContent: which turn each rendered
+	// line belongs to, and - for a prose turn's own continuation lines only,
+	// never its first/label line - that turn's tag. String() reads
+	// lineMeta[viewport.YOffset()] to draw the sticky "⋯ continued" header
+	// (SESSION-READING-SPEC.md) whenever a scroll lands mid-turn.
+	lineMeta []sessionTurnLineTag
+
 	// composer is the shared inline message box (slice 5) - app.go owns
 	// the single instance and wires it into both this pane and NeedsYouPane
 	// via SetComposer, since only one row can be the current send target.
 	composer *Composer
+}
+
+// pad is the reading layout's own left/right inset inside the pane's
+// received width - 1 column each side at the wide (>= sessionWideMinWidth)
+// size, 0 at the narrow size (SESSION-READING-SPEC.md's "Pane padding 1
+// column ... pane padding 0" pair).
+func (s *SessionPane) pad() int {
+	if s.width >= sessionWideMinWidth {
+		return 1
+	}
+	return 0
+}
+
+// gutter is the turn body's own hanging indent under its tag/time label
+// line - 2 columns wide, 1 narrow (SESSION-READING-SPEC.md's "Turn gutter
+// 2" / "gutter 1" pair, and its own rule of thumb: "gutter = 2 at 140
+// columns or wider, else 1").
+func (s *SessionPane) gutter() int {
+	if s.width >= sessionWideMinWidth {
+		return 2
+	}
+	return 1
+}
+
+// contentWidth is the chrome's own working width (header lines, rules,
+// state line, composer box, and the turns viewport itself all render at
+// this width) - the pane's received width minus its own padding on both
+// sides.
+func (s *SessionPane) contentWidth() int {
+	cw := s.width - 2*s.pad()
+	if cw < 1 {
+		cw = 1
+	}
+	return cw
+}
+
+// measure is the prose wrap width - min(96, content - gutter), the rule of
+// thumb SESSION-READING-SPEC.md's geometry section names verbatim.
+func (s *SessionPane) measure() int {
+	m := s.contentWidth() - s.gutter()
+	if m > 96 {
+		m = 96
+	}
+	if m < 1 {
+		m = 1
+	}
+	return m
 }
 
 // NewSessionPane returns an empty SessionPane - SetSize and SetInfo (or
@@ -230,13 +310,15 @@ func (s *SessionPane) refreshViewport() {
 	wasAtBottom := s.viewport.TotalLineCount() == 0 || s.viewport.AtBottom()
 	prevOffset := s.viewport.YOffset()
 
-	s.viewport.SetWidth(s.width)
+	s.viewport.SetWidth(s.contentWidth())
 	s.viewport.SetHeight(s.turnsAreaHeight())
 	if s.info == nil {
 		s.viewport.SetContent("")
+		s.lineMeta = nil
 		return
 	}
-	lines := buildTurnLines(s.info.Tail.Turns, s.width, s.info.Now)
+	lines, meta := buildTurnLines(s.info.Tail.Turns, s.gutter(), s.measure(), s.info.Now)
+	s.lineMeta = meta
 	s.viewport.SetContent(strings.Join(lines, "\n"))
 	if wasAtBottom {
 		s.viewport.GotoBottom()
@@ -300,7 +382,7 @@ func (s *SessionPane) String() string {
 
 	turnsHeight := s.turnsAreaHeight()
 	s.viewport.SetHeight(turnsHeight)
-	s.viewport.SetWidth(s.width)
+	s.viewport.SetWidth(s.contentWidth())
 	body := strings.Split(s.viewport.View(), "\n")
 	if turnsHeight <= 0 {
 		body = nil
@@ -308,6 +390,18 @@ func (s *SessionPane) String() string {
 		body = append(body, make([]string, turnsHeight-len(body))...)
 	} else if len(body) > turnsHeight {
 		body = body[:turnsHeight]
+	}
+	// Sticky continued header (SESSION-READING-SPEC.md): when the viewport's
+	// own top visible row is a prose turn's CONTINUATION (never its own
+	// first/label line - lineMeta's own tag is "" there), that row is
+	// replaced by the scrolled-off turn's own tag, so a scrolled read always
+	// names its speaker.
+	if len(body) > 0 {
+		if off := s.viewport.YOffset(); off >= 0 && off < len(s.lineMeta) {
+			if tag := s.lineMeta[off].tag; tag != "" {
+				body[0] = fitRow(renderContinuedLabel(tag), s.contentWidth())
+			}
+		}
 	}
 	lines = append(lines, body...)
 
@@ -319,8 +413,9 @@ func (s *SessionPane) String() string {
 	} else if len(lines) < s.height {
 		lines = append(lines, make([]string, s.height-len(lines))...)
 	}
+	pad := strings.Repeat(" ", s.pad())
 	for i, l := range lines {
-		lines[i] = fitRow(l, s.width)
+		lines[i] = fitRow(pad+l+pad, s.width)
 	}
 	return strings.Join(lines, "\n")
 }
@@ -432,12 +527,13 @@ func (s *SessionPane) renderHeaderLine1() string {
 		g + " " + t.State + ctxSeg,
 		g + " " + t.State,
 	}
+	cw := s.contentWidth()
 	for _, right := range candidates {
-		if ansi.StringWidth(s.info.Lane)+ansi.StringWidth(right)+1 <= s.width {
-			return sessionTextStyle.Render(padRow(s.info.Lane, right, s.width))
+		if ansi.StringWidth(s.info.Lane)+ansi.StringWidth(right)+1 <= cw {
+			return sessionTextStyle.Render(padRow(s.info.Lane, right, cw))
 		}
 	}
-	return sessionTextStyle.Render(padRow(s.info.Lane, candidates[len(candidates)-1], s.width))
+	return sessionTextStyle.Render(padRow(s.info.Lane, candidates[len(candidates)-1], cw))
 }
 
 // renderHeaderLine2 is "<workdir> · <branch> · <model> · <window>   ...
@@ -471,26 +567,28 @@ func (s *SessionPane) renderHeaderLine2() string {
 		right += fmt.Sprintf(" · session %s", stem)
 	}
 
-	return sessionMutedStyle.Render(padRowKeepRight(strings.Join(left, " · "), right, s.width))
+	return sessionMutedStyle.Render(padRowKeepRight(strings.Join(left, " · "), right, s.contentWidth()))
 }
 
-// rule is a full-width horizontal divider, dim.
+// rule is a full-content-width horizontal divider, dim (colour role: NEW
+// sessionRuleStyle, dimmer than sessionMutedStyle so a rule never competes
+// with a tag line).
 func (s *SessionPane) rule() string {
-	return muteRule(s.width)
+	return muteRule(s.contentWidth())
 }
 
 // muteRule is a full-width horizontal divider, dim - shared by SessionPane
 // and NeedsYouPane (needsyou.go) so the two tabs' dividers never drift out
 // of style.
 func muteRule(width int) string {
-	return sessionMutedStyle.Render(strings.Repeat("─", width))
+	return sessionRuleStyle.Render(strings.Repeat("─", width))
 }
 
 // renderEarlierLine is "⋯ earlier in this session · N messages · shift+↑ to
 // scroll back", shown only when info.Tail.Truncated.
 func (s *SessionPane) renderEarlierLine() string {
 	text := fmt.Sprintf("⋯  earlier in this session · %d messages · shift+↑ to scroll back", s.info.Tail.Messages)
-	return sessionMutedStyle.Render(ansiTruncateRow(text, s.width))
+	return sessionMutedStyle.Render(ansiTruncateRow(text, s.contentWidth()))
 }
 
 // renderStateLine is the pane's own foot summary: "<glyph> <state> · turn
@@ -520,7 +618,7 @@ func (s *SessionPane) renderStateLine() string {
 // 5): the shared Composer's own Render, targeted at this pane's selected
 // lane whenever the composer is not already open on a captured target.
 func (s *SessionPane) renderComposerLines() []string {
-	return s.composer.Render(s.width, s.info.Lane)
+	return s.composer.Render(s.contentWidth(), s.info.Lane)
 }
 
 // -- small rendering helpers, package-private to this file --------------
@@ -712,52 +810,318 @@ func minutesAgo(at, now time.Time) string {
 
 // -- turn rendering -------------------------------------------------------
 
-// buildTurnLines renders every Turn in order (oldest first) into the plain
-// lines the turns viewport holds - owner/assistant turns as a header line
-// plus wrapped, indented body lines; tool turns as one line each with the
-// result right-aligned.
-func buildTurnLines(turns []clarity.Turn, width int, now time.Time) []string {
-	var lines []string
-	for _, t := range turns {
+// sessionTurnLineTag is buildTurnLines' own per-rendered-line bookkeeping -
+// see SessionPane.lineMeta's own doc comment.
+type sessionTurnLineTag struct {
+	turnIdx int
+	tag     string // "" unless this line is a prose turn's own CONTINUATION
+}
+
+// buildTurnLines renders every Turn in order (oldest first) into the plain,
+// already-styled lines the turns viewport holds: owner/assistant turns as a
+// tag/time label line plus paragraph/list-aware wrapped body (rule 1), one
+// blank line between turns and never inside one (SESSION-READING-SPEC.md's
+// Spacing section); tool turns as one line each, their own result styled by
+// outcome and right-aligned to the measure's own right edge. meta is
+// returned in lock-step with lines - see SessionPane.lineMeta.
+func buildTurnLines(turns []clarity.Turn, gutter, measure int, now time.Time) (lines []string, meta []sessionTurnLineTag) {
+	for i, t := range turns {
+		if i > 0 {
+			lines = append(lines, "")
+			meta = append(meta, sessionTurnLineTag{turnIdx: i})
+		}
+		var turnLines []string
+		var tag string
 		switch t.Kind {
 		case clarity.TurnOwner:
-			lines = append(lines, renderProseTurn(t, "YOU", width)...)
+			tag = "YOU"
+			turnLines = renderProseTurn(t, tag, needsYouTitleStyle, gutter, measure)
 		case clarity.TurnAssistant:
-			lines = append(lines, renderProseTurn(t, "CLAUDE", width)...)
+			tag = "CLAUDE"
+			turnLines = renderProseTurn(t, tag, sessionClaudeStyle, gutter, measure)
 		case clarity.TurnTool:
-			lines = append(lines, renderToolTurn(t, width, now))
+			turnLines = []string{renderToolTurn(t, gutter, measure, now)}
+		}
+		for j, l := range turnLines {
+			lines = append(lines, l)
+			m := sessionTurnLineTag{turnIdx: i}
+			if j > 0 {
+				m.tag = tag
+			}
+			meta = append(meta, m)
+		}
+	}
+	return lines, meta
+}
+
+// renderContinuedLabel is the sticky top-of-viewport marker String() swaps
+// in for lineMeta's own continuation rows: "<TAG>  ⋯ continued" in the
+// tag's own colour, at content offset 0 like every real label line.
+func renderContinuedLabel(tag string) string {
+	style := needsYouTitleStyle
+	if tag == "CLAUDE" {
+		style = sessionClaudeStyle
+	}
+	return style.Render(fmt.Sprintf("%-7s  ⋯ continued", tag))
+}
+
+// renderProseTurn renders one owner/assistant turn: the "%-7s  %s" tag/time
+// label line (SESSION-READING-SPEC.md's own format string - tag first so
+// YOU and CLAUDE's times land in one column), then the turn's own text
+// preserving paragraphs and list items (rule 1 - collapseWS folding them
+// into one paragraph was the defect this replaces), word-wrapped to measure
+// with a gutter-wide hanging indent under each line, list items hanging
+// under their own marker instead.
+func renderProseTurn(t clarity.Turn, tag string, tagStyle lipgloss.Style, gutter, measure int) []string {
+	label := tagStyle.Render(fmt.Sprintf("%-7s  ", tag)) + sessionMutedStyle.Render(t.At.Local().Format("15:04:05"))
+	lines := []string{label}
+
+	indent := strings.Repeat(" ", gutter)
+	for _, block := range splitProseBlocks(t.Text) {
+		markerWidth := len([]rune(block.marker))
+		wrapWidth := measure - gutter - markerWidth
+		if wrapWidth < 10 {
+			wrapWidth = 10
+		}
+		for i, wline := range wrapTokens(tokenizeMarkdown(block.text), wrapWidth) {
+			prefix := indent
+			switch {
+			case block.marker == "":
+				// plain paragraph, gutter indent only
+			case i == 0:
+				prefix = indent + block.marker
+			default:
+				prefix = indent + strings.Repeat(" ", markerWidth)
+			}
+			lines = append(lines, prefix+renderTokenLine(wline))
 		}
 	}
 	return lines
 }
 
-// renderProseTurn is "hh:mm:ss   YOU|CLAUDE" on its own line, then the
-// turn's text collapsed to one paragraph and word-wrapped, each wrapped
-// line indented under it (design/cockpit-pane/PANE-MOCKUP-164x45.md's own
-// owner/assistant turns, e.g. "18:03:25   YOU" then two indented lines).
-func renderProseTurn(t clarity.Turn, label string, width int) []string {
-	lines := []string{fmt.Sprintf("%s   %s", t.At.Local().Format("15:04:05"), label)}
-	wrapWidth := width - len(sessionTurnIndent)
-	if wrapWidth < 10 {
-		wrapWidth = 10
-	}
-	for _, w := range wrapPlain(collapseWS(t.Text), wrapWidth) {
-		lines = append(lines, sessionTurnIndent+w)
-	}
-	return lines
+// proseBlock is one paragraph or list item split out of a turn's raw text -
+// see splitProseBlocks.
+type proseBlock struct {
+	marker string // "" for a plain paragraph, else "- ", "* " or "N. " as rendered
+	text   string
 }
 
-// renderToolTurn is "▪ <tool>  <summary>" with the result and duration
-// right-aligned to the pane's width in one line, per the mock-up's tool
-// rows ("▪ Bash   ...                exit 0     2.1s").
-func renderToolTurn(t clarity.Turn, width int, now time.Time) string {
-	left := fmt.Sprintf("▪ %s  %s", t.Tool, t.Summary)
-	return padRow(left, toolResultLabel(t, now), width)
+// orderedListMarkerRe matches an ordered-list source line's own "N. " lead.
+var orderedListMarkerRe = regexp.MustCompile(`^(\d+)\.\s+(.*)$`)
+
+// listMarker reports whether line opens a list item (SESSION-READING-
+// SPEC.md: "a source line opening '- ', '* ' or 'N. ' becomes a list
+// item"), returning the marker exactly as rendered and the remainder.
+func listMarker(line string) (marker, rest string, ok bool) {
+	switch {
+	case strings.HasPrefix(line, "- "):
+		return "- ", strings.TrimPrefix(line, "- "), true
+	case strings.HasPrefix(line, "* "):
+		return "* ", strings.TrimPrefix(line, "* "), true
+	}
+	if m := orderedListMarkerRe.FindStringSubmatch(line); m != nil {
+		return m[1] + ". ", m[2], true
+	}
+	return "", "", false
 }
 
-// toolResultLabel is the tool line's right-hand field: "exit 0     2.1s",
-// "running   4m12s", "denied", "error" - the exact four shapes the brief
-// names, duration shown only alongside a real (ok/running) outcome. A
+// splitProseBlocks walks text's own source lines - never collapsed to one
+// paragraph (rule 1) - into paragraph/list-item blocks: a blank source line
+// ends the current block, and a list-marker line always starts a new one
+// even without a blank line before it. Any other non-blank line joins the
+// CURRENT block with a single space, so a paragraph or item hard-wrapped in
+// the source still renders as one flowing, re-wrappable unit.
+func splitProseBlocks(text string) []proseBlock {
+	var blocks []proseBlock
+	var cur *proseBlock
+	flush := func() {
+		if cur != nil && strings.TrimSpace(cur.text) != "" {
+			blocks = append(blocks, *cur)
+		}
+		cur = nil
+	}
+	for _, raw := range strings.Split(text, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			flush()
+			continue
+		}
+		if marker, rest, ok := listMarker(line); ok {
+			flush()
+			cur = &proseBlock{marker: marker, text: rest}
+			continue
+		}
+		if cur == nil {
+			cur = &proseBlock{text: line}
+		} else {
+			cur.text += " " + line
+		}
+	}
+	flush()
+	return blocks
+}
+
+// proseToken is one word of a rendered block, carrying whether it fell
+// inside a "**bold**" span.
+type proseToken struct {
+	text string
+	bold bool
+}
+
+// tokenizeMarkdown strips "**", "__" and backtick markers from s and splits
+// what remains into words, marking each word bold if it fell inside a
+// "**...**" span (SESSION-READING-SPEC.md: "strip markdown emphasis and
+// code markers ... apply bold to what ** wrapped") - no marker byte
+// survives into a token's own text (rule 1's "never a literal asterisk pair
+// in the pane").
+func tokenizeMarkdown(s string) []proseToken {
+	var out []proseToken
+	bold := false
+	var buf strings.Builder
+	flush := func() {
+		if buf.Len() > 0 {
+			out = append(out, proseToken{text: buf.String(), bold: bold})
+			buf.Reset()
+		}
+	}
+	r := []rune(s)
+	for i := 0; i < len(r); i++ {
+		switch {
+		case r[i] == '*' && i+1 < len(r) && r[i+1] == '*':
+			flush()
+			bold = !bold
+			i++
+		case r[i] == '_' && i+1 < len(r) && r[i+1] == '_':
+			flush()
+			i++
+		case r[i] == '`':
+			// stripped, no style change
+		case unicode.IsSpace(r[i]):
+			flush()
+		default:
+			buf.WriteRune(r[i])
+		}
+	}
+	flush()
+	return out
+}
+
+// wrapTokens greedily wraps tokens into lines no wider than width, at word
+// boundaries - a single word longer than width still gets its own
+// (overflowing) line, never split mid-word (mirrors wrapPlain's own rule).
+func wrapTokens(tokens []proseToken, width int) [][]proseToken {
+	if len(tokens) == 0 {
+		return nil
+	}
+	lines := make([][]proseToken, 0, 4)
+	cur := []proseToken{tokens[0]}
+	curLen := len([]rune(tokens[0].text))
+	for _, tok := range tokens[1:] {
+		wlen := len([]rune(tok.text))
+		if curLen+1+wlen > width {
+			lines = append(lines, cur)
+			cur = []proseToken{tok}
+			curLen = wlen
+		} else {
+			cur = append(cur, tok)
+			curLen += 1 + wlen
+		}
+	}
+	return append(lines, cur)
+}
+
+// renderTokenLine joins one wrapped line's tokens back into a styled
+// string - sessionTextStyle for plain words, bold for a "**...**" span,
+// never a second hue (colour role rule 2). Runs of CONSECUTIVE same-bold
+// tokens are rendered in one Style.Render call (their own words plain-space
+// joined first), not one call per word: a per-word Render would interleave
+// an ANSI escape between every word, and a caller reading the rendered
+// text back for a literal phrase (a live turn's own words, or a test
+// fixture's) would never find it as one contiguous substring.
+func renderTokenLine(tokens []proseToken) string {
+	var b strings.Builder
+	for i := 0; i < len(tokens); {
+		bold := tokens[i].bold
+		j := i
+		var words []string
+		for j < len(tokens) && tokens[j].bold == bold {
+			words = append(words, tokens[j].text)
+			j++
+		}
+		if i > 0 {
+			b.WriteString(" ")
+		}
+		style := sessionTextStyle
+		if bold {
+			style = style.Bold(true)
+		}
+		b.WriteString(style.Render(strings.Join(words, " ")))
+		i = j
+	}
+	return b.String()
+}
+
+// toolIndentFor returns the tool line's own content offset: 2 further than
+// the turn gutter at the wide (gutter 2) size, so a tool line visibly nests
+// under its turn's prose; the narrow (gutter 1) size has no room to spare
+// and nests at the gutter itself (SESSION-READING-SPEC.md: "Tool lines
+// indent 2 further (content offset 4)" at 164x45 vs "Tool indent 1
+// (gutter + 0)" at 120x36).
+func toolIndentFor(gutter int) int {
+	if gutter >= 2 {
+		return gutter + 2
+	}
+	return gutter
+}
+
+// toolSummaryCap is the Truncation section's own two named figures - 66 at
+// measure 96/gutter 2, 50 at measure 79/gutter 1 (SESSION-READING-SPEC.md's
+// own arithmetic for the narrow case: "measure - 1 - 2 - 8 - 16 - 2 = 50").
+func toolSummaryCap(gutter, rowWidth int) int {
+	capWidth := rowWidth - 28 // "▪ " (2) + tool name (8) + gap (2) + result block (16)
+	if gutter == 1 {
+		capWidth-- // SESSION-READING-SPEC.md 120x36's own extra "-1" term
+	}
+	if capWidth < 1 {
+		capWidth = 1
+	}
+	return capWidth
+}
+
+// renderToolTurn is the tool row: "▪ <tool>  <summary>" left, the result/
+// duration right-aligned to the measure's own right edge, indented
+// toolIndentFor(gutter) columns so it nests under its turn's prose
+// (SESSION-READING-SPEC.md's Truncation section: tool name capped to 8
+// columns, summary capped per toolSummaryCap, the result block ending at
+// the measure's own right edge).
+func renderToolTurn(t clarity.Turn, gutter, measure int, now time.Time) string {
+	indent := toolIndentFor(gutter)
+	rowWidth := gutter + measure - indent
+	if rowWidth < 20 {
+		rowWidth = 20
+	}
+
+	name := t.Tool
+	if r := []rune(name); len(r) > 8 {
+		name = string(r[:7]) + "…"
+	}
+	summary := t.Summary
+	if capWidth := toolSummaryCap(gutter, rowWidth); len([]rune(summary)) > capWidth {
+		if r := []rune(summary); capWidth > 1 {
+			summary = string(r[:capWidth-1]) + "…"
+		} else {
+			summary = "…"
+		}
+	}
+
+	left := sessionMutedStyle.Render(fmt.Sprintf("▪ %-8s%s", name, summary))
+	right := toolResultStyled(t, now)
+	return strings.Repeat(" ", indent) + padRow(left, right, rowWidth)
+}
+
+// toolResultLabel is the tool line's right-hand PLAIN text: "exit 0
+// 2.1s", "running   4m12s", "denied", "error" - the exact four shapes the
+// brief names, duration shown only alongside a real (ok/running) outcome. A
 // ResultRunning turn (the Latency ruling's own case: an unmatched tool_use,
 // no tool_result yet) never carries a stored Duration - buildTurns only
 // ever sets that from a matched outcome - so its elapsed time is computed
@@ -788,6 +1152,22 @@ func toolResultLabel(t clarity.Turn, now time.Time) string {
 		return "error"
 	default:
 		return t.Result
+	}
+}
+
+// toolResultStyled is toolResultLabel's own text, styled by outcome
+// (colour roles): ok is the default and never earns colour, running
+// borrows the lane rows' own amber "moving" tint (needsYouTitleStyle,
+// unbolded), error/denied get the removed-lines red.
+func toolResultStyled(t clarity.Turn, now time.Time) string {
+	text := toolResultLabel(t, now)
+	switch t.Result {
+	case clarity.ResultRunning:
+		return needsYouTitleStyle.Bold(false).Render(text)
+	case clarity.ResultDenied, clarity.ResultError:
+		return removedLinesStyle.Render(text)
+	default:
+		return sessionMutedStyle.Render(text)
 	}
 }
 

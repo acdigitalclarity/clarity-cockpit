@@ -13,6 +13,7 @@ import (
 	"claude-squad/ui/splash"
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"strings"
@@ -265,8 +266,17 @@ const (
 // show branch and model without truncating (ui/session.go's
 // padRowKeepRight). Only called above collapsePreviewBelowWidth; below it
 // the list still takes the whole terminal, unchanged.
+//
+// Rounds rather than truncates (slice 13's own fix, part of "the tabbed
+// window and the list must together reach column 164"): 164*0.28=45.92
+// truncated to 45 was quietly discarding the list's own fractional column
+// rather than giving it to either side - math.Round hands it to whichever
+// side it actually belongs to (164 case: the list, landing on 46, matching
+// SESSION-READING-SPEC.md's own "List 46 (cols 1-46)"). Every clamped case
+// (100, 120, 200 columns) is unaffected, since the fraction never survives
+// the min/max clamp either way.
 func listWidthForTerminal(width int) int {
-	w := int(float64(width) * 0.28)
+	w := int(math.Round(float64(width) * 0.28))
 	if w < listWidthMin {
 		w = listWidthMin
 	}

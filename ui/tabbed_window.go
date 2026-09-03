@@ -88,13 +88,37 @@ func NewTabbedWindow(session *SessionPane, needsYou *NeedsYouPane, terminal *Ter
 	}
 }
 
-// AdjustPreviewWidth adjusts the width of the preview pane to be 90% of the provided width.
+// AdjustPreviewWidth adjusts the width of the preview pane to be 90% of the
+// provided width - kept for ui/list.go's own unrelated title-bar width calc
+// (list.go:648, a distinct calculation over the LIST's own width, not this
+// window's), but no longer used by TabbedWindow.SetSize itself (see its own
+// comment - slice 13's "leaves the 10 columns" fix).
 func AdjustPreviewWidth(width int) int {
 	return int(float64(width) * 0.9)
 }
 
 func (w *TabbedWindow) SetSize(width, height int) {
-	w.width = AdjustPreviewWidth(width)
+	// Slice 13's own root-cause fix ("the tabbed window and the list must
+	// together reach column 164"): this used to shave a further 10% off
+	// width via AdjustPreviewWidth, on top of the list already having taken
+	// its own share in app.go - so the pane's own box (this value plus its
+	// own border, windowStyle.GetHorizontalFrameSize()) landed 10+ columns
+	// short of the terminal's real right edge (164 case: stopped at column
+	// 154, not 164). width here IS the budget already computed FOR this
+	// component (app.go's tabsWidth = the terminal width minus the list's
+	// own share) - w.width only needs its own border subtracted, once, so
+	// that w.width+GetHorizontalFrameSize() (the box's own total rendered
+	// width, windowStyle.Render's own contract - see GetContentSize's doc
+	// comment) exactly equals the budget it was given, not 90% of it.
+	w.width = width - windowStyle.GetHorizontalFrameSize()
+	if w.width < 0 {
+		// The collapsed case (app.go's OVERFLOW fix passes width 0 below
+		// collapsePreviewBelowWidth): String()'s own "nothing to render" gate
+		// checks w.width == 0 exactly, a contract AdjustPreviewWidth(0)==0
+		// used to satisfy for free - clamp here so it still does now that
+		// this subtracts the border instead of taking 90%.
+		w.width = 0
+	}
 	w.height = height
 
 	// Collapsed (app.go's OVERFLOW fix gives the preview/diff pane zero
@@ -115,7 +139,16 @@ func (w *TabbedWindow) SetSize(width, height int) {
 	contentWidth := w.width - windowStyle.GetHorizontalFrameSize()
 
 	w.contentWidth, w.contentHeight = contentWidth, contentHeight
-	w.session.SetSize(contentWidth, contentHeight)
+	// SessionPane gets w.width (the box's own INTERIOR, before this second
+	// border subtraction), not contentWidth: the reading layout's own 1-
+	// column-each-side padding at wide sizes (SESSION-READING-SPEC.md's
+	// geometry - "inner 116" vs "content 114") already falls out of exactly
+	// this arithmetic once SessionPane owns it, so it needs the wider,
+	// unreduced figure to divide up itself (ui/session.go's own pad/gutter/
+	// measure helpers). Needs-you and Terminal are untouched by this slice
+	// and keep the existing contentWidth (also what the real underlying
+	// tmux pane is resized to via GetContentSize - see its own doc comment).
+	w.session.SetSize(w.width, contentHeight)
 	w.needsYou.SetSize(contentWidth, contentHeight)
 	w.terminal.SetSize(contentWidth, contentHeight)
 }
@@ -298,7 +331,16 @@ func (w *TabbedWindow) String() string {
 			border.BottomRight = "┤"
 		}
 		style = style.Border(border)
-		style = style.Width(width - style.GetHorizontalFrameSize())
+		// lipgloss/v2's own Width() is border-box (the final rendered width
+		// IS the value given, border included) - subtracting the border's
+		// own frame size here was double-counting it, rendering every tab 2
+		// columns narrower than its own share of totalTabWidth and leaving
+		// the tab row's own right edge 6 columns short of the window box
+		// below it (3 tabs x 2 columns) - part of slice 13's "the tab bar at
+		// col 148" defect, proven empirically against this same lipgloss
+		// version (a bordered box's own Render at Width(8) measures exactly
+		// 8 columns wide, not 8+frame).
+		style = style.Width(width)
 		renderedTabs = append(renderedTabs, style.Render(t))
 	}
 
