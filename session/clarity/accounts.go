@@ -121,3 +121,18 @@ func ReadSeatOAuthAccount(configDir string) SeatOAuthAccount {
 		SeatTier:         file.OAuthAccount.SeatTier,
 	}
 }
+
+// AccountFromLaneDir exposes discover.go's accountFromLaneDir (unexported,
+// package-internal) to callers outside package clarity - main.go's
+// clarity-attach command, which registers a declared lane under its own
+// seat when the wrapper does not pass --account yet (FRONTDOOR-SPEC.md
+// slice 4 item 3, BRIEF-FRONTDOOR-4.md).
+func AccountFromLaneDir(lanePath string) string {
+	return accountFromLaneDir(lanePath)
+}
+
+// ModalityFromLaneDir exposes discover.go's modalityFromLaneDir the same
+// way, for the same caller.
+func ModalityFromLaneDir(lanePath string) string {
+	return modalityFromLaneDir(lanePath)
+}

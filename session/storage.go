@@ -24,6 +24,13 @@ type InstanceData struct {
 	Worktree   GitWorktreeData `json:"worktree"`
 	DiffStats  DiffStatsData   `json:"diff_stats"`
 	NoWorktree bool            `json:"no_worktree,omitempty"`
+
+	// Account and Modality are the seat identity FRONTDOOR-SPEC.md's "The
+	// store" section adds (slice 4): an empty Account is itself a valid
+	// seat (today's lanes, unchanged), and omitempty keeps every state.json
+	// written before this slice readable byte-for-byte on a round trip.
+	Account  string `json:"account,omitempty"`
+	Modality string `json:"modality,omitempty"`
 }
 
 // GitWorktreeData represents the serializable data of a GitWorktree
@@ -182,8 +189,23 @@ func (s *Storage) UntrackedInstances(known map[string]bool) ([]*Instance, error)
 	return out, nil
 }
 
-// DeleteInstance removes an instance from storage
+// DeleteInstance removes the instance whose empty-Account row matches
+// title - the shape every call site outside this package still uses
+// (app/app.go's kill key), since no caller there passes a seat yet. It is
+// DeleteInstanceByAccountTitle with account "" - itself a valid seat
+// (FRONTDOOR-SPEC.md "The store") - kept as a separate entry point because
+// app/app.go belongs to a different, concurrently-running slice (24) and
+// cannot be edited from here to pass the account it already holds on the
+// selected instance; see the collision noted in this leg's report.
 func (s *Storage) DeleteInstance(title string) error {
+	return s.DeleteInstanceByAccountTitle("", title)
+}
+
+// DeleteInstanceByAccountTitle removes the instance whose Account plus
+// Title match the given pair - the identity FRONTDOOR-SPEC.md's "The
+// store" section requires, so a save from one seat's process can never
+// delete another seat's row of the same Title.
+func (s *Storage) DeleteInstanceByAccountTitle(account, title string) error {
 	instances, err := s.LoadInstances()
 	if err != nil {
 		return fmt.Errorf("failed to load instances: %w", err)
@@ -193,21 +215,24 @@ func (s *Storage) DeleteInstance(title string) error {
 	newInstances := make([]*Instance, 0)
 	for _, instance := range instances {
 		data := instance.ToInstanceData()
-		if data.Title != title {
-			newInstances = append(newInstances, instance)
-		} else {
+		if data.Account == account && data.Title == title {
 			found = true
+		} else {
+			newInstances = append(newInstances, instance)
 		}
 	}
 
 	if !found {
-		return fmt.Errorf("instance not found: %s", title)
+		return fmt.Errorf("instance not found: %s (account %q)", title, account)
 	}
 
 	return s.SaveInstances(newInstances)
 }
 
-// UpdateInstance updates an existing instance in storage
+// UpdateInstance updates an existing instance in storage, matched by
+// Account plus Title - the same identity DeleteInstanceByAccountTitle
+// uses. instance already carries both (ToInstanceData), so this needed no
+// signature change and has no external callers to break.
 func (s *Storage) UpdateInstance(instance *Instance) error {
 	instances, err := s.LoadInstances()
 	if err != nil {
@@ -218,7 +243,7 @@ func (s *Storage) UpdateInstance(instance *Instance) error {
 	found := false
 	for i, existing := range instances {
 		existingData := existing.ToInstanceData()
-		if existingData.Title == data.Title {
+		if existingData.Account == data.Account && existingData.Title == data.Title {
 			instances[i] = instance
 			found = true
 			break
@@ -226,7 +251,7 @@ func (s *Storage) UpdateInstance(instance *Instance) error {
 	}
 
 	if !found {
-		return fmt.Errorf("instance not found: %s", data.Title)
+		return fmt.Errorf("instance not found: %s (account %q)", data.Title, data.Account)
 	}
 
 	return s.SaveInstances(instances)
