@@ -103,6 +103,14 @@ type home struct {
 	// promptAfterName tracks if we should enter prompt mode after naming
 	promptAfterName bool
 
+	// newLaneOverlay is the "n" key's three-step name/seat/modality dialog
+	// (FRONTDOOR-SPEC.md "The overlay") - non-nil only while state ==
+	// stateNew AND this flow (not "N"/KeyPrompt's own "new with prompt"
+	// flow, which also sets state to stateNew but never sets this field)
+	// is in progress. handleKeyPress's stateNew branch tells the two apart
+	// by nil-checking this field rather than adding a new state constant.
+	newLaneOverlay *overlay.NewLaneOverlay
+
 	// keySent is used to manage underlining menu items
 	keySent bool
 
@@ -772,6 +780,22 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.setStatus("no terminal for this lane yet: press tab to Terminal first")
 		}
 		return m, nil
+	case newLaneStartedMsg:
+		// The three-step overlay's own "Starting" step (FRONTDOOR-SPEC.md
+		// item 2) completed in the background. Unlike instanceStartedMsg
+		// below, an error here never calls m.list.Kill() - nothing was ever
+		// added to the list before this arrived, so there is nothing to
+		// remove.
+		if msg.err != nil {
+			return m, m.handleError(msg.err)
+		}
+		finalize := m.list.AddInstance(msg.instance)
+		finalize()
+		m.list.SetSelectedInstance(m.list.NumInstances() - 1)
+		if err := m.storage.SaveInstances(m.list.GetInstances()); err != nil {
+			return m, m.handleError(err)
+		}
+		return m, tea.Batch(tea.RequestWindowSize, m.instanceChanged())
 	case instanceStartedMsg:
 		// Select the instance that just started (or failed)
 		m.list.SelectInstance(msg.instance)
@@ -944,8 +968,19 @@ func (m *home) handleMenuHighlighting(msg tea.KeyPressMsg) (cmd tea.Cmd, returnE
 	// picker's own up/down/c/esc dispatch is direct and single-pass, same
 	// reason stateMsg's composer typing is: the menu has no highlight state
 	// for any of those keys while a modal like this owns them outright.
+	//
+	// The three-step overlay (newLaneOverlay != nil) joins them too - the
+	// old stateNew's own Enter->KeySubmitName remap below still needs this
+	// mechanism, but the new flow's own name field does not: typing a name
+	// like "q3-tender-bid" hits several letters that are ALSO global
+	// shortcuts (q=quit, n=new, r=resume, b=bank), and this mechanism's own
+	// re-send-on-a-later-tick dance reordered them into visible garbage
+	// when several arrived in one input burst (found live, capture item 4)
+	// - the box owns every key while it is open, so it is dispatched
+	// directly, exactly like the composer's own typing.
 	if m.state == statePrompt || m.state == stateHelp || m.state == stateConfirm || m.state == stateMsg ||
-		m.state == stateSessionPicker || m.state == stateAnswerConfirm || m.state == stateBankConfirm {
+		m.state == stateSessionPicker || m.state == stateAnswerConfirm || m.state == stateBankConfirm ||
+		(m.state == stateNew && m.newLaneOverlay != nil) {
 		return nil, false
 	}
 	// If it's in the global keymap, we should try to highlight it.
@@ -983,6 +1018,14 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 	}
 
 	if m.state == stateNew {
+		// The three-step overlay (FRONTDOOR-SPEC.md) owns every key while it
+		// is open - handled entirely separately from "N"/KeyPrompt's own
+		// single-field "new with prompt" flow below, which never sets
+		// newLaneOverlay.
+		if m.newLaneOverlay != nil {
+			return m.handleNewLaneKey(msg)
+		}
+
 		// Handle quit commands first. Don't handle q because the user might want to type that.
 		if msg.String() == "ctrl+c" {
 			m.state = stateDefault
@@ -1365,23 +1408,19 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 
 		return m, fetchCmd
 	case keys.KeyNew:
+		// The three-step name/seat/modality overlay (FRONTDOOR-SPEC.md "The
+		// overlay") - floats over the pane only (View's own stateNew branch),
+		// the list stays fully visible and the main footer does not change
+		// (n stays bound but off the footer, per the owner's keys ruling).
+		// Nothing is created, registered or started until Enter on step 3
+		// (startNewLane) - ctrl-c at any step before that leaves no folder
+		// and no store row because nothing has run yet.
 		if m.list.NumInstances() >= GlobalInstanceLimit {
 			return m, m.handleError(
 				fmt.Errorf("you can't create more than %d instances", GlobalInstanceLimit))
 		}
-		instance, err := session.NewInstance(session.InstanceOptions{
-			Title:   "",
-			Path:    ".",
-			Program: m.program,
-		})
-		if err != nil {
-			return m, m.handleError(err)
-		}
-
-		m.newInstanceFinalizer = m.list.AddInstance(instance)
-		m.list.SetSelectedInstance(m.list.NumInstances() - 1)
+		m.newLaneOverlay = m.buildNewLaneOverlay()
 		m.state = stateNew
-		m.menu.SetState(ui.StateNewInstance)
 
 		return m, nil
 	case keys.KeyUp:
@@ -2085,6 +2124,241 @@ type instanceStartedMsg struct {
 	err             error
 	promptAfterName bool
 	selectedBranch  string
+}
+
+// newLaneStartedMsg reports the outcome of the three-step overlay's own
+// "Starting" step (FRONTDOOR-SPEC.md item 2): the wrapper's own folder +
+// CLAUDE.md creation, then registering and starting the instance the same
+// way clarity-attach does for an already-declared lane (main.go's
+// clarityAttachCmd). Kept distinct from instanceStartedMsg because that
+// handler's error path calls m.list.Kill() on the currently selected row -
+// correct for the old flow's pre-added placeholder instance, wrong here,
+// since nothing is ever added to the list before this message arrives.
+type newLaneStartedMsg struct {
+	instance *session.Instance
+	err      error
+}
+
+// buildNewLaneOverlay reads the registry and this process's own live lanes
+// once, at the moment "n" is pressed, into the overlay's own account rows -
+// FRONTDOOR-SPEC.md "Step 2 account"'s columns (tag, config dir, credential
+// presence, window figure) plus the registry policy's default seat.
+func (m *home) buildNewLaneOverlay() *overlay.NewLaneOverlay {
+	regAccounts, policy := clarity.LoadAccountsRegistryFull()
+	rows := make([]overlay.NewLaneAccountRow, 0, len(regAccounts))
+	for _, ra := range regAccounts {
+		cred := clarity.ReadSeatOAuthAccount(ra.ConfigDir)
+		pct, ok := m.maxFillForAccount(ra.Tag)
+		rows = append(rows, overlay.NewLaneAccountRow{
+			Tag:             ra.Tag,
+			ConfigDir:       ra.ConfigDir,
+			CredentialStore: cred.Present,
+			FillPct:         pct,
+			HasLiveLane:     ok,
+			IsDefault:       ra.Tag == policy.DefaultAccount,
+			DefaultModality: ra.DefaultModality,
+		})
+	}
+	return overlay.NewNewLaneOverlay(clarity.SessionsRoot(), clarity.ForgeAppsRoot(), rows, policy.DefaultAccount)
+}
+
+// maxFillForAccount is the seat's own window figure: the maximum context
+// fill across every lane currently on that seat this process can see -
+// tracked instances (a fresh read, not the metadata tick's cache, so the
+// picker is never stale the instant it opens) and live external lanes
+// alike. ok is false ("idle") when no lane on this seat has a resolvable
+// gauge at all.
+func (m *home) maxFillForAccount(tag string) (pct int, ok bool) {
+	best, found := 0, false
+	for _, inst := range m.list.GetInstances() {
+		if inst.Account() != tag {
+			continue
+		}
+		if p, k := inst.ComputeContextFill(); k && (!found || p > best) {
+			best, found = p, true
+		}
+	}
+	if external, err := clarity.DiscoverExternalLanes(nil); err == nil {
+		for _, ext := range external {
+			if ext.Account != tag || !ext.FillOK {
+				continue
+			}
+			if !found || ext.Fill.Pct > best {
+				best, found = ext.Fill.Pct, true
+			}
+		}
+	}
+	return best, found
+}
+
+// handleNewLaneKey is every key the three-step overlay is open for -
+// FRONTDOOR-SPEC.md "The overlay": ctrl-c cancels the whole flow at any
+// step and creates nothing; each step's own enter/esc/up/down are handled
+// per step below; "l" at step 2 is slice 7's own placeholder (does nothing
+// but name the next slice in the footer).
+func (m *home) handleNewLaneKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	o := m.newLaneOverlay
+
+	if msg.String() == "ctrl+c" {
+		m.newLaneOverlay = nil
+		m.state = stateDefault
+		return m, nil
+	}
+
+	switch o.Step() {
+	case overlay.NewLaneStepName:
+		switch msg.Code {
+		case tea.KeyEnter:
+			if err := o.ValidateName(); err != nil {
+				return m, m.handleError(err)
+			}
+			o.NextFromName()
+			return m, nil
+		case tea.KeyEsc:
+			m.newLaneOverlay = nil
+			m.state = stateDefault
+			return m, nil
+		case tea.KeyBackspace:
+			o.Backspace()
+			return m, nil
+		case tea.KeySpace:
+			if err := o.TypeRune(" "); err != nil {
+				return m, m.handleError(err)
+			}
+			return m, nil
+		default:
+			if msg.Text != "" {
+				if err := o.TypeRune(msg.Text); err != nil {
+					return m, m.handleError(err)
+				}
+			}
+			return m, nil
+		}
+
+	case overlay.NewLaneStepAccount:
+		if msg.Code == tea.KeyEnter {
+			o.NextFromAccount()
+			return m, nil
+		}
+		if msg.Code == tea.KeyEsc {
+			o.BackToName()
+			return m, nil
+		}
+		if msg.String() == "l" {
+			// Slice 7 ("l" log in) is not built yet - the footer names it
+			// rather than the key doing nothing silently.
+			return m, m.setStatus("log in: next slice")
+		}
+		if name, ok := keys.GlobalKeyStringsMap[msg.String()]; ok {
+			switch name {
+			case keys.KeyUp:
+				o.MoveUp()
+			case keys.KeyDown:
+				o.MoveDown()
+			}
+		}
+		return m, nil
+
+	case overlay.NewLaneStepModality:
+		if msg.Code == tea.KeyEnter {
+			return m.startNewLane(o)
+		}
+		if msg.Code == tea.KeyEsc {
+			o.BackToAccount()
+			return m, nil
+		}
+		if name, ok := keys.GlobalKeyStringsMap[msg.String()]; ok {
+			switch name {
+			case keys.KeyUp:
+				o.MoveUp()
+			case keys.KeyDown:
+				o.MoveDown()
+			}
+		}
+		return m, nil
+	}
+	return m, nil
+}
+
+// newLaneProgram builds the program string session.NewInstance launches
+// with - CLAUDE_CONFIG_DIR sits INSIDE the string, exactly the way
+// scripts/clarity's own open_session does it (research F11: the direct exec
+// path silently runs the default account otherwise). A non-default seat's
+// program also carries clarity.EnvUnsetPrefix ahead of CLAUDE_CONFIG_DIR: a
+// cockpit pane inherits the tmux server's environment, which carries the
+// owner's shell ANTHROPIC_API_KEY, and that key outranks the seat's own
+// claude.ai login unless cleared first (observed on the max-2 seat).
+// Nothing is prefixed for the machine's own default config directory or for
+// an unset one.
+func newLaneProgram(base, configDir string) string {
+	if configDir == "" || clarity.IsDefaultConfigDir(configDir) {
+		return base
+	}
+	return fmt.Sprintf("%s CLAUDE_CONFIG_DIR=%s %s", clarity.EnvUnsetPrefix, configDir, base)
+}
+
+// clarityWrapperNew shells out to the real `clarity new ... --no-launch`
+// (scripts/clarity cmd_new, front-door slice 4c) so the lane folder and its
+// .claude/CLAUDE.md meta block are written in exactly the wrapper's own
+// dialect - the account guard and autodetect's F-rules both read that file,
+// never a second one the cockpit invents.
+func clarityWrapperNew(cmdExec cmd.Executor, name, account, modality string) error {
+	args := []string{"new", name, "--no-launch"}
+	if account != "" {
+		args = append(args, "--account", account)
+	}
+	if modality != "" {
+		args = append(args, "--modality", modality)
+	}
+	if _, err := cmdExec.Output(exec.Command(clarity.ClarityWrapperPath(), args...)); err != nil {
+		return fmt.Errorf("clarity new %s --no-launch: %w", name, err)
+	}
+	return nil
+}
+
+// startNewLane is step 3's own Enter (FRONTDOOR-SPEC.md item 2, "Starting"):
+// runs the wrapper's --no-launch path, then registers and starts the
+// instance in the background, same shape as the old flow's
+// runInstanceStartCmd, so the UI stays responsive while the wrapper script
+// and tmux both do real work.
+func (m *home) startNewLane(o *overlay.NewLaneOverlay) (tea.Model, tea.Cmd) {
+	name := o.Name()
+	acc := o.SelectedAccount()
+	mod := o.SelectedModality()
+	program := m.program
+
+	m.newLaneOverlay = nil
+	m.state = stateDefault
+	cmdExec := m.cmdExec
+
+	startCmd := func() tea.Msg {
+		if err := clarityWrapperNew(cmdExec, name, acc.Tag, mod.Key); err != nil {
+			return newLaneStartedMsg{err: err}
+		}
+
+		lanePath, err := clarity.ResolveExistingLaneDir(name)
+		if err != nil {
+			return newLaneStartedMsg{err: err}
+		}
+
+		inst, err := session.NewInstance(session.InstanceOptions{
+			Title:      name,
+			Path:       lanePath,
+			Program:    newLaneProgram(program, acc.ConfigDir),
+			NoWorktree: true,
+			Account:    acc.Tag,
+			Modality:   mod.Key,
+		})
+		if err != nil {
+			return newLaneStartedMsg{err: err}
+		}
+		if err := inst.Start(true); err != nil {
+			return newLaneStartedMsg{err: err}
+		}
+		return newLaneStartedMsg{instance: inst}
+	}
+
+	return m, tea.Batch(tea.RequestWindowSize, startCmd)
 }
 
 // branchSearchDebounceMsg fires after the debounce interval to trigger a search.
@@ -2878,7 +3152,17 @@ func (m *home) View() tea.View {
 	}
 
 	listWithPadding := lipgloss.NewStyle().PaddingTop(1).Render(m.list.String())
-	previewWithPadding := lipgloss.NewStyle().PaddingTop(1).Render(m.tabbedWindow.String())
+
+	previewContent := m.tabbedWindow.String()
+	if m.state == stateNew && m.newLaneOverlay != nil {
+		// The three-step overlay floats over the PANE only (FRONTDOOR-
+		// SPEC.md "The overlay": "n opens one box... centred over the PANE,
+		// not the main view") - never the whole screen, so the list (the
+		// seat gauges step 2 reads) stays fully visible and undimmed; only
+		// the pane behind the box gets PlaceOverlay's own fade.
+		previewContent = overlay.PlaceOverlay(0, 0, m.newLaneOverlay.Render(), previewContent, false, true)
+	}
+	previewWithPadding := lipgloss.NewStyle().PaddingTop(1).Render(previewContent)
 	listAndPreview := lipgloss.JoinHorizontal(lipgloss.Top, listWithPadding, previewWithPadding)
 
 	// The error box and status box share one footer row: an error always

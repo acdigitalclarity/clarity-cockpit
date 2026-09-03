@@ -67,6 +67,40 @@ func TestLoadAccountsRegistry_SkipsAccountWithEmptyConfigDir(t *testing.T) {
 	require.Equal(t, "/x", registry["real"])
 }
 
+func TestLoadAccountsRegistryFull_ReadsAccountsSortedByTagAndPolicy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.json")
+	writeRegistry(t, path, `{
+		"accounts": {
+			"team-b": {"config_dir": "/Users/allencoates/.claude-team-b", "default_modality": ""},
+			"main": {"config_dir": "/Users/allencoates/.claude", "default_modality": ""},
+			"team-a": {"config_dir": "/Users/allencoates/.claude-team-a", "default_modality": "app-pipeline"},
+			"stub": {"config_dir": ""}
+		},
+		"policy": {"default_account": "main", "note": "ignored"}
+	}`)
+	t.Setenv(AccountsRegistryEnvVar, path)
+
+	accounts, policy := LoadAccountsRegistryFull()
+	require.Equal(t, "main", policy.DefaultAccount)
+	require.Len(t, accounts, 3, "the empty-config_dir stub account must be skipped, same as LoadAccountsRegistry")
+	require.Equal(t, []string{"main", "team-a", "team-b"}, []string{accounts[0].Tag, accounts[1].Tag, accounts[2].Tag},
+		"accounts must come back tag-sorted for a deterministic picker order")
+	require.Equal(t, "app-pipeline", accounts[1].DefaultModality)
+}
+
+func TestLoadAccountsRegistryFull_MissingFileIsNotAnError(t *testing.T) {
+	t.Setenv(AccountsRegistryEnvVar, filepath.Join(t.TempDir(), "does-not-exist.json"))
+
+	accounts, policy := LoadAccountsRegistryFull()
+	require.Nil(t, accounts)
+	require.Equal(t, "", policy.DefaultAccount)
+}
+
+func TestIsDefaultConfigDir(t *testing.T) {
+	require.True(t, IsDefaultConfigDir(filepath.Dir(DefaultClaudeProjectsRoot)))
+	require.False(t, IsDefaultConfigDir("/Users/allencoates/.claude-team-b"))
+}
+
 // TestReadSeatOAuthAccount_PresentReportsOrgAndTierOnly proves the field
 // fence itself: even when the source .claude.json carries accountUuid and
 // emailAddress, the struct ReadSeatOAuthAccount returns has no field for

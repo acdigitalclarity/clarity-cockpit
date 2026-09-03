@@ -21,6 +21,20 @@ const SessionsRootEnvVar = "CLARITY_SESSIONS_ROOT"
 // lanes on this machine.
 const DefaultSessionsRoot = "/Users/allencoates/projects/Clarity/sessions"
 
+// SessionsRoot returns the Clarity workspace sessions root, honouring
+// SessionsRootEnvVar for tests exactly the way ResolveLanePath already does
+// - the new-lane overlay's step 1 (FRONTDOOR-SPEC.md "below it, the folder
+// that will be created") needs the bare root to build its preview line
+// before a name even exists, so it cannot call ResolveLanePath itself
+// (which requires a non-empty lane name).
+func SessionsRoot() string {
+	root := os.Getenv(SessionsRootEnvVar)
+	if root == "" {
+		root = DefaultSessionsRoot
+	}
+	return root
+}
+
 // ResolveLanePath returns the absolute working directory for a Clarity
 // session lane, without touching the filesystem. It rejects empty lane
 // names and any lane name that could escape the sessions root (path
@@ -37,12 +51,44 @@ func ResolveLanePath(lane string) (string, error) {
 		return "", fmt.Errorf("clarity lane name %q is not a valid lane", lane)
 	}
 
-	root := os.Getenv(SessionsRootEnvVar)
-	if root == "" {
-		root = DefaultSessionsRoot
-	}
+	return filepath.Join(SessionsRoot(), lane), nil
+}
 
-	return filepath.Join(root, lane), nil
+// ForgeAppsRootEnvVar overrides the default clarity-forge apps directory.
+// Set only for tests; the real CLI relies on the default.
+const ForgeAppsRootEnvVar = "CLARITY_FORGE_APPS_ROOT"
+
+// DefaultForgeAppsRoot is where clarity-forge's own scaffolded apps live -
+// autodetect rule N3 (FRONTDOOR-SPEC.md "Autodetect: the ladder").
+const DefaultForgeAppsRoot = "/Users/allencoates/projects/Clarity/repos/clarity-forge/apps"
+
+// ForgeAppsRoot returns the clarity-forge apps root, honouring
+// ForgeAppsRootEnvVar for tests.
+func ForgeAppsRoot() string {
+	root := os.Getenv(ForgeAppsRootEnvVar)
+	if root == "" {
+		root = DefaultForgeAppsRoot
+	}
+	return root
+}
+
+// ClarityWrapperEnvVar overrides the `clarity` wrapper script's own path.
+// Set only for tests; the real CLI relies on the default.
+const ClarityWrapperEnvVar = "CLARITY_WRAPPER_BIN"
+
+// DefaultClarityWrapperPath is the wrapper's real location on this machine.
+const DefaultClarityWrapperPath = "/Users/allencoates/projects/Clarity/scripts/clarity"
+
+// ClarityWrapperPath returns the `clarity` wrapper script's path, honouring
+// ClarityWrapperEnvVar for tests. The new-lane overlay's "Starting" step
+// (FRONTDOOR-SPEC.md item 2) shells out to this rather than reproducing the
+// wrapper's own folder-creation logic a second time.
+func ClarityWrapperPath() string {
+	path := os.Getenv(ClarityWrapperEnvVar)
+	if path == "" {
+		path = DefaultClarityWrapperPath
+	}
+	return path
 }
 
 // ResolveExistingLaneDir resolves the lane path and confirms it exists and

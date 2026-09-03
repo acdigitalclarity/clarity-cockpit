@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
 // AccountsRegistryEnvVar overrides the registry path. Set only for tests;
@@ -21,6 +22,16 @@ const AccountsRegistryEnvVar = "CLARITY_ACCOUNTS_REGISTRY"
 
 // DefaultAccountsRegistryPath is the registry slice 1 landed at.
 const DefaultAccountsRegistryPath = "/Users/allencoates/.claude-accounts/registry.json"
+
+// EnvUnsetPrefix is the environment-clearing prefix a declared-seat launch
+// program carries ahead of CLAUDE_CONFIG_DIR, verbatim from scripts/clarity's
+// own env_unset_prefix. A cockpit pane inherits the tmux server's
+// environment, which carries the owner's shell ANTHROPIC_API_KEY (and any
+// stray CLAUDE_CODE_* session variable); left set, that key outranks the
+// seat's own claude.ai login (observed on the max-2 seat: "ANTHROPIC_API_KEY
+// or another auth source is set and takes precedence over your claude.ai
+// login"). Exported for slice 7's login program to reuse.
+const EnvUnsetPrefix = "env -u ANTHROPIC_API_KEY -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_BRIDGE_SESSION_ID -u CLAUDE_CODE_MESSAGING_SOCKET -u CLAUDE_CODE_MESSAGING_TOKEN -u CLAUDE_CODE_SSE_PORT -u CLAUDE_CODE_ENTRYPOINT"
 
 // registryAccount is the one field this package needs from an account's
 // registry entry - the rest (plan, purpose, default_modality) belong to
@@ -120,6 +131,85 @@ func ReadSeatOAuthAccount(configDir string) SeatOAuthAccount {
 		OrganizationName: file.OAuthAccount.OrganizationName,
 		SeatTier:         file.OAuthAccount.SeatTier,
 	}
+}
+
+// RegistryAccount is the full per-seat entry the new-lane overlay's step-2
+// picker needs (front-door slice 6) - config_dir plus default_modality,
+// beyond the bare tag->config_dir map LoadAccountsRegistry returns for
+// gauge.go/discover.go's narrower needs. An additive second read of the
+// same file, kept separate so neither existing caller's return type moves.
+type RegistryAccount struct {
+	Tag             string
+	ConfigDir       string
+	DefaultModality string
+}
+
+// RegistryPolicy is the registry's top-level "policy" block - today just
+// the seat a new lane pre-selects at step 2 (FRONTDOOR-SPEC.md "Step 2
+// account": "pre-select the policy default_account and re-order nothing").
+type RegistryPolicy struct {
+	DefaultAccount string
+}
+
+type registryAccountFull struct {
+	ConfigDir       string `json:"config_dir"`
+	DefaultModality string `json:"default_modality"`
+}
+
+type registryPolicyFile struct {
+	DefaultAccount string `json:"default_account"`
+}
+
+type registryFileFull struct {
+	Accounts map[string]registryAccountFull `json:"accounts"`
+	Policy   registryPolicyFile             `json:"policy"`
+}
+
+// LoadAccountsRegistryFull reads the registry's full per-seat shape plus its
+// policy block, tag-sorted for a deterministic picker order. A missing or
+// unreadable registry yields (nil, RegistryPolicy{}) - the same
+// "not an error" contract LoadAccountsRegistry already carries.
+func LoadAccountsRegistryFull() ([]RegistryAccount, RegistryPolicy) {
+	path := accountsRegistryPath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if log.InfoLog != nil {
+			log.InfoLog.Printf("accounts registry: %s not read: %v", path, err)
+		}
+		return nil, RegistryPolicy{}
+	}
+
+	var file registryFileFull
+	if err := json.Unmarshal(data, &file); err != nil {
+		if log.InfoLog != nil {
+			log.InfoLog.Printf("accounts registry: %s not parsed: %v", path, err)
+		}
+		return nil, RegistryPolicy{}
+	}
+
+	tags := make([]string, 0, len(file.Accounts))
+	for tag := range file.Accounts {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+
+	out := make([]RegistryAccount, 0, len(tags))
+	for _, tag := range tags {
+		acc := file.Accounts[tag]
+		if acc.ConfigDir == "" {
+			continue
+		}
+		out = append(out, RegistryAccount{Tag: tag, ConfigDir: acc.ConfigDir, DefaultModality: acc.DefaultModality})
+	}
+	return out, RegistryPolicy{DefaultAccount: file.Policy.DefaultAccount}
+}
+
+// IsDefaultConfigDir reports whether configDir is this machine's default
+// Claude Code config directory - gauge.go's DefaultClaudeProjectsRoot's own
+// parent. The launch program string (research F11) never carries
+// CLAUDE_CONFIG_DIR for this one; every other seat's does.
+func IsDefaultConfigDir(configDir string) bool {
+	return filepath.Clean(configDir) == filepath.Clean(filepath.Dir(DefaultClaudeProjectsRoot))
 }
 
 // AccountFromLaneDir exposes discover.go's accountFromLaneDir (unexported,
