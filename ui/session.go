@@ -186,6 +186,23 @@ type SessionPane struct {
 	awayViewLane    string
 	awayViewSince   time.Time
 	awaySeenThrough map[string]time.Time
+
+	// restingCache holds the last rendered resting frame (splash.RenderFrame
+	// called with entranceFrame=-1, idleFrame=-1 - a pure function of
+	// width, height, live and waiting, no time or tick input at all: see
+	// RenderFrame's own resting branch, ui/splash/render.go). Slice 20's
+	// own idle-CPU profile named this the single largest per-tick cost -
+	// SessionPane.renderResting -> splash.RenderFrame -> the gradient's own
+	// lerpHex/hexToRGB sweep across every cell - recomputed from scratch on
+	// EVERY previewTickMsg (100ms) even though a resting frame's bytes
+	// never change between two calls with the same four inputs. Cached
+	// here and only recomputed when one of them actually differs from the
+	// last render - the "runs only when it can change something visible"
+	// rule applied to the one render path the profile actually named.
+	restingCacheValid                     bool
+	restingCacheWidth, restingCacheHeight int
+	restingCacheLive, restingCacheWaiting int
+	restingCacheValue                     string
 }
 
 // awaySummarySeenAfter is how long the owner must have the Session tab open
@@ -755,11 +772,23 @@ func (s *SessionPane) String() string {
 // threshold, since RenderFrame's own row/column budget depends on width in
 // ways this package does not otherwise duplicate.
 func (s *SessionPane) renderResting() string {
+	if s.restingCacheValid &&
+		s.restingCacheWidth == s.width && s.restingCacheHeight == s.height &&
+		s.restingCacheLive == s.live && s.restingCacheWaiting == s.waiting {
+		return s.restingCacheValue
+	}
+
 	frame := splash.RenderFrame(s.width, s.height, -1, -1, s.live, s.waiting)
 	if !fitsBox(frame, s.width, s.height) {
 		frame = FallbackMark(s.width)
 	}
-	return lipgloss.Place(s.width, s.height, lipgloss.Center, lipgloss.Center, frame)
+	placed := lipgloss.Place(s.width, s.height, lipgloss.Center, lipgloss.Center, frame)
+
+	s.restingCacheValid = true
+	s.restingCacheWidth, s.restingCacheHeight = s.width, s.height
+	s.restingCacheLive, s.restingCacheWaiting = s.live, s.waiting
+	s.restingCacheValue = placed
+	return placed
 }
 
 // renderRestingWithComposer is renderResting's own layout, shrunk to leave
