@@ -80,6 +80,29 @@ func TestView_NoLineExceedsWidth(t *testing.T) {
 	}
 }
 
+// TestView_ReachesRealRightEdge is slice 13's own geometry proof (SESSION-
+// READING-SPEC.md: "the pane widened to the real right edge"): the header
+// rule - the one row guaranteed to span the pane's own full content width -
+// must reach exactly the terminal's own column count at 164x45 and 120x36,
+// not stop short of it the way AdjustPreviewWidth's 10% shave used to (the
+// pane stopping at column 154, the tab bar at 148, both short of 164).
+func TestView_ReachesRealRightEdge(t *testing.T) {
+	for _, sz := range []struct{ w, h int }{{164, 45}, {120, 36}} {
+		t.Run(fmt.Sprintf("%dx%d", sz.w, sz.h), func(t *testing.T) {
+			h := newHome(context.Background(), "true", false, true)
+			h.updateHandleWindowSizeEvent(tea.WindowSizeMsg{Width: sz.w, Height: sz.h})
+			v := h.View()
+			maxw := 0
+			for _, line := range strings.Split(v.Content, "\n") {
+				if w := ansi.StringWidth(line); w > maxw {
+					maxw = w
+				}
+			}
+			require.Equal(t, sz.w, maxw, "the widest rendered row must reach the terminal's own right edge, not stop short of it")
+		})
+	}
+}
+
 // TestView_HeightNeverExceedsTerminal is the OVERFLOW defect's vertical
 // half: the whole screen (list+preview, menu, footer) must render exactly
 // within the given height at 24, 36, 45 and 60 rows (the brief's named
@@ -201,14 +224,20 @@ func TestUpdateHandleWindowSizeEvent_CollapsesBelowThreshold(t *testing.T) {
 }
 
 // TestListWidthForTerminal_ClampedTo28PercentBetween38And52 is defect 2's
-// own rule, verbatim: listWidth = clamp(int(width*0.28), 38, 52) - replacing
-// the old flat 40% split so the compact list row (name/pct/glyph+word/time)
-// gets just what it needs and the Session pane's header line 2 gets the rest.
+// own rule: listWidth = clamp(round(width*0.28), 38, 52) - replacing the old
+// flat 40% split so the compact list row (name/pct/glyph+word/time) gets
+// just what it needs and the Session pane's header line 2 gets the rest.
+//
+// Slice 13 widened this from int() truncation to math.Round (part of "the
+// tabbed window and the list must together reach column 164" -
+// SESSION-READING-SPEC.md's own "List 46 (cols 1-46)"): 164*0.28=45.92
+// rounds to 46, not 45 - the other three cases are unaffected since the
+// fraction never survives their min/max clamp either way.
 func TestListWidthForTerminal_ClampedTo28PercentBetween38And52(t *testing.T) {
 	cases := []struct{ width, want int }{
 		{100, 38}, // 28: below listWidthMin, clamped up
-		{120, 38}, // 33.6->33: below listWidthMin, clamped up
-		{164, 45}, // 45.9->45: within bounds, unclamped
+		{120, 38}, // 33.6->34, still below listWidthMin, clamped up
+		{164, 46}, // 45.92 rounds to 46: within bounds, unclamped
 		{200, 52}, // 56: above listWidthMax, clamped down
 	}
 	for _, c := range cases {
@@ -222,7 +251,7 @@ func TestListWidthForTerminal_ClampedTo28PercentBetween38And52(t *testing.T) {
 func TestUpdateHandleWindowSizeEvent_ListGetsNewProportion(t *testing.T) {
 	h := newHome(context.Background(), "true", false, true)
 	h.updateHandleWindowSizeEvent(tea.WindowSizeMsg{Width: 164, Height: 45})
-	require.Equal(t, 45, h.list.Width(), "164 columns must give the list 45 (clamp(int(164*0.28),38,52)), not the old 40%-share of 65")
+	require.Equal(t, 46, h.list.Width(), "164 columns must give the list 46 (clamp(round(164*0.28),38,52)), not the old 40%-share of 65 nor the pre-slice-13 truncated 45")
 }
 
 // TestFeedTick_ComputesContextFillForPausedInstances is the OWN ROW

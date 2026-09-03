@@ -459,3 +459,193 @@ func TestSessionPane_NeverExceedsPaneDimensions(t *testing.T) {
 		})
 	}
 }
+
+// -- slice 13: the reading layout ----------------------------------------
+
+// TestSplitProseBlocks_ParagraphsAndListItems is rule 1's own structural
+// test: a blank source line ends a paragraph, a list-marker line always
+// starts a new block even without one, and any other non-blank line joins
+// the CURRENT block - the defect this replaces (collapseWS) folded all of
+// this into one wrappable line.
+func TestSplitProseBlocks_ParagraphsAndListItems(t *testing.T) {
+	text := "First paragraph line one\nstill first paragraph.\n\n" +
+		"Second paragraph.\n\n" +
+		"- item one\n- item two spans\nmultiple lines\n" +
+		"1. ordered one\n2. ordered two"
+	blocks := splitProseBlocks(text)
+	require.Len(t, blocks, 6)
+	require.Equal(t, proseBlock{marker: "", text: "First paragraph line one still first paragraph."}, blocks[0])
+	require.Equal(t, proseBlock{marker: "", text: "Second paragraph."}, blocks[1])
+	require.Equal(t, proseBlock{marker: "- ", text: "item one"}, blocks[2])
+	require.Equal(t, proseBlock{marker: "- ", text: "item two spans multiple lines"}, blocks[3])
+	require.Equal(t, proseBlock{marker: "1. ", text: "ordered one"}, blocks[4])
+	require.Equal(t, proseBlock{marker: "2. ", text: "ordered two"}, blocks[5])
+}
+
+// TestTokenizeMarkdown_StripsMarkersAndMarksBold is rule 1's other named
+// test: "**bold**" is stripped and its words marked bold; "__" and
+// backtick markers are stripped with no style change - never a literal
+// marker byte surviving into a token.
+func TestTokenizeMarkdown_StripsMarkersAndMarksBold(t *testing.T) {
+	tokens := tokenizeMarkdown("plain **bold word** back`tick`ed __underlined__ end")
+	var texts []string
+	var bolds []bool
+	for _, tok := range tokens {
+		texts = append(texts, tok.text)
+		bolds = append(bolds, tok.bold)
+		require.NotContains(t, tok.text, "*", "rule 1: never a literal asterisk pair in the pane")
+		require.NotContains(t, tok.text, "`")
+	}
+	require.Equal(t, []string{"plain", "bold", "word", "backticked", "underlined", "end"}, texts)
+	require.Equal(t, []bool{false, true, true, false, false, false}, bolds)
+}
+
+// TestSessionPane_ProseTurn_WrapsAtMeasureWithHangingIndent is the brief's
+// own named test: a fixture Turn.Text wraps at the pane's own measure, a
+// plain paragraph hangs under the gutter, and a list item's continuation
+// hangs under its own marker instead - a deterministic small width (21,
+// which SessionPane's own thresholds resolve to the narrow gutter-1 profile
+// - see TestSessionPane_MeasureAndGutter_AtNamedGeometries) so the exact
+// wrap boundary is computable by hand.
+func TestSessionPane_ProseTurn_WrapsAtMeasureWithHangingIndent(t *testing.T) {
+	pinHome(t)
+	s := NewSessionPane()
+	s.SetSize(21, 30)
+	require.Equal(t, 1, s.gutter())
+	require.Equal(t, 20, s.measure())
+
+	info := fixtureInfo()
+	base := time.Date(2026, 9, 2, 18, 3, 25, 0, time.Local)
+	info.Tail.Turns = []clarity.Turn{
+		{Kind: clarity.TurnAssistant, At: base, Text: "aaaa bbbb cccc dddd eeee"},
+		{Kind: clarity.TurnAssistant, At: base, Text: "- item aaaa bbbb cccc"},
+	}
+	s.SetInfo(info)
+
+	rawLines := strings.Split(ansi.Strip(s.String()), "\n")
+	plain := make([]string, len(rawLines))
+	for i, l := range rawLines {
+		plain[i] = strings.TrimRight(l, " ") // rows are right-padded to the pane's own width
+	}
+	// The first turn's paragraph greedy-wraps at width 20: "aaaa bbbb cccc
+	// dddd" is 19 columns (one more word would be 24), "eeee" spills to its
+	// own continuation line, both hung one column under the gutter.
+	require.Contains(t, plain, " aaaa bbbb cccc dddd")
+	require.Contains(t, plain, " eeee")
+
+	// The second turn's list item hangs its own continuation under its
+	// marker ("- ", 2 columns) rather than the bare gutter: gutter(1) +
+	// len("- ")(2) = 3 leading spaces once the item's own text overflows
+	// its first line.
+	require.Contains(t, plain, " - item aaaa bbbb")
+	require.Contains(t, plain, "   cccc")
+}
+
+// TestSessionPane_BlankLineBetweenTurns_NoneInside is the Spacing section's
+// own rule: exactly one blank line separates two turns, and a multi-
+// paragraph turn's own paragraphs never get one between them.
+func TestSessionPane_BlankLineBetweenTurns_NoneInside(t *testing.T) {
+	pinHome(t)
+	base := time.Date(2026, 9, 2, 18, 3, 25, 0, time.Local)
+	lines, _ := buildTurnLines([]clarity.Turn{
+		{Kind: clarity.TurnOwner, At: base, Text: "paragraph one\n\nparagraph two"},
+		{Kind: clarity.TurnAssistant, At: base, Text: "reply"},
+	}, 2, 96, base)
+
+	blankCount := 0
+	for _, l := range lines {
+		if l == "" {
+			blankCount++
+		}
+	}
+	require.Equal(t, 1, blankCount, "exactly one blank line must separate the two turns, none inside either")
+}
+
+// TestSessionPane_TagLineFormat_AlignsYouAndClaude is the brief's own named
+// test: the label line is "%-7s  %s" (tag then time), so YOU's and
+// CLAUDE's own timestamps land in the same column.
+func TestSessionPane_TagLineFormat_AlignsYouAndClaude(t *testing.T) {
+	pinHome(t)
+	base := time.Date(2026, 9, 2, 18, 3, 25, 0, time.Local)
+	lines, _ := buildTurnLines([]clarity.Turn{
+		{Kind: clarity.TurnOwner, At: base, Text: "hi"},
+		{Kind: clarity.TurnAssistant, At: base, Text: "hi"},
+	}, 2, 96, base)
+
+	you := ansi.Strip(lines[0])
+	// lines[1] is YOU's own wrapped body ("hi"), lines[2] the blank
+	// separator, lines[3] CLAUDE's label.
+	claude := ansi.Strip(lines[3])
+	require.Equal(t, "YOU      18:03:25", you)
+	require.Equal(t, "CLAUDE   18:03:25", claude)
+	require.Equal(t, strings.Index(you, "18:"), strings.Index(claude, "18:"),
+		"YOU and CLAUDE's own timestamps must land in the same column")
+}
+
+// TestSessionPane_ContinuedLabel_StickyOnMidTurnScroll is the sticky
+// header's own named test: scrolling so the viewport's top row lands
+// mid-turn replaces that row with "<TAG>  ⋯ continued" in the tag's colour,
+// and the label reverts once scrolled back to a turn's own first line.
+func TestSessionPane_ContinuedLabel_StickyOnMidTurnScroll(t *testing.T) {
+	pinHome(t)
+	base := time.Date(2026, 9, 2, 18, 0, 0, 0, time.Local)
+	longText := strings.Repeat("word ", 200)
+
+	info := fixtureInfo()
+	info.Tail.Turns = []clarity.Turn{
+		{Kind: clarity.TurnAssistant, At: base, Text: longText},
+	}
+
+	s := NewSessionPane()
+	s.SetSize(80, 10) // a small turns area: the one turn overflows it
+	s.SetInfo(info)
+
+	for i := 0; i < 500; i++ {
+		s.ScrollUp()
+	}
+	top := strings.Split(ansi.Strip(s.String()), "\n")[3] // header x2 + rule
+	require.Equal(t, "CLAUDE   18:00:00", strings.TrimRight(top, " "),
+		"scrolled all the way up, the top row IS the turn's own label line - no sticky substitution")
+
+	s.ScrollDown()
+	s.ScrollDown()
+	mid := strings.Split(ansi.Strip(s.String()), "\n")[3]
+	require.Equal(t, "CLAUDE   ⋯ continued", strings.TrimRight(mid, " "),
+		"scrolled past the label line, the sticky header must name the scrolled-off turn's own tag")
+}
+
+// TestSessionPane_MeasureAndGutter_AtNamedGeometries is SESSION-READING-
+// SPEC.md's own two geometry profiles: 116 (164x45's own pane inner width)
+// gets padding 1/gutter 2/measure 96 (min(96, 114-2)=96, capped); 80
+// (120x36's own pane inner width, no separate padding at this size) gets
+// padding 0/gutter 1/measure 79 (80-1, uncapped).
+func TestSessionPane_MeasureAndGutter_AtNamedGeometries(t *testing.T) {
+	wide := NewSessionPane()
+	wide.SetSize(116, 40)
+	require.Equal(t, 1, wide.pad())
+	require.Equal(t, 2, wide.gutter())
+	require.Equal(t, 114, wide.contentWidth())
+	require.Equal(t, 96, wide.measure())
+
+	narrow := NewSessionPane()
+	narrow.SetSize(80, 30)
+	require.Equal(t, 0, narrow.pad())
+	require.Equal(t, 1, narrow.gutter())
+	require.Equal(t, 80, narrow.contentWidth())
+	require.Equal(t, 79, narrow.measure())
+}
+
+// TestSessionPane_ChromeReachesPaneEdge_AtNamedGeometries proves the
+// pane-widened-to-the-real-right-edge rule at the SessionPane level: the
+// header rule (a full contentWidth-plus-padding line) reaches exactly the
+// width SetSize was given, at both named geometries.
+func TestSessionPane_ChromeReachesPaneEdge_AtNamedGeometries(t *testing.T) {
+	pinHome(t)
+	for _, w := range []int{116, 80} {
+		s := NewSessionPane()
+		s.SetSize(w, 30)
+		s.SetInfo(fixtureInfo())
+		lines := strings.Split(s.String(), "\n")
+		require.Equal(t, w, ansi.StringWidth(lines[2]), "the header rule must reach exactly the pane's own received width %d", w)
+	}
+}
