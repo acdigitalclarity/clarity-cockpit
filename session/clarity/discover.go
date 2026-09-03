@@ -370,6 +370,22 @@ func ExternalLaneAlive(name string, exec cmd.Executor, tmuxArgs ...string) bool 
 	return exec.Run(osexec.Command("tmux", args...)) == nil
 }
 
+// ApplyLiveSessionSet overlays Alive on every lane in lanes from a single
+// pre-fetched tmux session-name set (tmux.ListSessionNames) - the batched
+// replacement for DiscoverExternalLanes' own per-lane ExternalLaneAlive
+// call (slice 17c item 2: "one tmux call per pass ... for tracked rows and
+// external lanes alike"). Pure: makes no tmux call of its own. The
+// discovery tick (app.go's feedTickMsg handler) calls this right after
+// DiscoverExternalLanes, reusing the same name set session.
+// ApplyLiveSessionSet already answered for every tracked row on that same
+// pass, so the whole tick spends exactly one tmux call on liveness rather
+// than one per lane.
+func ApplyLiveSessionSet(lanes []ExternalLane, names map[string]bool) {
+	for i := range lanes {
+		lanes[i].Alive = names[lanes[i].Key]
+	}
+}
+
 // DiscoverExternalLanes derives the list of live external lanes: every
 // <root>/<encoded>/*.jsonl transcript across every root claudeProjectsRoots()
 // names, whose mtime is within ExternalLiveWindow, minus any path containing
