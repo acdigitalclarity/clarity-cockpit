@@ -1767,16 +1767,20 @@ func (m *home) selectedFolderPath() string {
 	return ""
 }
 
-// noWorktreeResumeAllowed is the r key's own gate for a NoWorktree tracked
-// instance (slice 8 rule 2): resuming spins up a SECOND tmux session
-// running the SAME program in the SAME folder the owner's own terminal
-// already runs it in, so it is only safe when that terminal-side session
-// looks abandoned - the lane's own transcript classifies as idle or
-// stalled (clarity.ClassifyState: "stalled" already means "no close in
-// over 10 minutes", so no separate age check is needed on top of it).
-// Anything else - working, waiting on you, or no transcript read yet at
-// all - refuses: never risk a duplicate live Claude in one folder.
+// noWorktreeResumeAllowed is the r key's gate for a NoWorktree tracked
+// instance. Resuming starts a second tmux session running the same program
+// in the same folder, so it is refused while the owner's own terminal-side
+// session may still be live. Order of checks:
+//  1. inst.TmuxAlive() false (the same DoesSessionExist check the load path
+//     uses to park a dead session as Paused): nothing is running, resume is
+//     allowed regardless of the cached lane state.
+//  2. tmux alive: the lane's own transcript state decides - idle or stalled
+//     allows, anything else (working, waiting on you, no transcript read)
+//     refuses.
 func noWorktreeResumeAllowed(inst *session.Instance) bool {
+	if !inst.TmuxAlive() {
+		return true
+	}
 	state, _, ok := inst.GetLaneState()
 	if !ok {
 		return false

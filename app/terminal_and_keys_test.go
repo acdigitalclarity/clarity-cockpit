@@ -357,6 +357,47 @@ func noWorktreeAppFixture(t *testing.T, h *home, title string) (inst *session.In
 	return inst, &sessionExists
 }
 
+// noWorktreeAppFixtureLive is noWorktreeAppFixture's live-session
+// counterpart, added for the dead-lane-resume fix's own "keep the existing
+// refusal" half: a Started, still-Running NoWorktree instance whose tmux
+// session genuinely exists (termPtyFactory.Start flips sessionExists true on
+// Start, and this fixture never calls Pause to kill it back off) - the
+// shape where "the lane is live in your own terminal" is actually true.
+func noWorktreeAppFixtureLive(t *testing.T, h *home, title string) (inst *session.Instance, exists *bool) {
+	t.Helper()
+	sessionExists := false
+	cmdExec := cmd_test.MockCmdExec{
+		RunFunc: func(cmd *exec.Cmd) error {
+			cmdStr := cmd.String()
+			if strings.Contains(cmdStr, "has-session") {
+				if sessionExists {
+					return nil
+				}
+				return fmt.Errorf("session does not exist")
+			}
+			if strings.Contains(cmdStr, "kill-session") {
+				sessionExists = false
+			}
+			return nil
+		},
+	}
+	ptyFactory := &termPtyFactory{t: t, sessionExists: &sessionExists}
+
+	inst, err := session.NewInstance(session.InstanceOptions{
+		Title:      title,
+		Path:       t.TempDir(),
+		Program:    "claude",
+		NoWorktree: true,
+	})
+	require.NoError(t, err)
+	inst.SetTmuxSession(tmux.NewTmuxSessionWithDeps(title, "claude", ptyFactory, cmdExec))
+	require.NoError(t, inst.Start(true))
+	require.True(t, inst.TmuxAlive(), "fixture must start with a live session - the still-running-in-your-terminal shape")
+
+	h.list.AddInstance(inst)()
+	return inst, &sessionExists
+}
+
 // TestKeyEnter_TrackedNoWorktreeInstance_NoSession_ShowsFooterLine is
 // slice 8 rule 2's own Enter test, seen failing against the pre-fix code
 // (which silently no-op'd): Enter on a tracked NoWorktree row with no live
@@ -386,34 +427,60 @@ func TestKeyResume_NoWorktreeInstance_Idle_ResumesSession(t *testing.T) {
 	require.Empty(t, h.statusText, "a successful resume shows no refusal footer")
 }
 
-// TestKeyResume_NoWorktreeInstance_Working_RefusesWithFooter is slice 8
-// rule 2's "refused" branch: a lane whose transcript reads working (still
-// live in the owner's own terminal) must never get a second session - r
-// shows the "nothing to resume" footer instead, and starts nothing.
-func TestKeyResume_NoWorktreeInstance_Working_RefusesWithFooter(t *testing.T) {
+// TestKeyResume_NoWorktreeInstance_DeadSessionWorking_ResumesAnyway is the
+// dead-lane-resume incident's own reproduction (3 Sep 2026, board issue
+// family #317): noWorktreeAppFixture's tmux session is already dead (the
+// build-night shape - the tmux server died taking the session with it,
+// leaving the instance parked Paused), yet its cached lane state still
+// reads StateWorking (the tail.go bug this same fix pairs with: a
+// turn_duration close with a pending agent and no age cap read working
+// forever). Before this fix r refused with "nothing to resume" and started
+// nothing, permanently - "live in your own terminal" cannot be true when no
+// tmux session exists, so a dead session must resume regardless of the
+// cached state.
+func TestKeyResume_NoWorktreeInstance_DeadSessionWorking_ResumesAnyway(t *testing.T) {
 	h := newComposerTestHome(t)
 	inst, exists := noWorktreeAppFixture(t, h, "scratchfix-working")
 	inst.SetLaneState(clarity.StateWorking, time.Now(), true)
 
 	pressGlobalKey(h, tea.KeyPressMsg{Code: 'r', Text: "r"})
 
-	require.False(t, *exists, "a working lane must never get a second session")
-	require.Equal(t, session.Paused, inst.Status)
-	require.Equal(t, "the lane is live in your own terminal; nothing to resume", h.statusText)
+	require.True(t, *exists, "a dead session must resume even off a stale working state")
+	require.Equal(t, session.Running, inst.Status)
+	require.Empty(t, h.statusText, "a successful resume shows no refusal footer")
 }
 
-// TestKeyResume_NoWorktreeInstance_NoTranscriptYet_RefusesWithFooter is
-// rule 2's fail-closed default: no transcript read at all (GetLaneState's
-// own ok=false, before the first feed tick has run) refuses, the same as
-// an actively working lane - never assumed idle just because nothing has
-// been read yet.
-func TestKeyResume_NoWorktreeInstance_NoTranscriptYet_RefusesWithFooter(t *testing.T) {
+// TestKeyResume_NoWorktreeInstance_DeadSessionNoTranscript_ResumesAnyway is
+// the dead-session gate's other no-state case: no transcript read at all
+// (GetLaneState's own ok=false, before the first feed tick has run) used to
+// refuse fail-closed the same as a working lane - but the tmux-liveness
+// check now settles it before the cached state is even consulted, so a dead
+// session resumes here too.
+func TestKeyResume_NoWorktreeInstance_DeadSessionNoTranscript_ResumesAnyway(t *testing.T) {
 	h := newComposerTestHome(t)
-	_, exists := noWorktreeAppFixture(t, h, "scratchfix-no-transcript")
+	inst, exists := noWorktreeAppFixture(t, h, "scratchfix-no-transcript")
 
 	pressGlobalKey(h, tea.KeyPressMsg{Code: 'r', Text: "r"})
 
-	require.False(t, *exists)
+	require.True(t, *exists)
+	require.Equal(t, session.Running, inst.Status)
+	require.Empty(t, h.statusText)
+}
+
+// TestKeyResume_NoWorktreeInstance_LiveSessionWorking_RefusesWithFooter is
+// the half of rule 2 the dead-lane-resume fix must NOT touch: the tmux
+// session is genuinely still alive (noWorktreeAppFixtureLive - the owner's
+// own terminal really is running it), so a working transcript still refuses
+// exactly as before, never risking a duplicate live Claude in one folder.
+func TestKeyResume_NoWorktreeInstance_LiveSessionWorking_RefusesWithFooter(t *testing.T) {
+	h := newComposerTestHome(t)
+	inst, exists := noWorktreeAppFixtureLive(t, h, "scratchfix-live-working")
+	inst.SetLaneState(clarity.StateWorking, time.Now(), true)
+
+	pressGlobalKey(h, tea.KeyPressMsg{Code: 'r', Text: "r"})
+
+	require.True(t, *exists, "a live session must never be torn down or duplicated by a refused resume")
+	require.Equal(t, session.Running, inst.Status)
 	require.Equal(t, "the lane is live in your own terminal; nothing to resume", h.statusText)
 }
 

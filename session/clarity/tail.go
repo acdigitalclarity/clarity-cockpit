@@ -329,13 +329,15 @@ type stateResult struct {
 }
 
 // ClassifyState applies the state rule ruled by the design leg (2 Sep,
-// DECISIONS.md slice 1) EXACTLY: walk backwards past
-// untimestampedBookkeepingTypes to the last timestamped record. If it is
-// type system/turn_duration the turn is CLOSED: pendingBackgroundAgentCount
-// > 0 -> working; closed under 30 minutes ago -> "waiting on you";
-// otherwise -> idle. Any other record type is an OPEN turn: written within
-// 10 minutes -> working (the rule's "within 3" and "3 to 10" bands both
-// resolve to the same word); over 10 minutes -> stalled.
+// DECISIONS.md slice 1): walk backwards past untimestampedBookkeepingTypes
+// to the last timestamped record. If it is type system/turn_duration the
+// turn is CLOSED: pendingBackgroundAgentCount > 0 and closed 10 minutes ago
+// or less -> working; pending > 0 and closed over 10 minutes ago -> stalled
+// (same age cap as the open-turn branch, so a closed turn with a pending
+// agent never reads working indefinitely); no pending agents and closed
+// under 30 minutes ago -> "waiting on you"; otherwise -> idle. Any other
+// record type is an OPEN turn: written within 10 minutes -> working; over
+// 10 minutes -> stalled.
 func ClassifyState(records []rawRecord, now time.Time) stateResult {
 	anchor, ok := lastTimestampedRecord(records)
 	if !ok {
@@ -351,6 +353,20 @@ func ClassifyState(records []rawRecord, now time.Time) stateResult {
 		duration := time.Duration(anchor.DurationMs) * time.Millisecond
 		pending := anchor.PendingBackgroundAgentCount
 		switch {
+		case pending > 0 && age > 10*time.Minute:
+			// The dead-lane-resume fix (3 Sep incident): a pending background
+			// agent never ages the lane past 10 minutes with no newer write -
+			// mirrors the open-turn branch's own 10-minute cap below, so a
+			// lane whose builder never checked back in (or whose tmux server
+			// died taking the builder with it) reads stalled, not working,
+			// once nothing has written to the transcript in that long.
+			return stateResult{
+				State:         StateStalled,
+				Reason:        fmt.Sprintf("turn closed %s ago with %d background agent(s) still pending, over 10m with no write", roundAge(age), pending),
+				LastTurn:      anchorAt,
+				PendingAgents: pending,
+				TurnDuration:  duration,
+			}
 		case pending > 0:
 			return stateResult{
 				State:         StateWorking,
