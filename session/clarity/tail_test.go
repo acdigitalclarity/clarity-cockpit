@@ -129,6 +129,41 @@ func TestClassifyState_ClosedWithPendingAgents_Working(t *testing.T) {
 	require.False(t, tail.OpenTurn)
 }
 
+// TestClassifyState_ClosedWithPendingAgentsOverTenMinutes_Stalled is the
+// dead-lane-resume incident's own reproduction (3 Sep 2026): the build-night
+// row's last record was a turn_duration close over an hour before the tmux
+// server died, still carrying a pending background agent. Before this fix
+// the pending>0 branch had no age cap at all and read StateWorking forever;
+// this proves it now ages out past 10 minutes exactly like the open-turn
+// branch does, naming both the pending count and the age in its reason.
+func TestClassifyState_ClosedWithPendingAgentsOverTenMinutes_Stalled(t *testing.T) {
+	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
+	path := writeFixture(t, []string{
+		turnDurationLine(now.Add(-42*time.Minute), 5000, 4, 1),
+	})
+	tail, err := ReadLaneTail(path, DefaultTailMaxBytes, DefaultTailTurns, now)
+	require.NoError(t, err)
+	require.Equal(t, StateStalled, tail.State)
+	require.Equal(t, 1, tail.PendingAgents)
+	require.Equal(t, "turn closed 42m ago with 1 background agent(s) still pending, over 10m with no write", tail.StateReason)
+}
+
+// TestClassifyState_ClosedWithPendingAgentsUnderTenMinutes_StillWorking
+// proves the age cap above never fires early - a turn that closed with a
+// pending agent LESS than 10 minutes ago must still read working, the same
+// as TestClassifyState_ClosedWithPendingAgents_Working's 1-minute case but
+// pinned right at the boundary this fix introduces.
+func TestClassifyState_ClosedWithPendingAgentsUnderTenMinutes_StillWorking(t *testing.T) {
+	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
+	path := writeFixture(t, []string{
+		turnDurationLine(now.Add(-9*time.Minute), 5000, 4, 1),
+	})
+	tail, err := ReadLaneTail(path, DefaultTailMaxBytes, DefaultTailTurns, now)
+	require.NoError(t, err)
+	require.Equal(t, StateWorking, tail.State)
+	require.Equal(t, 1, tail.PendingAgents)
+}
+
 func TestClassifyState_ClosedFiveMinutesAgoNoAgents_WaitingOnYou(t *testing.T) {
 	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
 	path := writeFixture(t, []string{
