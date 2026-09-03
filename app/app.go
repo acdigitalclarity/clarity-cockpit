@@ -159,6 +159,14 @@ type home struct {
 	// initialized on first use rather than in newHome, so a *home built
 	// directly in a test (skipping newHome) still works.
 	laneTailCache *clarity.LaneTailCache
+
+	// sessionAnimFrame is sessionTickMsg's own 500ms counter (design/
+	// cockpit-pane/DECISIONS.md's Latency ruling) - incremented once per
+	// session tick and handed to the SELECTED lane's ui.SessionInfo as
+	// AnimFrame, driving the header glyph's animation while its turn is
+	// open. Zero value (a *home built directly in a test, skipping the
+	// tick loop) simply never animates - the static glyph still renders.
+	sessionAnimFrame int
 }
 
 func newHome(ctx context.Context, program string, autoYes bool, noSplash bool) *home {
@@ -350,6 +358,10 @@ func (m *home) Init() tea.Cmd {
 		},
 		tickUpdateMetadataCmd(m.snapshotActiveInstances(), m.list.GetSelectedInstance()),
 		func() tea.Msg { return feedTickMsg{} },
+		func() tea.Msg {
+			time.Sleep(sessionTickInterval)
+			return sessionTickMsg{}
+		},
 	}
 	if m.splashModel != nil {
 		cmds = append(cmds, m.splashModel.Tick())
@@ -383,6 +395,23 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return previewTickMsg{}
 			},
 		)
+	case sessionTickMsg:
+		// The Latency ruling (design/cockpit-pane/DECISIONS.md): the
+		// SELECTED lane's Session tab refreshes on its OWN 500ms tick,
+		// never the 3s feedTickMsg cadence every row also runs on. This
+		// reads through the same laneTailCache feedTickMsg uses, but for
+		// the selected lane only - an unchanged transcript costs exactly
+		// one os.Stat (LaneTailCache.Get's own contract), so running this
+		// six times as often as the feed tick is cheap.
+		if m.laneTailCache == nil {
+			m.laneTailCache = clarity.NewLaneTailCache()
+		}
+		m.sessionAnimFrame++
+		m.updateSessionTabInfo(time.Now())
+		return m, func() tea.Msg {
+			time.Sleep(sessionTickInterval)
+			return sessionTickMsg{}
+		}
 	case keyupMsg:
 		m.menu.ClearKeydown()
 		return m, nil
@@ -524,11 +553,11 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			inst.SetContextFill(pct, ok)
 		}
 
-		// Session tab data (design/cockpit-pane/DECISIONS.md slice 3): the
-		// SELECTED row's own turns, tracked or external, on this same tick -
-		// never on the 100ms previewTickMsg cadence, since the underlying
-		// LaneTail is only as fresh as this tick anyway.
-		m.updateSessionTabInfo(now)
+		// The Session tab's own turns/header now refresh on sessionTickMsg's
+		// 500ms cadence (the Latency ruling, slice 12) - only the splash's
+		// fleet counters (unrelated to the selected lane's own data, and in
+		// no hurry to update faster) still ride this 3s tick.
+		m.updateSessionFleetCounts()
 
 		// Needs-you tab data (slice 5): re-read on every tick too, so a
 		// board fetch that resolved between ticks (or a re-ranked queue
@@ -1599,6 +1628,19 @@ type feedTickMsg struct{}
 // the fleet queue changes far less often than either.
 const feedRefreshInterval = 3 * time.Second
 
+// sessionTickMsg fires once per Session-tab refresh tick - the Latency
+// ruling's own cadence (design/cockpit-pane/DECISIONS.md, 3 Sep 09:2x): the
+// SELECTED lane's turns, header state glyph and running-tool elapsed text
+// all need to move roughly six times as often as the 3s feed tick that
+// refreshes every OTHER row, without dragging that fleet-wide work along
+// with it - see the sessionTickMsg case in Update, which touches only the
+// selected lane's own LaneTail (through the same laneTailCache, so an
+// unchanged file still costs one os.Stat, not a reparse).
+type sessionTickMsg struct{}
+
+// sessionTickInterval is the Latency ruling's own number, verbatim: 500ms.
+const sessionTickInterval = 500 * time.Millisecond
+
 // feedTopN is how many ranked entries the "Needs you" section shows.
 const feedTopN = 5
 
@@ -1661,9 +1703,10 @@ const sessionMaxTurns = 40
 // updateSessionTabInfo resolves the SELECTED row's own LaneTail (tracked or
 // external, whichever the list's cursor currently sits on) and hands it to
 // the Session pane, or clears it when nothing is selected - the pane then
-// falls back to the splash's resting frame. Called once per feedTickMsg,
-// never on the 100ms preview cadence (design/cockpit-pane/DECISIONS.md
-// slice 3's own "on the existing feed tick" requirement).
+// falls back to the splash's resting frame. Called once per sessionTickMsg
+// (design/cockpit-pane/DECISIONS.md's Latency ruling, slice 12) - the
+// selected lane's own 500ms cadence, never the 3s feedTickMsg every row
+// also runs on and never the 100ms preview cadence.
 func (m *home) updateSessionTabInfo(now time.Time) {
 	if m.tabbedWindow == nil {
 		// A *home built directly in a test (skipping newHome, see
@@ -1672,7 +1715,16 @@ func (m *home) updateSessionTabInfo(now time.Time) {
 	}
 	info := m.selectedSessionInfo(now)
 	m.tabbedWindow.SetSessionInfo(info)
+}
 
+// updateSessionFleetCounts refreshes the splash resting frame's own "lanes
+// live"/"needs you" counters - unrelated to the selected lane's own data,
+// so it stays on feedTickMsg's 3s cadence rather than moving to the
+// selected-lane-only sessionTickMsg alongside updateSessionTabInfo above.
+func (m *home) updateSessionFleetCounts() {
+	if m.tabbedWindow == nil {
+		return
+	}
 	live, needsYou := splash.FleetCounts()
 	m.tabbedWindow.SetSessionFleetCounts(live, needsYou)
 	m.tabbedWindow.SetTerminalFleetCounts(live, needsYou)
@@ -1697,13 +1749,14 @@ func (m *home) selectedSessionInfo(now time.Time) *ui.SessionInfo {
 		}
 		ctxPct, ctxOK := selected.GetContextFill()
 		return &ui.SessionInfo{
-			Lane:    selected.Title,
-			WorkDir: selected.Path,
-			Branch:  branch,
-			Tail:    tail,
-			CtxPct:  ctxPct,
-			CtxOK:   ctxOK,
-			Now:     now,
+			Lane:      selected.Title,
+			WorkDir:   selected.Path,
+			Branch:    branch,
+			Tail:      tail,
+			CtxPct:    ctxPct,
+			CtxOK:     ctxOK,
+			Now:       now,
+			AnimFrame: m.sessionAnimFrame,
 		}
 	}
 
@@ -1713,12 +1766,13 @@ func (m *home) selectedSessionInfo(now time.Time) *ui.SessionInfo {
 			return nil
 		}
 		return &ui.SessionInfo{
-			Lane:    ext.Name,
-			WorkDir: ext.WorkDir,
-			Tail:    tail,
-			CtxPct:  ext.Fill.Pct,
-			CtxOK:   ext.FillOK,
-			Now:     now,
+			Lane:      ext.Name,
+			WorkDir:   ext.WorkDir,
+			Tail:      tail,
+			CtxPct:    ext.Fill.Pct,
+			CtxOK:     ext.FillOK,
+			Now:       now,
+			AnimFrame: m.sessionAnimFrame,
 		}
 	}
 

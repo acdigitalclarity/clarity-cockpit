@@ -65,6 +65,15 @@ type SessionInfo struct {
 	// the rest of this info was computed from, not a fresh time.Now() at
 	// render time.
 	Now time.Time
+	// AnimFrame is app.go's own 500ms session-tick counter (design/
+	// cockpit-pane/DECISIONS.md's Latency ruling: "while the selected
+	// lane's turn is open the header state glyph animates ... one step per
+	// 500 ms tick"). headerGlyph cycles animGlyphFrames by this value only
+	// while State is StateWorking and OpenTurn is true; every other state
+	// ignores it and shows its own static glyph. Threaded from app.go
+	// rather than derived from Now, so a test can drive the animation
+	// deterministically without depending on wall-clock timing.
+	AnimFrame int
 }
 
 // SessionPane renders the Session tab: the header, the turns (oldest first,
@@ -74,6 +83,17 @@ type SessionPane struct {
 	width, height int
 
 	info *SessionInfo
+
+	// turnsSig is the previous SetInfo call's own sessionTurnsSignature -
+	// SetInfo skips rebuilding the turns viewport (refreshViewport) when the
+	// freshly read info's signature matches it exactly, the FINISH
+	// requirement's "no flicker (only re-render when the tail changed or
+	// the elapsed second changed)": a 500ms tick on an idle lane reads the
+	// identical LaneTail back from the cache every time (one stat, no
+	// reparse - LaneTailCache's own contract) and there is nothing new to
+	// draw. The header/state lines are unaffected either way - they render
+	// straight from s.info fresh on every String() call, never cached.
+	turnsSig sessionTurnsSignature
 
 	live, waiting int // fleet counters for the resting frame (splash.FleetCounts)
 
@@ -107,11 +127,52 @@ func (s *SessionPane) SetSize(width, height int) {
 
 // SetInfo replaces the SELECTED lane's data and rebuilds the turns
 // viewport, pinned to the bottom (the newest turn is always visible on the
-// first render after a change). nil clears the selection - String() then
-// shows the resting frame.
+// first render after a change) - but only when there is actually something
+// new to draw (see turnsSig's own doc comment). nil clears the selection -
+// String() then shows the resting frame.
 func (s *SessionPane) SetInfo(info *SessionInfo) {
+	sig := newSessionTurnsSignature(info)
+	rebuild := info == nil || s.info == nil || sig != s.turnsSig
 	s.info = info
-	s.refreshViewport()
+	s.turnsSig = sig
+	if rebuild {
+		s.refreshViewport()
+	}
+}
+
+// sessionTurnsSignature is the subset of a SessionInfo that determines
+// whether the turns viewport has anything new to draw: the transcript's own
+// identity and last-write instant, its message count, its turn count, and -
+// the part that changes fastest - the RENDERED elapsed text of every still-
+// running tool turn (toolResultLabel's own formatting, not a raw duration
+// bucket, so a signature match means the text truly would not have changed
+// either). Two SessionInfo values that produce an equal signature would
+// render byte-identical turn lines.
+type sessionTurnsSignature struct {
+	transcript string
+	lastWrite  time.Time
+	messages   int
+	turnCount  int
+	running    string
+}
+
+func newSessionTurnsSignature(info *SessionInfo) sessionTurnsSignature {
+	if info == nil {
+		return sessionTurnsSignature{}
+	}
+	var running strings.Builder
+	for i, t := range info.Tail.Turns {
+		if t.Kind == clarity.TurnTool && t.Result == clarity.ResultRunning {
+			fmt.Fprintf(&running, "|%d:%s", i, formatDurationTight(info.Now.Sub(t.At)))
+		}
+	}
+	return sessionTurnsSignature{
+		transcript: info.Tail.Transcript,
+		lastWrite:  info.Tail.LastWrite,
+		messages:   info.Tail.Messages,
+		turnCount:  len(info.Tail.Turns),
+		running:    running.String(),
+	}
 }
 
 // Clear is SetInfo(nil) under the name app.go's other panes use for "nothing
@@ -175,7 +236,7 @@ func (s *SessionPane) refreshViewport() {
 		s.viewport.SetContent("")
 		return
 	}
-	lines := buildTurnLines(s.info.Tail.Turns, s.width)
+	lines := buildTurnLines(s.info.Tail.Turns, s.width, s.info.Now)
 	s.viewport.SetContent(strings.Join(lines, "\n"))
 	if wasAtBottom {
 		s.viewport.GotoBottom()
@@ -321,13 +382,33 @@ func fitsBox(content string, width, height int) bool {
 	return true
 }
 
+// animGlyphFrames is the header's own "loady thing" (the owner's words, 3
+// Sep 09:2x) - the Latency ruling's cycle, one frame per 500ms session
+// tick, shown only while a turn is genuinely open.
+var animGlyphFrames = []string{"●", "◐", "○", "◑"}
+
+// headerGlyph is renderHeaderLine1's own glyph: laneStateGlyph's static
+// glyph for every state except an OPEN working turn (State working, Tail.
+// OpenTurn true), which instead cycles animGlyphFrames by info.AnimFrame -
+// the header IS the loading indicator while work is genuinely in flight,
+// and settles back to the plain "●" the instant ClassifyState reports the
+// turn closed (OpenTurn false), same tick.
+func (s *SessionPane) headerGlyph() (string, lipgloss.Style) {
+	t := s.info.Tail
+	if t.State == clarity.StateWorking && t.OpenTurn {
+		frame := animGlyphFrames[s.info.AnimFrame%len(animGlyphFrames)]
+		return frame, laneStateAccentStyle
+	}
+	return laneStateGlyph(t.State)
+}
+
 // renderHeaderLine1 is "<lane>  ...  <glyph> <state>[ · N agents]   ctx
 // NN%  <bar>   last write hh:mm:ss" - the lane name left, everything else
 // right-aligned to the pane's own width (design/cockpit-pane/
 // PANE-MOCKUP-164x45.md line 1).
 func (s *SessionPane) renderHeaderLine1() string {
 	t := s.info.Tail
-	glyph, style := laneStateGlyph(t.State)
+	glyph, style := s.headerGlyph()
 	g := style.Render(glyph)
 
 	agentSeg := ""
@@ -635,7 +716,7 @@ func minutesAgo(at, now time.Time) string {
 // lines the turns viewport holds - owner/assistant turns as a header line
 // plus wrapped, indented body lines; tool turns as one line each with the
 // result right-aligned.
-func buildTurnLines(turns []clarity.Turn, width int) []string {
+func buildTurnLines(turns []clarity.Turn, width int, now time.Time) []string {
 	var lines []string
 	for _, t := range turns {
 		switch t.Kind {
@@ -644,7 +725,7 @@ func buildTurnLines(turns []clarity.Turn, width int) []string {
 		case clarity.TurnAssistant:
 			lines = append(lines, renderProseTurn(t, "CLAUDE", width)...)
 		case clarity.TurnTool:
-			lines = append(lines, renderToolTurn(t, width))
+			lines = append(lines, renderToolTurn(t, width, now))
 		}
 	}
 	return lines
@@ -669,23 +750,34 @@ func renderProseTurn(t clarity.Turn, label string, width int) []string {
 // renderToolTurn is "▪ <tool>  <summary>" with the result and duration
 // right-aligned to the pane's width in one line, per the mock-up's tool
 // rows ("▪ Bash   ...                exit 0     2.1s").
-func renderToolTurn(t clarity.Turn, width int) string {
+func renderToolTurn(t clarity.Turn, width int, now time.Time) string {
 	left := fmt.Sprintf("▪ %s  %s", t.Tool, t.Summary)
-	return padRow(left, toolResultLabel(t), width)
+	return padRow(left, toolResultLabel(t, now), width)
 }
 
 // toolResultLabel is the tool line's right-hand field: "exit 0     2.1s",
 // "running   4m12s", "denied", "error" - the exact four shapes the brief
-// names, duration shown only alongside a real (ok/running) outcome.
-func toolResultLabel(t clarity.Turn) string {
-	dur := formatDurationTight(t.Duration)
+// names, duration shown only alongside a real (ok/running) outcome. A
+// ResultRunning turn (the Latency ruling's own case: an unmatched tool_use,
+// no tool_result yet) never carries a stored Duration - buildTurns only
+// ever sets that from a matched outcome - so its elapsed time is computed
+// HERE, live, from now (the session tick's own clock) minus the tool's own
+// timestamp: "running <elapsed>", counting up on every 500ms tick rather
+// than being frozen at whatever it read when the file was last (re)parsed.
+func toolResultLabel(t clarity.Turn, now time.Time) string {
 	switch t.Result {
 	case clarity.ResultOK:
+		dur := formatDurationTight(t.Duration)
 		if dur == "" {
 			return "exit 0"
 		}
 		return "exit 0     " + dur
 	case clarity.ResultRunning:
+		elapsed := now.Sub(t.At)
+		if elapsed < 0 {
+			elapsed = 0
+		}
+		dur := formatDurationTight(elapsed)
 		if dur == "" {
 			return "running"
 		}

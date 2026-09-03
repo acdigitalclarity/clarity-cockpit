@@ -313,6 +313,137 @@ func TestSessionPane_HeaderLine2_TruncatesLeftNeverDropsBranchOrModel(t *testing
 	require.Contains(t, line2, "…", "an overflowing left block truncates with an ellipsis, not a silent cut")
 }
 
+// openTurnInfo returns a fixtureInfo with an OPEN working turn (the
+// Latency ruling's own precondition for the header glyph to animate) and
+// one still-RUNNING tool turn - the shape the Latency ruling's slice 12
+// tests exercise: a lane whose transcript's last record is an unmatched
+// tool_use, no tool_result yet.
+func openTurnInfo(toolAt time.Time, animFrame int, now time.Time) *SessionInfo {
+	info := fixtureInfo()
+	info.Tail.State = clarity.StateWorking
+	info.Tail.OpenTurn = true
+	info.Tail.Turns = []clarity.Turn{
+		{Kind: clarity.TurnOwner, At: toolAt.Add(-time.Minute), Text: "run the long build"},
+		{Kind: clarity.TurnTool, At: toolAt, Tool: "Bash", Summary: "go build ./...", Result: clarity.ResultRunning},
+	}
+	info.AnimFrame = animFrame
+	info.Now = now
+	return info
+}
+
+// TestSessionPane_HeaderGlyph_AnimatesOnlyWhileTurnOpen is the Latency
+// ruling's own header requirement, seen failing before this leg's fix (the
+// header always drew laneStateGlyph's static "●" for StateWorking,
+// AnimFrame or no): a different AnimFrame value must draw a DIFFERENT
+// glyph out of animGlyphFrames while State is working and OpenTurn is true.
+func TestSessionPane_HeaderGlyph_AnimatesOnlyWhileTurnOpen(t *testing.T) {
+	pinHome(t)
+	base := time.Date(2026, 9, 3, 10, 0, 0, 0, time.Local)
+
+	s := NewSessionPane()
+	s.SetSize(160, 34)
+	s.SetInfo(openTurnInfo(base, 0, base))
+	line0 := strings.Split(s.String(), "\n")[0]
+
+	s.SetInfo(openTurnInfo(base, 1, base.Add(500*time.Millisecond)))
+	line1 := strings.Split(s.String(), "\n")[0]
+
+	require.NotEqual(t, line0, line1, "the header's own glyph column must advance between two session ticks while the turn is open")
+	require.Contains(t, line1, animGlyphFrames[1], "AnimFrame 1 must draw animGlyphFrames' own second frame")
+}
+
+// TestSessionPane_HeaderGlyph_SettlesWhenTurnCloses is the ruling's other
+// half: the instant OpenTurn goes false (ClassifyState's own "turn closed"
+// case), the header glyph must stop cycling and settle to laneStateGlyph's
+// plain static glyph for that state - regardless of what AnimFrame now is.
+func TestSessionPane_HeaderGlyph_SettlesWhenTurnCloses(t *testing.T) {
+	pinHome(t)
+	base := time.Date(2026, 9, 3, 10, 0, 0, 0, time.Local)
+
+	s := NewSessionPane()
+	s.SetSize(160, 34)
+	s.SetInfo(openTurnInfo(base, 3, base))
+	openLine := strings.Split(s.String(), "\n")[0]
+
+	closed := openTurnInfo(base, 4, base.Add(time.Second))
+	closed.Tail.OpenTurn = false
+	closed.Tail.Turns[1].Result = clarity.ResultOK
+	closed.Tail.Turns[1].Duration = time.Second
+	s.SetInfo(closed)
+	closedLine := strings.Split(s.String(), "\n")[0]
+
+	staticGlyph, _ := laneStateGlyph(clarity.StateWorking)
+	require.Contains(t, closedLine, staticGlyph, "a closed turn must settle to the plain static glyph, never a cycled frame")
+	require.NotEqual(t, openLine, closedLine)
+}
+
+// TestSessionPane_RunningToolLine_ElapsedAdvancesBetweenTicks is the
+// Latency ruling's tool-line requirement, seen failing before this leg's
+// fix (toolResultLabel showed a bare "running" forever - Duration is only
+// ever set from a matched tool_result, never for a still-open call): two
+// SetInfo calls a real elapsed second apart must show a strictly LARGER
+// elapsed figure on the unmatched tool's own line, counting up from its own
+// timestamp, not the lane's last stat.
+func TestSessionPane_RunningToolLine_ElapsedAdvancesBetweenTicks(t *testing.T) {
+	pinHome(t)
+	base := time.Date(2026, 9, 3, 10, 0, 0, 0, time.Local)
+
+	s := NewSessionPane()
+	s.SetSize(160, 34)
+
+	s.SetInfo(openTurnInfo(base, 0, base.Add(300*time.Millisecond)))
+	early := toolLine(t, s.String())
+	require.Contains(t, early, "running", "an unmatched tool_use must show running, not a bare exit/error label")
+
+	s.SetInfo(openTurnInfo(base, 1, base.Add(800*time.Millisecond)))
+	mid := toolLine(t, s.String())
+	require.NotEqual(t, early, mid, "the elapsed text must change tick to tick while the tool is still running")
+
+	s.SetInfo(openTurnInfo(base, 2, base.Add(1800*time.Millisecond)))
+	later := toolLine(t, s.String())
+	require.NotEqual(t, mid, later, "elapsed must keep advancing a further second later")
+}
+
+// toolLine returns the rendered pane's own "▪ Bash" line, failing the test
+// if none is present.
+func toolLine(t *testing.T, out string) string {
+	t.Helper()
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "▪ Bash") {
+			return l
+		}
+	}
+	t.Fatalf("no tool line found in:\n%s", out)
+	return ""
+}
+
+// TestSessionPane_SetInfo_SkipsRebuildWhenSignatureUnchanged is the FINISH
+// requirement's own "no flicker" clause: an idle lane whose file has not
+// changed (LaneTailCache serves the identical LaneTail back every tick, the
+// cache's own contract) must render the exact same turns content on a
+// second SetInfo call - never a spurious diff a terminal renderer would
+// have to repaint for no visible reason.
+func TestSessionPane_SetInfo_SkipsRebuildWhenSignatureUnchanged(t *testing.T) {
+	pinHome(t)
+	s := NewSessionPane()
+	s.SetSize(160, 34)
+
+	info1 := fixtureInfo()
+	s.SetInfo(info1)
+	out1 := s.String()
+
+	// A second, distinct SessionInfo value carrying byte-identical Tail
+	// content (as two ticks reading the same unchanged file through the
+	// cache would) and a slightly later Now within the same rendered
+	// second - the idle-lane case, no running tool to advance.
+	info2 := fixtureInfo()
+	info2.Now = info1.Now.Add(500 * time.Millisecond)
+	s.SetInfo(info2)
+	out2 := s.String()
+
+	require.Equal(t, out1, out2, "an unchanged lane must render byte-identical output across ticks")
+}
+
 // TestSessionPane_NeverExceedsPaneDimensions is the FINISH requirement at
 // the three named sizes' own pane-content dimensions.
 func TestSessionPane_NeverExceedsPaneDimensions(t *testing.T) {
