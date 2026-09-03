@@ -60,7 +60,7 @@ func runHasContinuousBackground(s string) bool {
 // continuous rowBg band with no un-styled gap in it anywhere.
 func TestLaneRowSuffix_SelectedRow_OneContinuousBackground(t *testing.T) {
 	out := laneRowSuffix(selectedTitleStyle.GetBackground(), selectedTitleStyle.GetForeground(),
-		"", false, 55, true, "waiting on you", time.Now(), true, true, true)
+		"", false, 55, true, "waiting on you", time.Now(), time.Time{}, true, true, true)
 
 	require.True(t, runHasContinuousBackground(out), "raw: %q", out)
 }
@@ -72,7 +72,7 @@ func TestLaneRowSuffix_SelectedRow_OneContinuousBackground(t *testing.T) {
 // the left of where it was fixed.
 func TestLaneRowSuffix_SelectedRow_WithTag_OneContinuousBackground(t *testing.T) {
 	out := laneRowSuffix(selectedTitleStyle.GetBackground(), selectedTitleStyle.GetForeground(),
-		"tb", true, 55, true, "waiting on you", time.Now(), true, true, true)
+		"tb", true, 55, true, "waiting on you", time.Now(), time.Time{}, true, true, true)
 
 	require.True(t, runHasContinuousBackground(out), "raw: %q", out)
 }
@@ -83,7 +83,7 @@ func TestLaneRowSuffix_SelectedRow_WithTag_OneContinuousBackground(t *testing.T)
 // play, not just the widest row.
 func TestLaneRowSuffix_SelectedRow_NoWordOrTime_StillContinuous(t *testing.T) {
 	out := laneRowSuffix(selectedTitleStyle.GetBackground(), selectedTitleStyle.GetForeground(),
-		"", false, 7, true, "idle", time.Now(), true, false, false)
+		"", false, 7, true, "idle", time.Now(), time.Time{}, true, false, false)
 
 	require.True(t, runHasContinuousBackground(out), "raw: %q", out)
 }

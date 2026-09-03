@@ -194,6 +194,21 @@ type home struct {
 	// queue itself no longer carries the issue (pruneClosedIssues), the
 	// same lifetime rule answeredIssues already follows.
 	closedIssues map[int]bool
+	// attentionState is item 3's own fleet-wide edge tracker (COCKPIT-
+	// MODALITIES-2026-09-03.md, slice 17: bell + title count) - one
+	// attentionCategory per lane, keyed by attentionKey, refreshed every
+	// feedTickMsg (updateAttention, app/attention.go). A lane's entry
+	// changing FROM attentionNone TO attentionWaitingOrStalled on a given
+	// tick is what rings the bell; every other change (or none) is silent.
+	attentionState map[string]attentionCategory
+	// lastBellAt is the fleet-wide bell cooldown's own clock - "at most one
+	// bell per 10 seconds fleet-wide", never one per lane.
+	lastBellAt time.Time
+	// windowTitle is the terminal title text updateAttention computed on the
+	// last feed tick - View() hands this straight to tea.View.WindowTitle
+	// every render; it is never computed there, since View() runs far more
+	// often than the 3s tick that actually changes it.
+	windowTitle string
 	// bankWatch is the b-key bank flow's own CONTINUATION-*.md poll, set on
 	// a successful bank send and cleared on the first hit, on 30 minutes
 	// elapsed, or on quit - nil otherwise. Only one watch is ever live at a
@@ -228,6 +243,24 @@ type home struct {
 	// initialized on first use rather than in newHome, so a *home built
 	// directly in a test (skipping newHome) still works.
 	laneTailCache *clarity.LaneTailCache
+
+	// laneSentAt is item 5's own "the cockpit sent into that lane" clock
+	// (WAITING HELD, cockpit-pane modalities research, 3 Sep): the last
+	// instant THIS process actually delivered text into a tracked lane's
+	// tmux session - the m-key plain message, the y-key answer, the b-key
+	// bank send, every flow that funnels through deliverToLane's tracked
+	// (non-external) branch - keyed by lane title (Instance.Title, the same
+	// key deliverToLane itself matches against). Recorded only from
+	// composerResultMsg's own handling in Update (recordSentAt), never from
+	// a dispatched tea.Cmd goroutine, so it is never written concurrently
+	// with the feed tick's own read of it. Read back on the next feed tick
+	// via LaneTailCache.Get's own sentAt argument, so a closed "waiting on
+	// you" turn answered by a cockpit send reads idle even before the
+	// transcript itself catches up. In-memory only, for this process's own
+	// lifetime - never persisted, lost on quit like every other feed-tick
+	// cache. Lazily initialized (recordSentAt), same convention as
+	// laneTailCache above.
+	laneSentAt map[string]time.Time
 
 	// transcriptWatcher is the fsnotify seam (slice 14 rule 3) watching the
 	// SELECTED lane's own transcript file - nil until the first lane with a
@@ -293,6 +326,7 @@ func newHome(ctx context.Context, program string, autoYes bool, noSplash bool) *
 		needsYouTab:  ui.NeedsYouTab,
 		prevRowKind:  ui.RowKindTracked,
 		pendingLogins: make(map[*session.Instance]string),
+		windowTitle:   attentionDefaultTitle,
 	}
 	if NoButterfly {
 		h.tabbedWindow.SetButterflyEnabled(false)
@@ -637,10 +671,15 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// path, so an external lane whose file has not changed since
 			// the last tick is not reparsed.
 			for i := range external {
-				if tail, err := m.laneTailCache.Get(external[i].TranscriptPath, 0, now); err == nil {
+				// sentAt is always the zero value here (item 5): an
+				// external lane is never SENT into by this cockpit at all,
+				// only copied to the clipboard for the owner to paste
+				// himself, so there is nothing to bridge to the transcript.
+				if tail, err := m.laneTailCache.Get(external[i].TranscriptPath, 0, now, time.Time{}); err == nil {
 					external[i].State = tail.State
 					external[i].LastTurn = tail.LastTurn
 					external[i].StateOK = true
+					external[i].AnsweredAt = tail.AnsweredAt
 				}
 			}
 			m.list.SetExternal(external)
@@ -664,11 +703,16 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !ok {
 				continue
 			}
-			tail, err := m.laneTailCache.Get(path, 0, now)
+			// sentAt (item 5) bridges a send this process made into inst's
+			// own lane, keyed the same way deliverToLane matches (inst.
+			// Title) - the zero value when this lane has never had a
+			// recorded send, same as m.laneSentAt's own doc comment.
+			tail, err := m.laneTailCache.Get(path, 0, now, m.laneSentAt[inst.Title])
 			if err != nil {
 				continue
 			}
 			inst.SetLaneState(tail.State, tail.LastTurn, true)
+			inst.SetAnsweredAt(tail.AnsweredAt)
 		}
 
 		// Permission-prompt state word (item 7) - a live tmux pane sample,
@@ -681,6 +725,12 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// polled on this same tick.
 		m.checkBankWatch(now)
 		retryCmd := m.retryPendingCommentsCmd(now)
+
+		// Fleet-wide bell and window-title lane count (item 3, cockpit-pane
+		// modalities research) - every lane's state and NeedsKey sample for
+		// this tick are current as of the two loops above, so this reads
+		// them fresh, never stale by a tick.
+		bellCmd := m.updateAttention(now)
 
 		// Context-fill for Paused tracked instances (the OWN ROW defect's
 		// "ctx n/a"): tickUpdateMetadataCmd's 500ms loop only computes
@@ -716,7 +766,7 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// waiting on a key press.
 		needsYouCmd := m.refreshNeedsYouTab()
 
-		return m, tea.Batch(needsYouCmd, retryCmd, func() tea.Msg {
+		return m, tea.Batch(needsYouCmd, retryCmd, bellCmd, func() tea.Msg {
 			time.Sleep(feedRefreshInterval)
 			return feedTickMsg{}
 		})
@@ -894,6 +944,14 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.composer.Close()
 			return m, m.handleError(msg.err)
+		}
+		// Item 5 (WAITING HELD): a successful, tracked (non-external) send
+		// records its own instant against the lane it landed in - a
+		// clipboard copy (isExternal) never sends anything into a lane's
+		// own tmux session at all, so it must never suppress that lane's
+		// held "waiting on you" the way an actual send does.
+		if !msg.isExternal && msg.lane != "" && !msg.sentAt.IsZero() {
+			m.recordSentAt(msg.lane, msg.sentAt)
 		}
 		switch {
 		case msg.bank:
@@ -2123,11 +2181,20 @@ type composerResultMsg struct {
 	// Msg) can rebuild the full foot without a fresh, possibly-stale
 	// time.Now().
 	sendResult string
-	// lane/isExternal are the delivery target, carried alongside issue so a
+	// lane/isExternal are the delivery target - carried alongside issue so a
 	// queued retry (comment or close) can rebuild the eventual "answered #N
-	// · closed · ..." footer without needing to re-resolve the row.
+	// · closed · ..." footer without needing to re-resolve the row, AND
+	// (item 5, WAITING HELD) so Update's own handling can record sentAt
+	// below against the right lane, only for a tracked (non-external) send.
 	lane       string
 	isExternal bool
+	// sentAt is item 5's own send instant - deliverResult.at, the moment
+	// this delivery actually landed, carried by every successful send
+	// return (plain message, answer, bank) regardless of flow. Zero on any
+	// error return, and ignored by Update's own handling whenever
+	// isExternal is true (a clipboard copy never sends anything into the
+	// lane's own tmux session at all).
+	sentAt time.Time
 	// closed is true when the comment posted AND the issue closed in this
 	// same call - Update removes the row on this tick.
 	closed bool
@@ -2720,7 +2787,9 @@ func (m *home) selectedSessionInfo(now time.Time) *ui.SessionInfo {
 		if !ok {
 			return nil
 		}
-		tail, err := m.laneTailCache.Get(path, sessionMaxTurns, now)
+		// sentAt (item 5) - same lookup as the feed-tick loop above, keyed
+		// by the selected instance's own Title.
+		tail, err := m.laneTailCache.Get(path, sessionMaxTurns, now, m.laneSentAt[selected.Title])
 		if err != nil {
 			return nil
 		}
@@ -2747,7 +2816,9 @@ func (m *home) selectedSessionInfo(now time.Time) *ui.SessionInfo {
 	}
 
 	if ext, ok := m.list.GetSelectedExternalLane(); ok {
-		tail, err := m.laneTailCache.Get(ext.TranscriptPath, sessionMaxTurns, now)
+		// sentAt is always the zero value here too (item 5) - see the
+		// external-lane loop's own comment above, same reason.
+		tail, err := m.laneTailCache.Get(ext.TranscriptPath, sessionMaxTurns, now, time.Time{})
 		if err != nil {
 			return nil
 		}
@@ -2849,6 +2920,17 @@ func (m *home) setStatus(text string) tea.Cmd {
 	}
 }
 
+// recordSentAt records lane's own send instant for item 5's sentAt bridge
+// (laneSentAt's own doc comment) - called only from composerResultMsg's
+// handling in Update, the main event loop, never from a dispatched tea.Cmd
+// goroutine.
+func (m *home) recordSentAt(lane string, at time.Time) {
+	if m.laneSentAt == nil {
+		m.laneSentAt = make(map[string]time.Time)
+	}
+	m.laneSentAt[lane] = at
+}
+
 // sendComposerCmd delivers text to lane in the background and reports the
 // result as a composerResultMsg the composer's own foot then shows: for a
 // tracked instance, SendPrompt followed by a pane capture to confirm the
@@ -2902,7 +2984,7 @@ func (m *home) deliverToLane(lane string, isExternal bool, text string) deliverR
 func (m *home) sendComposerCmd(lane string, isExternal bool, text string) tea.Cmd {
 	return func() tea.Msg {
 		r := m.deliverToLane(lane, isExternal, text)
-		return composerResultMsg{result: r.result, err: r.err}
+		return composerResultMsg{result: r.result, err: r.err, lane: lane, isExternal: isExternal, sentAt: r.at}
 	}
 }
 
@@ -2980,6 +3062,7 @@ func (m *home) sendAnswerCmd(issue int, lane string, isExternal bool, text strin
 				sendResult:  prefix,
 				lane:        lane,
 				isExternal:  isExternal,
+				sentAt:      r.at,
 			}
 		}
 		if err := m.boardCache.CloseIssue(issue); err != nil {
@@ -2991,13 +3074,17 @@ func (m *home) sendAnswerCmd(issue int, lane string, isExternal bool, text strin
 				sendResult:   prefix,
 				lane:         lane,
 				isExternal:   isExternal,
+				sentAt:       r.at,
 			}
 		}
 		return composerResultMsg{
-			result:   closedFooter(issue, lane, isExternal),
-			issue:    issue,
-			answered: true,
-			closed:   true,
+			result:     closedFooter(issue, lane, isExternal),
+			issue:      issue,
+			answered:   true,
+			closed:     true,
+			lane:       lane,
+			isExternal: isExternal,
+			sentAt:     r.at,
 		}
 	}
 }
@@ -3022,7 +3109,7 @@ func (m *home) sendBankCmd(lane string, isExternal bool, text, dir string) tea.C
 			prefix = copiedIntoLanePrefix(lane)
 		}
 		bankSent := fmt.Sprintf("%s · watching for CONTINUATION-*.md", prefix)
-		return composerResultMsg{result: bankSent, bank: true, bankDir: dir, bankAt: r.at}
+		return composerResultMsg{result: bankSent, bank: true, bankDir: dir, bankAt: r.at, lane: lane, isExternal: isExternal, sentAt: r.at}
 	}
 }
 
@@ -3339,6 +3426,7 @@ func (m *home) View() tea.View {
 	if m.splashModel != nil {
 		v := tea.NewView(m.splashModel.View())
 		v.AltScreen = true
+		v.WindowTitle = m.windowTitle
 		return v
 	}
 
@@ -3402,6 +3490,13 @@ func (m *home) View() tea.View {
 	// v1's tea.WithAltScreen() / tea.WithMouseCellMotion() program options -
 	// v2 declares them per-View instead (see Run above).
 	v.AltScreen = true
+	// Item 3 (bell + title count): updateAttention (app/attention.go)
+	// computes this once per feedTickMsg tick; View() just hands it through
+	// on every render, since tea.View.WindowTitle is the only place
+	// bubbletea v2 reads a window title from (verified at
+	// charm.land/bubbletea/v2@v2.0.9/tea.go and cursed_renderer.go - there
+	// is no separate SetWindowTitle command in this version).
+	v.WindowTitle = m.windowTitle
 	// Mouse capture is OFF (slice 22, PART A - the owner's own complaint:
 	// "cant copy paste from the session"). Finding: the mouse wheel scroll
 	// case (tea.MouseWheelMsg, ~line 623) was the ONLY consumer of mouse

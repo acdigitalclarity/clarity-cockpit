@@ -171,7 +171,28 @@ type SessionPane struct {
 	// navigation those keys otherwise drive.
 	pickerActive bool
 	pickerIdx    int
+
+	// awayViewLane/awayViewSince track how long the CURRENTLY selected lane
+	// has been continuously drawn on THIS tab (item 4, SINCE YOU WERE AWAY -
+	// cockpit-pane modalities research, 3 Sep): String() only runs while the
+	// Session tab is the active one (ui/tabbed_window.go's own String()
+	// switches on activeTab), so a run of String() calls on the same lane is
+	// the closest signal this file can read for "the owner is looking at
+	// it" without a dedicated activity message from app.go. awaySeenThrough
+	// is, per lane, the away_summary timestamp already viewed long enough to
+	// count as read (awaySummarySeenAfter) - "the owner's last look at that
+	// lane" the brief names; a lane never seen this process has no entry, so
+	// any away_summary at all is newer than the zero value and shows once.
+	awayViewLane    string
+	awayViewSince   time.Time
+	awaySeenThrough map[string]time.Time
 }
+
+// awaySummarySeenAfter is how long the owner must have the Session tab open
+// on a lane before its away_summary line counts as read and disappears -
+// the brief's own "it disappears once the owner views the lane for more
+// than three seconds".
+const awaySummarySeenAfter = 3 * time.Second
 
 // pad is the reading layout's own left/right inset inside the pane's
 // received width - 1 column each side at the wide (>= sessionWideMinWidth)
@@ -324,7 +345,10 @@ func (s *SessionPane) TickSpinner() {
 
 // fixedTopRows is the header/rule/divider row cost above the turns region -
 // 3 rows normally (two header lines, one rule), plus the "⋯ earlier in this
-// session" divider when the tail was cut.
+// session" divider when the tail was cut, plus the since-you-were-away line
+// (item 4) when it is currently showing - trackAwayView must already have
+// run for this call (String() runs it before turnsAreaHeight/fixedTopRows,
+// never here) so the two never disagree about whether that line renders.
 func (s *SessionPane) fixedTopRows() int {
 	if s.info == nil {
 		return 0
@@ -333,7 +357,77 @@ func (s *SessionPane) fixedTopRows() int {
 	if s.info.Tail.Truncated {
 		rows++
 	}
+	if _, ok := s.awaySummaryVisible(); ok {
+		rows++
+	}
 	return rows
+}
+
+// trackAwayView advances item 4's own "how long has the owner been looking
+// at this lane" clock - called once at the top of every String() (the only
+// place this pane is actually drawn while its tab is active), before
+// fixedTopRows/turnsAreaHeight read the result, so a transition into "seen"
+// takes effect on the SAME render that crosses the 3-second mark. Reusing
+// the same lane, tick after tick, advances the clock; switching to a
+// different lane restarts it.
+func (s *SessionPane) trackAwayView() {
+	lane := s.info.Lane
+	now := s.info.Now
+	if lane != s.awayViewLane {
+		s.awayViewLane = lane
+		s.awayViewSince = now
+		return
+	}
+	if s.awayViewSince.IsZero() || now.Sub(s.awayViewSince) < awaySummarySeenAfter {
+		return
+	}
+	at := s.info.Tail.AwaySummary.At
+	if at.IsZero() {
+		return
+	}
+	if s.awaySeenThrough == nil {
+		s.awaySeenThrough = make(map[string]time.Time)
+	}
+	if at.After(s.awaySeenThrough[lane]) {
+		s.awaySeenThrough[lane] = at
+	}
+}
+
+// awaySummaryVisible reports the selected lane's own away_summary and
+// whether it should currently render: a summary exists AND is newer than
+// whatever this lane's own awaySeenThrough entry holds (the zero value,
+// "never looked", when there is none yet - the brief's own "newer than the
+// owner's last look").
+func (s *SessionPane) awaySummaryVisible() (clarity.AwaySummary, bool) {
+	as := s.info.Tail.AwaySummary
+	if as.At.IsZero() {
+		return as, false
+	}
+	return as, as.At.After(s.awaySeenThrough[s.info.Lane])
+}
+
+// renderAwaySummaryLine draws item 4's own "since you were away · <summary>"
+// line - the label in the accent (sessionClaudeStyle, the same teal every
+// other speaker tag in this file uses), the summary text muted and
+// truncated to whatever measure remains after the label. ok is false (and
+// the returned string empty) when nothing should show, mirroring
+// renderEarlierLine's own presence test.
+func (s *SessionPane) renderAwaySummaryLine() (string, bool) {
+	as, ok := s.awaySummaryVisible()
+	if !ok {
+		return "", false
+	}
+	cw := s.contentWidth()
+	label := "since you were away"
+	sep := " · "
+	textWidth := cw - ansi.StringWidth(label) - ansi.StringWidth(sep)
+	if textWidth < 1 {
+		textWidth = 1
+	}
+	line := sessionClaudeStyle.Render(label) +
+		sessionMutedStyle.Render(sep) +
+		sessionMutedStyle.Render(ansiTruncateRow(as.Text, textWidth))
+	return line, true
 }
 
 // turnsAreaHeight is the remaining budget for the scrollable turns region,
@@ -578,14 +672,25 @@ func (s *SessionPane) String() string {
 		// placeholder line, per DECISIONS.md's own "no placeholder text"
 		// rule) - only its own foot rows now make room for the composer
 		// whenever it has something to show.
+		// Nothing selected: item 4's own "how long has the owner been
+		// looking" clock has nothing to run on either - reset so a later
+		// reselect of the SAME lane restarts the 3-second count rather than
+		// resuming one left over from before the gap.
+		s.awayViewLane = ""
+		s.awayViewSince = time.Time{}
 		if s.composer.IsOpen() || s.composer.HasResult() {
 			return s.renderRestingWithComposer()
 		}
 		return s.renderResting()
 	}
+	s.trackAwayView()
 
 	lines := make([]string, 0, s.height)
-	lines = append(lines, s.renderHeaderLine1(), s.renderHeaderLine2(), s.rule())
+	lines = append(lines, s.renderHeaderLine1(), s.renderHeaderLine2())
+	if line, ok := s.renderAwaySummaryLine(); ok {
+		lines = append(lines, line)
+	}
+	lines = append(lines, s.rule())
 	if s.info.Tail.Truncated {
 		lines = append(lines, s.renderEarlierLine())
 	}
@@ -888,6 +993,15 @@ func (s *SessionPane) renderStateLine() string {
 
 	if t.State == clarity.StateStalled {
 		return sessionTextStyle.Render(fmt.Sprintf("%s %s · stalled: open turn, last write %s ago", g, t.State, minutesAgo(t.LastWrite, s.info.Now)))
+	}
+
+	// Item 5 (WAITING HELD): a fresh transition out of "waiting on you" - an
+	// owner turn or a cockpit send answering a held close - shows "answered
+	// N min ago" in place of the usual "turn closed hh:mm:ss" clause while
+	// it is under 30 minutes old (the brief's own words); past that it falls
+	// through to the ordinary clause below, same as any other idle read.
+	if !t.AnsweredAt.IsZero() && s.info.Now.Sub(t.AnsweredAt) < 30*time.Minute {
+		return sessionTextStyle.Render(fmt.Sprintf("%s %s · answered %s ago", g, t.State, minutesAgo(t.AnsweredAt, s.info.Now)))
 	}
 
 	trailing := "nothing waiting on you"

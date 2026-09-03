@@ -153,8 +153,16 @@ func TestDown_WalksDrawnOrder(t *testing.T) {
 
 	titles := []string{"row-u1", "row-u2", "row-u3", "row-u4", "row-build-night", "row-p2p"}
 	drawnOrder := drawnRowOrder(t, l.String(), titles)
-	require.Equal(t, []string{"row-build-night", "row-p2p", "row-u1", "row-u2", "row-u3", "row-u4"}, drawnOrder,
-		"named modality groups draw above the no-modality catch-all")
+	// Item 2 (slice 17, cockpit-pane modalities research) sorts WITHIN each
+	// group by attention; every catch-all row here shares the same idle
+	// state, so the tiebreak (last turn newest first) is what actually
+	// orders them - row-u4 (9:03) newest down to row-u1 (9:00) oldest,
+	// reversing this fixture's own store order from before item 2 landed.
+	// The named-groups-above-the-catch-all shape this test exists to prove
+	// is untouched: build-night and p2p, each alone in their own group,
+	// keep their own place either way.
+	require.Equal(t, []string{"row-build-night", "row-p2p", "row-u4", "row-u3", "row-u2", "row-u1"}, drawnOrder,
+		"named modality groups draw above the no-modality catch-all, attention-sorted within it")
 
 	l.SelectInstance(buildNight)
 

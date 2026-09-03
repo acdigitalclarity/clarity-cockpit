@@ -93,6 +93,13 @@ type Instance struct {
 	laneState    string
 	laneLastTurn time.Time
 	laneStateOK  bool
+	// laneAnsweredAt caches item 5's own WAITING HELD transition instant
+	// (see clarity.LaneTail.AnsweredAt's own doc comment) - set alongside
+	// the three fields above on the same feed tick, read by the row's own
+	// "ans Nm" abbreviation (ui/list.go) and the Session pane's own
+	// "answered N min ago" state line. Zero when the last tick's own
+	// classification carried none.
+	laneAnsweredAt time.Time
 
 	// selectedBranch is the existing branch to start on (empty = new branch from HEAD)
 	selectedBranch string
@@ -853,6 +860,22 @@ func (i *Instance) SetLaneState(state string, lastTurn time.Time, ok bool) {
 // the first feed tick has computed it for this instance.
 func (i *Instance) GetLaneState() (state string, lastTurn time.Time, ok bool) {
 	return i.laneState, i.laneLastTurn, i.laneStateOK
+}
+
+// SetAnsweredAt caches item 5's own WAITING HELD transition instant. Should
+// be called from the main event loop only, same contract as SetLaneState -
+// a separate pair of accessors rather than extra return values on
+// SetLaneState/GetLaneState, so every existing caller of those two (the
+// main event loop and every test across the app/ui packages) stays
+// untouched.
+func (i *Instance) SetAnsweredAt(at time.Time) {
+	i.laneAnsweredAt = at
+}
+
+// GetAnsweredAt returns the cached WAITING HELD transition instant - the
+// zero value when the last feed tick's own classification carried none.
+func (i *Instance) GetAnsweredAt() time.Time {
+	return i.laneAnsweredAt
 }
 
 // SetNeedsKey caches whether this instance's own tmux pane last sampled a

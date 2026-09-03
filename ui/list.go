@@ -222,6 +222,37 @@ const lanePctFieldWidth = len("100%")
 // laneTimeWidth is "15:04" - the last-turn time, local, hours:minutes.
 const laneTimeWidth = len("15:04")
 
+// laneAnsweredCellMaxAge caps item 5's own row abbreviation ("ans Nm",
+// WAITING HELD, cockpit-pane modalities research) to the SAME 30-minute
+// window the Session pane's own "answered N min ago" line uses
+// (renderStateLine, ui/session.go) - past this the row falls back to the
+// ordinary last-turn HH:MM time.
+const laneAnsweredCellMaxAge = 30 * time.Minute
+
+// laneAnsweredCellText is item 5's own row abbreviation - "ans Nm", N
+// floored to a minimum of 1 the same way minutesAgo (ui/session.go) floors
+// the Session pane's own longer phrase, so a transition seconds old never
+// reads "ans 0m". "" (the caller falls back to the ordinary HH:MM time)
+// when answeredAt is zero or has aged past the 30-minute window. Reads the
+// wall clock directly - the row redraws on every tick regardless, so a
+// live read here is never stale between redraws, only ever as fresh as the
+// last one, the same way the Session pane's own s.info.Now is refreshed
+// every tick rather than cached once.
+func laneAnsweredCellText(answeredAt time.Time) string {
+	if answeredAt.IsZero() {
+		return ""
+	}
+	age := time.Since(answeredAt)
+	if age < 0 || age >= laneAnsweredCellMaxAge {
+		return ""
+	}
+	mins := int(age.Minutes())
+	if mins < 1 {
+		mins = 1
+	}
+	return fmt.Sprintf("ans %dm", mins)
+}
+
 // laneShowTimeMinWidth is THE RULE's own second collapse point, distinct
 // from app.go's collapsePreviewBelowWidth (which drops the state WORD): a
 // row-inner width under this many columns drops the last-turn TIME entirely
@@ -311,8 +342,18 @@ func lanePctField(pct int, ok bool) string {
 // requirement. Every segment carries rowBg/rowFg forward explicitly (the
 // same technique laneRowMarker and laneRowFrame below use for the rest of
 // the row) so the glyph's own state colour does not reset the row's
-// selected-highlight background for the characters after it.
-func laneRowSuffix(rowBg, rowFg color.Color, tag string, showTag bool, pct int, fillOK bool, state string, lastTurn time.Time, turnOK bool, showWord, showTime bool) string {
+// selected-highlight background for the characters after it. answeredAt is
+// item 5's own WAITING HELD transition instant (LaneTail.AnsweredAt) - when
+// it is set and under laneAnsweredCellMaxAge old, the word and time
+// segments are replaced by ONE merged "ans Nm" segment occupying their
+// COMBINED reserved width (never a wider row): growing laneTimeWidth itself
+// to fit "ans 29m" (its own widest render) was tried and rejected - it
+// shifts laneShowTagMinWidth's own mockup-locked threshold
+// (FRONTDOOR-MOCKUP-164x45.md's tag column boundary sits exactly at that
+// width today), where borrowing the word segment's own 8 columns (1 +
+// laneStateWordWidth) leaves 14 total against "ans Nm"'s own 7-character
+// ceiling - comfortable room, no drift anywhere else.
+func laneRowSuffix(rowBg, rowFg color.Color, tag string, showTag bool, pct int, fillOK bool, state string, lastTurn time.Time, answeredAt time.Time, turnOK bool, showWord, showTime bool) string {
 	plain := lipgloss.NewStyle().Background(rowBg).Foreground(rowFg)
 	glyph, glyphStyle := laneStateGlyph(state)
 	glyphStyle = glyphStyle.Background(rowBg)
@@ -332,20 +373,31 @@ func laneRowSuffix(rowBg, rowFg color.Color, tag string, showTag bool, pct int, 
 
 	pctSeg := plain.Render(lanePctField(pct, fillOK))
 
-	var wordSeg string
-	if showWord {
-		word := plain.Foreground(glyphStyle.GetForeground()).
-			Render(runewidth.FillRight(laneStateDisplayWord(state), laneStateWordWidth))
-		wordSeg = plain.Render(" ") + word
-	}
-
-	var timeSeg string
-	if showTime {
-		timeText := strings.Repeat(" ", laneTimeWidth)
-		if turnOK {
-			timeText = lastTurn.Local().Format("15:04")
+	var wordSeg, timeSeg string
+	answeredText := laneAnsweredCellText(answeredAt)
+	if answeredText != "" && showWord && showTime {
+		// reserved is the EXACT same total width the ordinary word+time
+		// pair below would occupy (their own leading gap spaces included:
+		// 1+laneStateWordWidth for the word, 1+laneTimeWidth for the time) -
+		// a single leading space then the abbreviation, left-justified and
+		// padded out to fill every remaining column, so laneSuffixWidth's
+		// own total never drifts regardless of which branch fires.
+		reserved := (1 + laneStateWordWidth) + (1 + laneTimeWidth)
+		combined := " " + runewidth.FillRight(answeredText, reserved-1)
+		timeSeg = plain.Foreground(glyphStyle.GetForeground()).Render(combined)
+	} else {
+		if showWord {
+			word := plain.Foreground(glyphStyle.GetForeground()).
+				Render(runewidth.FillRight(laneStateDisplayWord(state), laneStateWordWidth))
+			wordSeg = plain.Render(" ") + word
 		}
-		timeSeg = plain.Render(" ") + plain.Render(timeText)
+		if showTime {
+			timeText := strings.Repeat(" ", laneTimeWidth)
+			if turnOK {
+				timeText = lastTurn.Local().Format("15:04")
+			}
+			timeSeg = plain.Render(" ") + plain.Render(timeText)
+		}
 	}
 
 	// Every literal separator space between segments is rendered through
@@ -805,7 +857,7 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, h
 		// real state underneath).
 		state = clarity.StateNeedsKey
 	}
-	suffix := laneRowSuffix(rowBg, rowFg, i.Account(), showTag, pct, fillOK, state, lastTurn, turnOK, showWord, laneShowTime(rowInner))
+	suffix := laneRowSuffix(rowBg, rowFg, i.Account(), showTag, pct, fillOK, state, lastTurn, i.GetAnsweredAt(), turnOK, showWord, laneShowTime(rowInner))
 
 	content := nameStyle.Render(base) + branchStyle.Render(branchSuffix) + plain.Render(pad) + suffix
 	return laneRowFrame(rowBg, rowFg, selected, ansiTruncateRow(content, rowInner))
@@ -906,7 +958,76 @@ func groupLanesByModality(items []*session.Instance, external []clarity.External
 		}
 		groups[g].externalIdx = append(groups[g].externalIdx, i)
 	}
+
+	// Item 2 (cockpit-pane modalities research, slice 17): within EACH
+	// group, sort tracked rows and external rows by attention - the group
+	// order itself (named groups in first-seen order, catch-all last) and
+	// the tracked/external split within a group are both untouched, "the
+	// modality groups and the external heading keep their order". This is
+	// the ONE place the drawn order is decided - drawnItemOrder/
+	// drawnExternalOrder below both just read groups' own itemIdx/
+	// externalIdx back out in order, so there is no second ordering for the
+	// two to ever disagree about.
+	for i := range groups {
+		g := &groups[i]
+		sort.SliceStable(g.itemIdx, func(a, b int) bool {
+			ia, ib := items[g.itemIdx[a]], items[g.itemIdx[b]]
+			sa, la, oka := ia.GetLaneState()
+			sb, lb, okb := ib.GetLaneState()
+			return newLaneAttentionKey(sa, la, oka, ia.NeedsKey()).less(newLaneAttentionKey(sb, lb, okb, ib.NeedsKey()))
+		})
+		sort.SliceStable(g.externalIdx, func(a, b int) bool {
+			ea, eb := external[g.externalIdx[a]], external[g.externalIdx[b]]
+			return newLaneAttentionKey(ea.State, ea.LastTurn, ea.StateOK, false).less(newLaneAttentionKey(eb.State, eb.LastTurn, eb.StateOK, false))
+		})
+	}
 	return groups
+}
+
+// laneAttentionKey is one row's own sort key for item 2's attention order:
+// waiting on you, stalled, working, idle (the brief's own list, rank 0-3);
+// a needs-a-key row ranks ahead of all four (-1), the same "ahead of every
+// other word" convention laneStateNeedsKeyStyle's own comment already gives
+// the glyph - live-permission-prompt is always the single most urgent thing
+// a row can say. Ties (equal rank) break by last turn NEWEST first; a row
+// with no resolved last-turn time (oka/StateOK false) sorts as though it
+// were the oldest possible, last within its rank.
+type laneAttentionKey struct {
+	rank int
+	last time.Time
+}
+
+func newLaneAttentionKey(state string, lastTurn time.Time, ok, needsKey bool) laneAttentionKey {
+	k := laneAttentionKey{rank: laneAttentionRank(state, needsKey)}
+	if ok {
+		k.last = lastTurn
+	}
+	return k
+}
+
+func laneAttentionRank(state string, needsKey bool) int {
+	if needsKey {
+		return -1
+	}
+	switch state {
+	case clarity.StateWaitingYou:
+		return 0
+	case clarity.StateStalled:
+		return 1
+	case clarity.StateWorking:
+		return 2
+	case clarity.StateIdle:
+		return 3
+	default:
+		return 4
+	}
+}
+
+func (k laneAttentionKey) less(other laneAttentionKey) bool {
+	if k.rank != other.rank {
+		return k.rank < other.rank
+	}
+	return k.last.After(other.last)
 }
 
 // renderExternalRow renders one external-lane row (message-only: no diff
@@ -933,7 +1054,7 @@ func (l *List) renderExternalRow(lane clarity.ExternalLane, selected, showWord, 
 	nameCol := l.laneNameColWidth(showWord)
 	name := runewidth.FillRight(ansiTruncateRow(lane.Name, nameCol), nameCol)
 	suffix := laneRowSuffix(rowBg, rowFg, externalRowTag(lane), showTag,
-		lane.Fill.Pct, lane.FillOK, lane.State, lane.LastTurn, lane.StateOK, showWord, laneShowTime(innerWidth))
+		lane.Fill.Pct, lane.FillOK, lane.State, lane.LastTurn, lane.AnsweredAt, lane.StateOK, showWord, laneShowTime(innerWidth))
 	line := nameStyle.Render(name) + suffix
 	content := ansiTruncateRow(line, innerWidth)
 	return laneRowFrame(rowBg, rowFg, selected, content)
@@ -1310,6 +1431,24 @@ func (l *List) drawnItemOrder() []int {
 	return order
 }
 
+// drawnExternalOrder is drawnItemOrder's own external-lane counterpart
+// (item 2, "the drawn order stays the single navigation order: extend
+// drawnItemOrder, do not add a second ordering") - the l.external store
+// indices in the EXACT order String() draws their rows, reading the SAME
+// groupLanesByModality pass drawnItemOrder itself reads (that one function
+// is where the grouping and, since item 2, the attention sort both actually
+// happen - this is not a second ordering, just the other half of the one
+// groups slice it already returns). Down/Up below walk this the same way
+// they already walked drawnItemOrder for tracked rows.
+func (l *List) drawnExternalOrder() []int {
+	groups := groupLanesByModality(l.items, l.external)
+	order := make([]int, 0, len(l.external))
+	for _, g := range groups {
+		order = append(order, g.externalIdx...)
+	}
+	return order
+}
+
 // indexOfInt returns the position of v in s, or -1 if v is not present.
 func indexOfInt(s []int, v int) int {
 	for i, x := range s {
@@ -1371,6 +1510,16 @@ func (l *List) Down() {
 			l.selectedIdx = order[pos+1]
 			return
 		}
+	} else if g == 2 {
+		// The external group walks its own drawn order too (item 2) - the
+		// same board #315 reasoning: a grouped/sorted render and a raw
+		// store-index walk can disagree the instant more than one modality
+		// group carries external rows.
+		order := l.drawnExternalOrder()
+		if pos := indexOfInt(order, l.selectedIdx); pos >= 0 && pos < len(order)-1 {
+			l.selectedIdx = order[pos+1]
+			return
+		}
 	} else if l.selectedIdx < lens[g]-1 {
 		l.selectedIdx++
 		return
@@ -1380,9 +1529,12 @@ func (l *List) Down() {
 		if lens[next] == 0 {
 			continue
 		}
-		if next == 1 {
+		switch next {
+		case 1:
 			l.setGroup(next, l.drawnItemOrder()[0])
-		} else {
+		case 2:
+			l.setGroup(next, l.drawnExternalOrder()[0])
+		default:
 			l.setGroup(next, 0)
 		}
 		return
@@ -1452,6 +1604,13 @@ func (l *List) Up() {
 			l.selectedIdx = order[pos-1]
 			return
 		}
+	} else if g == 2 {
+		// Same drawnExternalOrder walk as Down, in reverse (item 2).
+		order := l.drawnExternalOrder()
+		if pos := indexOfInt(order, l.selectedIdx); pos > 0 {
+			l.selectedIdx = order[pos-1]
+			return
+		}
 	} else if l.selectedIdx > 0 {
 		l.selectedIdx--
 		return
@@ -1461,10 +1620,14 @@ func (l *List) Up() {
 		if lens[prev] == 0 {
 			continue
 		}
-		if prev == 1 {
+		switch prev {
+		case 1:
 			order := l.drawnItemOrder()
 			l.setGroup(prev, order[len(order)-1])
-		} else {
+		case 2:
+			order := l.drawnExternalOrder()
+			l.setGroup(prev, order[len(order)-1])
+		default:
 			l.setGroup(prev, lens[prev]-1)
 		}
 		return

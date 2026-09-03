@@ -110,6 +110,34 @@ type LaneTail struct {
 	// earlier in this session" divider (design/cockpit-pane/DECISIONS.md
 	// slice 3) reads this rather than re-deriving it from Turns/Messages.
 	Truncated bool
+
+	// AnsweredAt is set (item 5, WAITING HELD) the instant ClassifyState
+	// resolves a closed, no-pending-agent turn's own "waiting on you" into
+	// StateIdle - either because a newer owner turn now sits in the
+	// transcript, or because the cockpit itself sent into this lane after
+	// the close (ClassifyState's own sentAt argument). Zero when no such
+	// transition has happened (including every other state). The Session
+	// pane's state line reads this to show "answered N min ago" in place of
+	// the usual "turn closed hh:mm:ss" clause while it is under 30 minutes
+	// old (renderStateLine, ui/session.go).
+	AnsweredAt time.Time
+
+	// AwaySummary is the newest system/away_summary record still inside this
+	// read's own tail window (item 4, SINCE YOU WERE AWAY) - the harness's
+	// own "Goal ... Next ..." recap, previously discarded by
+	// lastTimestampedRecord's anchor walk along with every other non-
+	// turn_duration system record. Zero (At.IsZero()) when the window holds
+	// none.
+	AwaySummary AwaySummary
+}
+
+// AwaySummary is one lane's own newest away_summary record: its free-text
+// content (confirmed against live transcripts to already read "Goal ...
+// Next ..." prose, never separate structured fields - see latestAwaySummary's
+// own doc comment) and the timestamp it was written.
+type AwaySummary struct {
+	Text string
+	At   time.Time
 }
 
 // rawRecord is the union of the transcript record fields tail.go relies on,
@@ -127,7 +155,16 @@ type rawRecord struct {
 	DurationMs                  int64       `json:"durationMs"`
 	MessageCount                int         `json:"messageCount"`
 	PendingBackgroundAgentCount int         `json:"pendingBackgroundAgentCount"`
-	Message                     *rawMessage `json:"message"`
+	// Content is the TOP-LEVEL "content" field a system record (away_summary,
+	// local_command, queue-operation, bridge_status) carries as a plain
+	// string - a different field from rawMessage.Content below, which lives
+	// under "message" and is a plain string only for an owner turn. Confirmed
+	// against five live away_summary records across three transcripts before
+	// this field was added (item 4's own leg report quotes them): every
+	// sighting had "content" as a bare JSON string, never an object or array,
+	// so a plain Go string decodes it directly with no further parsing.
+	Content string      `json:"content"`
+	Message *rawMessage `json:"message"`
 }
 
 // rawMessage mirrors the .message block on assistant/user records.
@@ -244,7 +281,20 @@ func TranscriptForLane(lane string) (string, error) {
 // straddling the cut and is discarded before parsing, never counted as
 // malformed. Any other line that fails to parse as JSON is skipped and
 // counted in MalformedLines. maxTurns <= 0 uses DefaultTailTurns.
-func ReadLaneTail(transcriptPath string, maxBytes int, maxTurns int, now time.Time) (LaneTail, error) {
+//
+// sentAt is item 5's own "the cockpit sent into that lane" signal - the
+// last time THIS process sent a prompt into this lane, if any, kept by the
+// caller (never derived from the transcript itself, since a cockpit-sent
+// prompt earns no immediate write there). Variadic and optional so every
+// existing call site (main.go's lane-tail CLI, tail_cache.go's cache
+// refresh, this file's own tests) keeps compiling and reading exactly as
+// before with no sent-time to report; a caller that tracks per-lane send
+// times passes exactly one.
+func ReadLaneTail(transcriptPath string, maxBytes int, maxTurns int, now time.Time, sentAt ...time.Time) (LaneTail, error) {
+	var sent time.Time
+	if len(sentAt) > 0 {
+		sent = sentAt[0]
+	}
 	if maxBytes <= 0 {
 		maxBytes = DefaultTailMaxBytes
 	}
@@ -296,7 +346,7 @@ func ReadLaneTail(transcriptPath string, maxBytes int, maxTurns int, now time.Ti
 		return LaneTail{}, err
 	}
 
-	state := ClassifyState(records, now)
+	state := ClassifyState(records, now, sent)
 	mode, model, messages := deriveMeta(records)
 	turns, turnsTrimmed := buildTurns(records, maxTurns)
 
@@ -315,6 +365,8 @@ func ReadLaneTail(transcriptPath string, maxBytes int, maxTurns int, now time.Ti
 		Turns:          turns,
 		MalformedLines: malformed,
 		Truncated:      truncated || turnsTrimmed,
+		AnsweredAt:     state.AnsweredAt,
+		AwaySummary:    latestAwaySummary(records),
 	}, nil
 }
 
@@ -326,23 +378,38 @@ type stateResult struct {
 	OpenTurn      bool
 	PendingAgents int
 	TurnDuration  time.Duration
+
+	// AnsweredAt is set only on the two "waiting held, then answered"
+	// transitions item 5 adds - see LaneTail.AnsweredAt's own doc comment.
+	AnsweredAt time.Time
 }
 
 // ClassifyState applies the state rule ruled by the design leg (2 Sep,
-// DECISIONS.md slice 1): walk backwards past untimestampedBookkeepingTypes
-// to the last timestamped record. If it is type system/turn_duration the
-// turn is CLOSED: pendingBackgroundAgentCount > 0 and closed 10 minutes ago
-// or less -> working; pending > 0 and closed over 10 minutes ago -> stalled
-// (same age cap as the open-turn branch, so a closed turn with a pending
-// agent never reads working indefinitely); no pending agents and closed
-// under 30 minutes ago -> "waiting on you"; otherwise -> idle. Any other
-// record type is an OPEN turn: written within 10 minutes -> working; over
-// 10 minutes -> stalled.
-func ClassifyState(records []rawRecord, now time.Time) stateResult {
-	anchor, ok := lastTimestampedRecord(records)
+// DECISIONS.md slice 1), amended by item 5 (WAITING HELD, cockpit-pane
+// modalities research, 3 Sep): walk backwards past
+// untimestampedBookkeepingTypes to the last timestamped record. If it is
+// type system/turn_duration the turn is CLOSED: pendingBackgroundAgentCount
+// > 0 and closed 10 minutes ago or less -> working; pending > 0 and closed
+// over 10 minutes ago -> stalled (same age cap as the open-turn branch, so a
+// closed turn with a pending agent never reads working indefinitely); no
+// pending agents -> "waiting on you", HELD there by no time cap at all
+// (DEFECT, the old 30-minute decay: a lane that answered while the owner
+// was in a meeting read identical to one that finished and banked, DECISIONS.md
+// "Leaving and coming back") UNLESS sentAt (the cockpit's own last-send time
+// for this lane, the caller's to track) is newer than the close, in which
+// case it reads idle, answered by the cockpit send. Any other record type is
+// an OPEN turn: an owner-authored reply (not harness-tagged) whose own
+// immediately preceding anchor-eligible record was exactly that kind of
+// pending-free close also reads idle, answered - "a newer owner turn
+// appears in that transcript (he answered, from any surface)"; every other
+// open turn is unchanged: written within 10 minutes -> working; over 10
+// minutes -> stalled.
+func ClassifyState(records []rawRecord, now time.Time, sentAt time.Time) stateResult {
+	anchorIdx, ok := lastTimestampedRecordIndex(records)
 	if !ok {
 		return stateResult{State: StateIdle, Reason: "no timestamped record found in the tail window"}
 	}
+	anchor := records[anchorIdx]
 	anchorAt, err := parseTimestamp(anchor.Timestamp)
 	if err != nil {
 		return stateResult{State: StateIdle, Reason: "no timestamped record found in the tail window"}
@@ -375,19 +442,48 @@ func ClassifyState(records []rawRecord, now time.Time) stateResult {
 				PendingAgents: pending,
 				TurnDuration:  duration,
 			}
-		case age < 30*time.Minute:
+		case !sentAt.IsZero() && sentAt.After(anchorAt):
+			// Item 5's second trigger: the cockpit itself sent into this lane
+			// after the close, but the transcript has not caught up with a
+			// write reflecting it yet - waiting on you is answered, not by a
+			// transcript record but by the send the caller already knows
+			// about (sentAt), so it must not keep nagging until the
+			// transcript proves it independently.
+			return stateResult{
+				State:        StateIdle,
+				Reason:       fmt.Sprintf("answered %s ago (sent from the cockpit)", roundAge(now.Sub(sentAt))),
+				LastTurn:     anchorAt,
+				TurnDuration: duration,
+				AnsweredAt:   sentAt,
+			}
+		default:
+			// HELD: no time cap. A closed turn with no pending agents and no
+			// answer yet stays "waiting on you" no matter how old - the owner
+			// has not looked, and an elapsed clock is not evidence he has.
 			return stateResult{
 				State:        StateWaitingYou,
 				Reason:       fmt.Sprintf("turn closed %s ago, no pending agents", roundAge(age)),
 				LastTurn:     anchorAt,
 				TurnDuration: duration,
 			}
-		default:
-			return stateResult{
-				State:        StateIdle,
-				Reason:       fmt.Sprintf("turn closed %s ago", roundAge(age)),
-				LastTurn:     anchorAt,
-				TurnDuration: duration,
+		}
+	}
+
+	// OPEN branch: the anchor is not a closed turn_duration record. Item 5's
+	// first trigger - an owner-authored reply that itself follows a
+	// pending-free close - reads idle/answered rather than falling through
+	// to the ordinary working/stalled age split below, which would otherwise
+	// read the owner's OWN reply as though it were assistant activity.
+	if isOwnerAuthoredRecord(anchor) && anchorIdx > 0 {
+		if prevIdx, ok := lastTimestampedRecordIndex(records[:anchorIdx]); ok {
+			prev := records[prevIdx]
+			if prev.Type == "system" && prev.Subtype == "turn_duration" && prev.PendingBackgroundAgentCount == 0 {
+				return stateResult{
+					State:      StateIdle,
+					Reason:     fmt.Sprintf("answered %s ago", roundAge(age)),
+					LastTurn:   anchorAt,
+					AnsweredAt: anchorAt,
+				}
 			}
 		}
 	}
@@ -408,11 +504,27 @@ func ClassifyState(records []rawRecord, now time.Time) stateResult {
 	}
 }
 
-// lastTimestampedRecord walks records backward, skipping any record of an
-// untimestampedBookkeepingTypes type, a harness-tagged user record that is
-// not itself the very last record in the tail, or one that carries no
-// parseable timestamp - and returns the first (i.e. chronologically last)
-// one found.
+// isOwnerAuthoredRecord reports whether r is a genuine owner-typed message -
+// a "user" record whose message content is a plain string that is NOT one of
+// harnessRecordTags (isHarnessTaggedUserRecord's own negation, named
+// separately here since ClassifyState's own "a newer owner turn" rule reads
+// more plainly as a positive test).
+func isOwnerAuthoredRecord(r rawRecord) bool {
+	if r.Type != "user" || r.Message == nil {
+		return false
+	}
+	text, _, isString := parseContentItems(r.Message.Content)
+	return isString && !isHarnessTaggedText(text)
+}
+
+// lastTimestampedRecordIndex walks records backward, skipping any record of
+// an untimestampedBookkeepingTypes type, a harness-tagged user record that
+// is not itself the very last record in the tail, or one that carries no
+// parseable timestamp - and returns the POSITION of the first (i.e.
+// chronologically last) one found. Item 5's owner-turn transition needs the
+// anchor's position, not just its value, so it can search the slice
+// strictly before it (records[:anchorIdx]) for the record the owner's reply
+// is itself answering, using this exact same walk a second time.
 //
 // DEFECT 1's anchor choice: a harness-tagged user record (task-notification,
 // system-reminder, etc.) is skipped like any other bookkeeping record when
@@ -427,7 +539,7 @@ func ClassifyState(records []rawRecord, now time.Time) stateResult {
 // every earlier record is bookkeeping too, which is a worse answer than
 // treating the harness's own write to the transcript as evidence the lane
 // is live, even though that write never renders as a Turn.
-func lastTimestampedRecord(records []rawRecord) (rawRecord, bool) {
+func lastTimestampedRecordIndex(records []rawRecord) (int, bool) {
 	for i := len(records) - 1; i >= 0; i-- {
 		r := records[i]
 		if untimestampedBookkeepingTypes[r.Type] {
@@ -447,9 +559,9 @@ func lastTimestampedRecord(records []rawRecord) (rawRecord, bool) {
 		if _, err := parseTimestamp(r.Timestamp); err != nil {
 			continue
 		}
-		return r, true
+		return i, true
 	}
-	return rawRecord{}, false
+	return -1, false
 }
 
 // parseTimestamp parses a transcript record's timestamp field, which is
@@ -478,6 +590,28 @@ func roundAge(d time.Duration) string {
 		m := int(d.Minutes()) - h*60
 		return fmt.Sprintf("%dh%dm", h, m)
 	}
+}
+
+// latestAwaySummary scans the whole tail window (not just the
+// classification anchor - lastTimestampedRecordIndex skips every
+// away_summary record outright, item 4's own DEFECT) for the newest
+// system/away_summary record and returns its content and timestamp. Records
+// with an unparseable timestamp are skipped rather than aborting the scan,
+// so a single malformed away_summary can never hide an older, good one.
+// Zero (At.IsZero()) when the window holds none.
+func latestAwaySummary(records []rawRecord) AwaySummary {
+	for i := len(records) - 1; i >= 0; i-- {
+		r := records[i]
+		if r.Type != "system" || r.Subtype != "away_summary" {
+			continue
+		}
+		at, err := parseTimestamp(r.Timestamp)
+		if err != nil {
+			continue
+		}
+		return AwaySummary{Text: r.Content, At: at}
+	}
+	return AwaySummary{}
 }
 
 // deriveMeta scans the whole tail window (not just the classification
