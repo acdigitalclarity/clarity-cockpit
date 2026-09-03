@@ -192,19 +192,26 @@ func (t *TerminalPane) UpdateContent(target TerminalTarget) error {
 
 // updateTrackedLocked mirrors the selected TRACKED instance's own tmux
 // pane - the dormant PreviewPane's own capture path (ui/preview.go's
-// UpdateContent), not a separate term_ shell. Caller must hold t.mu.
+// UpdateContent), not a separate term_ shell - for as long as that pane has
+// a LIVE tmux session to mirror. A tracked instance with no live session
+// (paused, or one whose session died) has nothing to mirror, so it falls
+// through to the same term_<title> shell an external lane gets instead
+// (slice 8 rule 3): the splash resting frame is reserved for "nothing
+// selected", never "this row has no live session right now" - that used to
+// render here as a "Session is paused" fallback, wrong for a NoWorktree
+// instance (its own "Resume to use terminal" invited a worktree operation
+// that does not exist for it). Caller must hold t.mu.
 func (t *TerminalPane) updateTrackedLocked(instance *session.Instance) error {
 	if instance == nil {
 		t.setFallbackState("Select an instance to open a terminal")
 		return nil
 	}
-	if instance.Status == session.Paused {
-		t.setFallbackState("Session is paused. Resume to use terminal.")
-		return nil
-	}
 	if !instance.Started() {
 		t.setFallbackState("Instance is not started yet.")
 		return nil
+	}
+	if !instance.TmuxAlive() {
+		return t.updateExternalLocked(instance.Title, instance.Path)
 	}
 	if t.isScrolling {
 		// Full-history capture only happens lazily on entering scroll mode
@@ -457,7 +464,19 @@ func (t *TerminalPane) enterScrollModeLocked() error {
 		if t.target.Instance == nil {
 			return nil
 		}
-		content, err = t.target.Instance.PreviewFullHistory()
+		if t.target.Instance.TmuxAlive() {
+			content, err = t.target.Instance.PreviewFullHistory()
+		} else {
+			// No live session to mirror - this tracked row is showing its
+			// term_<title> shell instead (updateTrackedLocked above), so
+			// scroll mode must pull full history from THAT session, keyed
+			// by the same instance.Title.
+			s, ok := t.external[t.target.Instance.Title]
+			if !ok || s.tmuxSession == nil || !s.tmuxSession.DoesSessionExist() {
+				return nil
+			}
+			content, err = s.tmuxSession.CapturePaneContentWithOptions("-", "-")
+		}
 		if err != nil {
 			return fmt.Errorf("terminal pane: failed to capture full history: %w", err)
 		}

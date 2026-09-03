@@ -335,7 +335,10 @@ func (i *Instance) Start(firstTimeSetup bool) error {
 	return nil
 }
 
-// Kill terminates the instance and cleans up all resources
+// Kill terminates the instance and cleans up all resources. For a
+// NoWorktree instance i.gitWorktree is always nil (see NoWorktree), so the
+// git cleanup block below is naturally skipped - Kill removes the instance
+// and its tmux session only, never touching git (slice 8 rule 1).
 func (i *Instance) Kill() error {
 	if !i.started {
 		// If instance was never started, just return success
@@ -470,13 +473,31 @@ func (i *Instance) TmuxAlive() bool {
 	return i.tmuxSession.DoesSessionExist()
 }
 
+// pauseNoWorktree closes a NoWorktree instance's tmux session - there is no
+// git worktree to preserve (see Instance.NoWorktree), so Pause here never
+// touches git at all: it just stops tracking a live session. The lane
+// itself (its Path, on disk) is untouched either way.
+func (i *Instance) pauseNoWorktree() error {
+	if i.Status == Paused {
+		return fmt.Errorf("instance is already paused")
+	}
+	if i.tmuxSession != nil {
+		if err := i.tmuxSession.Close(); err != nil {
+			log.ErrorLog.Print(err)
+			return fmt.Errorf("failed to close tmux session: %w", err)
+		}
+	}
+	i.SetStatus(Paused)
+	return nil
+}
+
 // Pause stops the tmux session and removes the worktree, preserving the branch
 func (i *Instance) Pause() error {
 	if !i.started {
 		return fmt.Errorf("cannot pause instance that has not been started")
 	}
 	if i.NoWorktree {
-		return fmt.Errorf("cannot pause %q: it has no git worktree to preserve (clarity-attach instance)", i.Title)
+		return i.pauseNoWorktree()
 	}
 	if i.Status == Paused {
 		return fmt.Errorf("instance is already paused")
@@ -560,13 +581,35 @@ func (i *Instance) Pause() error {
 	return nil
 }
 
+// resumeNoWorktree creates (or reuses) a NoWorktree instance's tmux session
+// directly in its own Path - there is no git worktree to set up (see
+// Instance.NoWorktree). The caller (app.go's r key, slice 8 rule 2) owns
+// the state-based gate deciding whether resuming is safe to attempt at all
+// (never spin up a second Claude in a folder the owner's own terminal is
+// still driving) - this method itself always resumes when called.
+func (i *Instance) resumeNoWorktree() error {
+	if i.tmuxSession.DoesSessionExist() {
+		if err := i.tmuxSession.Restore(); err != nil {
+			log.ErrorLog.Print(err)
+			return fmt.Errorf("failed to restore existing session: %w", err)
+		}
+	} else {
+		if err := i.tmuxSession.Start(i.Path); err != nil {
+			log.ErrorLog.Print(err)
+			return fmt.Errorf("failed to start new session: %w", err)
+		}
+	}
+	i.SetStatus(Running)
+	return nil
+}
+
 // Resume recreates the worktree and restarts the tmux session
 func (i *Instance) Resume() error {
 	if !i.started {
 		return fmt.Errorf("cannot resume instance that has not been started")
 	}
 	if i.NoWorktree {
-		return fmt.Errorf("cannot resume %q: it has no git worktree (clarity-attach instance)", i.Title)
+		return i.resumeNoWorktree()
 	}
 	if i.Status != Paused {
 		return fmt.Errorf("can only resume paused instances")

@@ -1,13 +1,16 @@
 // Package app: this file tests slice 6 (Terminal tab wiring at the app
-// level - Enter's own row-kind branching) and slice 7 (the c copy / o open
-// folder keys) of design/cockpit-pane/DECISIONS.md.
+// level - Enter's own row-kind branching), slice 7 (the c copy / o open
+// folder keys) and slice 8 (attached/NoWorktree instances - Enter/r's own
+// honest handling, o's Path fallback) of design/cockpit-pane/DECISIONS.md.
 package app
 
 import (
 	"claude-squad/cmd"
 	"claude-squad/cmd/cmd_test"
 	"claude-squad/config"
+	"claude-squad/session"
 	"claude-squad/session/clarity"
+	"claude-squad/session/tmux"
 	"claude-squad/ui"
 	"context"
 	"fmt"
@@ -16,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
@@ -307,4 +311,130 @@ func TestKeyOpenFolder_NothingSelected_NoOp(t *testing.T) {
 	require.Nil(t, cmd)
 	require.False(t, ran, "no folder to open means no `open` command must run")
 	require.Empty(t, h.statusText)
+}
+
+// noWorktreeAppFixture builds a Started, Paused (no live session) NoWorktree
+// instance - the clarity-attach shape (main.go's clarityAttachCmd) - and
+// adds it as the sole tracked row in h.list, for the slice 8 tests below.
+// The returned *bool tracks the mocked tmux session's own existence, the
+// same shared-bool shape session/instance_test.go's sessionAwareCmdExec
+// uses, so Resume (rule 2's r gate) can be proven to actually start a
+// session rather than just flip Status.
+func noWorktreeAppFixture(t *testing.T, h *home, title string) (inst *session.Instance, exists *bool) {
+	t.Helper()
+	sessionExists := false
+	cmdExec := cmd_test.MockCmdExec{
+		RunFunc: func(cmd *exec.Cmd) error {
+			cmdStr := cmd.String()
+			if strings.Contains(cmdStr, "has-session") {
+				if sessionExists {
+					return nil
+				}
+				return fmt.Errorf("session does not exist")
+			}
+			if strings.Contains(cmdStr, "kill-session") {
+				sessionExists = false
+			}
+			return nil
+		},
+	}
+	ptyFactory := &termPtyFactory{t: t, sessionExists: &sessionExists}
+
+	inst, err := session.NewInstance(session.InstanceOptions{
+		Title:      title,
+		Path:       t.TempDir(),
+		Program:    "claude",
+		NoWorktree: true,
+	})
+	require.NoError(t, err)
+	inst.SetTmuxSession(tmux.NewTmuxSessionWithDeps(title, "claude", ptyFactory, cmdExec))
+	require.NoError(t, inst.Start(true))
+	require.NoError(t, inst.Pause())
+	require.False(t, inst.TmuxAlive(), "fixture must start with no live session, the clarity-attach-paused shape")
+
+	h.list.AddInstance(inst)()
+	return inst, &sessionExists
+}
+
+// TestKeyEnter_TrackedNoWorktreeInstance_NoSession_ShowsFooterLine is
+// slice 8 rule 2's own Enter test, seen failing against the pre-fix code
+// (which silently no-op'd): Enter on a tracked NoWorktree row with no live
+// session must show the "runs in your own terminal" footer, never a silent
+// no-op and never a resume prompt.
+func TestKeyEnter_TrackedNoWorktreeInstance_NoSession_ShowsFooterLine(t *testing.T) {
+	h := newComposerTestHome()
+	noWorktreeAppFixture(t, h, "scratchfix-attached")
+
+	pressGlobalKey(h, tea.KeyPressMsg{Code: tea.KeyEnter})
+
+	require.Equal(t, "this lane runs in your own terminal; tab to Terminal for a shell in its folder", h.statusText)
+}
+
+// TestKeyResume_NoWorktreeInstance_Idle_ResumesSession is slice 8 rule 2's
+// "allowed" branch: an idle transcript means the owner's own terminal
+// looks abandoned, so r is allowed to start a fresh session.
+func TestKeyResume_NoWorktreeInstance_Idle_ResumesSession(t *testing.T) {
+	h := newComposerTestHome()
+	inst, exists := noWorktreeAppFixture(t, h, "scratchfix-idle")
+	inst.SetLaneState(clarity.StateIdle, time.Now(), true)
+
+	pressGlobalKey(h, tea.KeyPressMsg{Code: 'r', Text: "r"})
+
+	require.True(t, *exists, "an idle lane's r must actually start a session")
+	require.Equal(t, session.Running, inst.Status)
+	require.Empty(t, h.statusText, "a successful resume shows no refusal footer")
+}
+
+// TestKeyResume_NoWorktreeInstance_Working_RefusesWithFooter is slice 8
+// rule 2's "refused" branch: a lane whose transcript reads working (still
+// live in the owner's own terminal) must never get a second session - r
+// shows the "nothing to resume" footer instead, and starts nothing.
+func TestKeyResume_NoWorktreeInstance_Working_RefusesWithFooter(t *testing.T) {
+	h := newComposerTestHome()
+	inst, exists := noWorktreeAppFixture(t, h, "scratchfix-working")
+	inst.SetLaneState(clarity.StateWorking, time.Now(), true)
+
+	pressGlobalKey(h, tea.KeyPressMsg{Code: 'r', Text: "r"})
+
+	require.False(t, *exists, "a working lane must never get a second session")
+	require.Equal(t, session.Paused, inst.Status)
+	require.Equal(t, "the lane is live in your own terminal; nothing to resume", h.statusText)
+}
+
+// TestKeyResume_NoWorktreeInstance_NoTranscriptYet_RefusesWithFooter is
+// rule 2's fail-closed default: no transcript read at all (GetLaneState's
+// own ok=false, before the first feed tick has run) refuses, the same as
+// an actively working lane - never assumed idle just because nothing has
+// been read yet.
+func TestKeyResume_NoWorktreeInstance_NoTranscriptYet_RefusesWithFooter(t *testing.T) {
+	h := newComposerTestHome()
+	_, exists := noWorktreeAppFixture(t, h, "scratchfix-no-transcript")
+
+	pressGlobalKey(h, tea.KeyPressMsg{Code: 'r', Text: "r"})
+
+	require.False(t, *exists)
+	require.Equal(t, "the lane is live in your own terminal; nothing to resume", h.statusText)
+}
+
+// TestKeyOpenFolder_TrackedNoWorktreeInstance_OpensItsPath is slice 8
+// rule 4's own o test, seen failing against the pre-fix code
+// (GetWorktreePath returns "" for a NoWorktree instance, so o silently did
+// nothing): o on a NoWorktree tracked row must open its own Path, falling
+// back off the (always-empty, for this instance) worktree path.
+func TestKeyOpenFolder_TrackedNoWorktreeInstance_OpensItsPath(t *testing.T) {
+	h := newComposerTestHome()
+	inst, _ := noWorktreeAppFixture(t, h, "scratchfix-openfolder")
+
+	var openedArgs []string
+	h.cmdExec = cmd_test.MockCmdExec{
+		RunFunc: func(cmd *exec.Cmd) error {
+			openedArgs = cmd.Args
+			return nil
+		},
+	}
+
+	h.handleOpenFolder()
+
+	require.Equal(t, []string{"open", inst.Path}, openedArgs)
+	require.Equal(t, "opened "+inst.Path, h.statusText)
 }

@@ -51,6 +51,7 @@ func (h helpTypeGeneral) toContent() string {
 		headerStyle.Render("Handoff:"),
 		keyStyle.Render("p")+descStyle.Render("         - Commit and push branch to github"),
 		keyStyle.Render("r")+descStyle.Render("         - Resume a paused session"),
+		descStyle.Render("             (a lane that runs in your own terminal resumes only when idle or stalled)"),
 		"",
 		headerStyle.Render("Terminal tab and keys:"),
 		keyStyle.Render("c")+descStyle.Render("         - Copy the composer's text, or the selected Needs-you row's title and number"),

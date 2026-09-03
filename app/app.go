@@ -1147,6 +1147,14 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 		if selected == nil || selected.Status == session.Loading {
 			return m, nil
 		}
+		if selected.NoWorktree && !noWorktreeResumeAllowed(selected) {
+			// Resuming a NoWorktree instance spins up a SECOND tmux session
+			// running the SAME program in the SAME folder the owner's own
+			// terminal already runs it in - only safe when that terminal-
+			// side session looks abandoned (slice 8 rule 2; the rule is
+			// also stated in the general help screen).
+			return m, m.setStatus("the lane is live in your own terminal; nothing to resume")
+		}
 		if err := selected.Resume(); err != nil {
 			return m, m.handleError(err)
 		}
@@ -1173,7 +1181,19 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 			return m, nil
 		}
 		selected := m.list.GetSelectedInstance()
-		if selected == nil || selected.Paused() || selected.Status == session.Loading || !selected.TmuxAlive() {
+		if selected == nil {
+			return m, nil
+		}
+		if selected.NoWorktree && !selected.TmuxAlive() {
+			// This lane runs in the owner's own terminal (a Clarity session
+			// lane started via clarity-attach) - attaching here would start
+			// a SECOND Claude in the same folder (slice 8 rule 2). Say so
+			// plainly rather than silently no-op-ing or (the pre-fix bug)
+			// walking a git-worktree resume path that does not exist for a
+			// NoWorktree instance.
+			return m, m.setStatus("this lane runs in your own terminal; tab to Terminal for a shell in its folder")
+		}
+		if selected.Paused() || selected.Status == session.Loading || !selected.TmuxAlive() {
 			return m, nil
 		}
 		// A tracked row attaches through its own tmux session regardless of
@@ -1245,12 +1265,35 @@ func (m *home) handleOpenFolder() tea.Cmd {
 // scan never found one).
 func (m *home) selectedFolderPath() string {
 	if selected := m.list.GetSelectedInstance(); selected != nil {
+		// A NoWorktree instance (slice 8 rule 4) has no git worktree, so
+		// GetWorktreePath always returns "" for it - fall back to its own
+		// Path (the lane directory it runs in directly) instead of a no-op.
+		if !selected.HasWorktree() {
+			return selected.Path
+		}
 		return selected.GetWorktreePath()
 	}
 	if ext, ok := m.list.GetSelectedExternalLane(); ok {
 		return ext.WorkDir
 	}
 	return ""
+}
+
+// noWorktreeResumeAllowed is the r key's own gate for a NoWorktree tracked
+// instance (slice 8 rule 2): resuming spins up a SECOND tmux session
+// running the SAME program in the SAME folder the owner's own terminal
+// already runs it in, so it is only safe when that terminal-side session
+// looks abandoned - the lane's own transcript classifies as idle or
+// stalled (clarity.ClassifyState: "stalled" already means "no close in
+// over 10 minutes", so no separate age check is needed on top of it).
+// Anything else - working, waiting on you, or no transcript read yet at
+// all - refuses: never risk a duplicate live Claude in one folder.
+func noWorktreeResumeAllowed(inst *session.Instance) bool {
+	state, _, ok := inst.GetLaneState()
+	if !ok {
+		return false
+	}
+	return state == clarity.StateIdle || state == clarity.StateStalled
 }
 
 // instanceChanged updates the Terminal tab and the menu based on whichever

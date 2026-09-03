@@ -571,7 +571,11 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, h
 	remainingWidth -= diffWidth
 
 	branch := i.Branch
-	if i.Started() && hasMultipleRepos {
+	// A NoWorktree instance (slice 8) has no git worktree and so no repo
+	// name to look up at all - RepoName() would return its own "no git
+	// worktree" error every render tick for an entirely expected condition,
+	// not a real failure, so this is skipped rather than logged.
+	if i.Started() && i.HasWorktree() && hasMultipleRepos {
 		repoName, err := i.RepoName()
 		if err != nil {
 			log.ErrorLog.Printf("could not get repo name in instance renderer: %v", err)
@@ -839,12 +843,16 @@ func (l *List) Kill() {
 		defer l.Up()
 	}
 
-	// Unregister the reponame.
-	repoName, err := targetInstance.RepoName()
-	if err != nil {
-		log.ErrorLog.Printf("could not get repo name: %v", err)
-	} else {
-		l.rmRepo(repoName)
+	// Unregister the reponame. A NoWorktree instance (slice 8) was never
+	// registered under a repo name in the first place (see AddInstance's
+	// own HasWorktree guard below) - skip straight past, no worktree error.
+	if targetInstance.HasWorktree() {
+		repoName, err := targetInstance.RepoName()
+		if err != nil {
+			log.ErrorLog.Printf("could not get repo name: %v", err)
+		} else {
+			l.rmRepo(repoName)
+		}
 	}
 
 	// Since there's items after this, the selectedIdx can stay the same.
@@ -908,8 +916,14 @@ func (l *List) rmRepo(repo string) {
 // When creating a new one and entering the name, you want to call the finalizer once the name is done.
 func (l *List) AddInstance(instance *session.Instance) (finalize func()) {
 	l.items = append(l.items, instance)
-	// The finalizer registers the repo name once the instance is started.
+	// The finalizer registers the repo name once the instance is started. A
+	// NoWorktree instance (slice 8) has no repo to register at all - this is
+	// the expected shape for it, not a failure, so it is a plain no-op
+	// rather than a logged "no git worktree" error.
 	return func() {
+		if !instance.HasWorktree() {
+			return
+		}
 		repoName, err := instance.RepoName()
 		if err != nil {
 			log.ErrorLog.Printf("could not get repo name: %v", err)
