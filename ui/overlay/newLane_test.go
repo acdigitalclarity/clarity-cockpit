@@ -177,6 +177,57 @@ func TestNewLaneOverlay_Render_MatchesMockupScreens(t *testing.T) {
 	}
 }
 
+// statusColumnStart is the account row's own fixed x - front-door slice 7
+// item 6a's own box-width measurement: the leading "│" (1) + prefix (5) +
+// tag field (9) + dir field (accountDirFieldWidth).
+const statusColumnStart = 1 + 5 + 9 + accountDirFieldWidth
+
+// TestNewLaneOverlay_AccountRow_DirCellNeverCrossesStatusColumn is front-
+// door slice 7 item 6a: the owner's own first-use defect, an unclipped
+// config-dir cell running past its own column and into the status column's
+// own x. The box's own column geometry (newLaneWidth and every field width
+// inside renderAccountRow) is a set of FIXED constants, independent of the
+// surrounding terminal - proven by the existing "every box line must be
+// exactly 84 columns" assertions above, which hold regardless of window
+// size - so both subtests below exercise the same Render() invariant
+// against the two terminal contexts the mock-up and the owner's own
+// narrower capture are each measured at (FRONTDOOR-MOCKUP-164x45.md; a
+// narrower real terminal is exactly where the owner hit the overrun).
+func TestNewLaneOverlay_AccountRow_DirCellNeverCrossesStatusColumn(t *testing.T) {
+	longDir := "/private/tmp/claude-scratch/deeply/nested/registered/seat/config/directory/that/is/unusually/long/and/not/under/home"
+	rows := []NewLaneAccountRow{
+		{Tag: "scratch", ConfigDir: longDir, CredentialStore: false},
+		{Tag: "team-b", ConfigDir: "/Users/allencoates/.claude-team-b", CredentialStore: true, FillPct: 18, HasLiveLane: true},
+	}
+
+	check := func(t *testing.T) {
+		o := NewNewLaneOverlay("/tmp/sessions", "", rows, "")
+		require.NoError(t, o.TypeRune("q3-tender-bid"))
+		o.NextFromName()
+
+		lines := strings.Split(o.Render(), "\n")
+		for _, line := range lines {
+			require.Equal(t, 84, len([]rune(line)), "every box line must stay exactly 84 columns: %q", line)
+		}
+
+		var scratchLine string
+		for _, l := range lines {
+			if strings.Contains(l, "scratch") {
+				scratchLine = l
+				break
+			}
+		}
+		require.NotEmpty(t, scratchLine, "the scratch seat's own row must render")
+		runes := []rune(scratchLine)
+		require.GreaterOrEqual(t, len(runes), statusColumnStart+len("no login"))
+		require.Equal(t, "no login", string(runes[statusColumnStart:statusColumnStart+len("no login")]),
+			"the status column must start at its own fixed x even with an oversized config-dir cell: %q", scratchLine)
+	}
+
+	t.Run("164x45 (mock-up width)", check)
+	t.Run("narrower (96x30)", check)
+}
+
 // A long sessions root (or a name near the 32-column cap) must not push the
 // Folder line's own interior width past the box - one overflowing line
 // poisons PlaceOverlay's own width measurement for the WHOLE box, since it

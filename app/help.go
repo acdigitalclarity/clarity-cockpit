@@ -41,7 +41,7 @@ func (h helpTypeGeneral) toContent() string {
 		"",
 		headerStyle.Render("Managing:"),
 		descStyle.Render("             Instances shows one line per seat with a live lane - the figure is that seat's per-seat maximum, not a sum"),
-		keyStyle.Render("n")+descStyle.Render("         - Create a new lane (name, then seat, then modality)"),
+		keyStyle.Render("n")+descStyle.Render("         - Create a new lane (name, then seat, then modality); at the seat step, l logs in a seat with no credential store"),
 		keyStyle.Render("N")+descStyle.Render("         - Create a new session with a prompt"),
 		keyStyle.Render("D")+descStyle.Render("         - Kill (delete) the selected session"),
 		keyStyle.Render("↑/j, ↓/k")+descStyle.Render("  - Navigate between sessions"),

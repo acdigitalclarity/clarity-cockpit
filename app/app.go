@@ -111,6 +111,14 @@ type home struct {
 	// by nil-checking this field rather than adding a new state constant.
 	newLaneOverlay *overlay.NewLaneOverlay
 
+	// pendingLogins tracks tracked instances slice 7's own "l" key started
+	// under the login program (FRONTDOOR-SPEC.md "l - log in from the
+	// cockpit") - keyed by instance pointer, valued by the normal launch
+	// program string that seat's next attach should use once the login
+	// pane is done with. completePendingLogin (below) is the only reader
+	// or writer besides handleLoginKey/newLaneLoginStartedMsg.
+	pendingLogins map[*session.Instance]string
+
 	// keySent is used to manage underlining menu items
 	keySent bool
 
@@ -284,6 +292,7 @@ func newHome(ctx context.Context, program string, autoYes bool, noSplash bool) *
 		laneTab:      ui.SessionTab,
 		needsYouTab:  ui.NeedsYouTab,
 		prevRowKind:  ui.RowKindTracked,
+		pendingLogins: make(map[*session.Instance]string),
 	}
 	if NoButterfly {
 		h.tabbedWindow.SetButterflyEnabled(false)
@@ -772,6 +781,10 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			return m, m.handleError(msg.err)
 		}
+		// Front-door slice 7: if this attach was the owner's own login pane
+		// (handleLoginKey), flip its Program back to the normal launch now
+		// that he is done with it - a no-op for every ordinary attach.
+		m.completePendingLogin()
 		return m, m.instanceChanged()
 	case terminalAttachFinishedMsg:
 		// A Terminal-tab external-lane attach (attachTerminalCmd) returned.
@@ -796,6 +809,34 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.handleError(err)
 		}
 		return m, tea.Batch(tea.RequestWindowSize, m.instanceChanged())
+	case newLaneLoginStartedMsg:
+		// Front-door slice 7's own "l" key (handleLoginKey) completed in the
+		// background: the lane is up under the login program. Same
+		// registration shape as newLaneStartedMsg above, plus the owner is
+		// attached straight into that pane so he completes the login
+		// himself - nothing is typed for him, item 3.
+		if msg.err != nil {
+			return m, m.handleError(msg.err)
+		}
+		finalize := m.list.AddInstance(msg.instance)
+		finalize()
+		m.list.SetSelectedInstance(m.list.NumInstances() - 1)
+		if m.pendingLogins == nil {
+			m.pendingLogins = make(map[*session.Instance]string)
+		}
+		m.pendingLogins[msg.instance] = msg.normalProgram
+		if err := m.storage.SaveInstances(m.list.GetInstances()); err != nil {
+			return m, m.handleError(err)
+		}
+		// Straight into the pane, no generic attach help screen first - the
+		// foot line below already says exactly what happens next (OWNER BAR:
+		// "the foot says exactly what happens next").
+		return m, tea.Batch(
+			tea.RequestWindowSize,
+			m.instanceChanged(),
+			m.setStatus("log in, then enter to start"),
+			attachInstanceCmd(m.list.Attach),
+		)
 	case instanceStartedMsg:
 		// Select the instance that just started (or failed)
 		m.list.SelectInstance(msg.instance)
@@ -2143,6 +2184,18 @@ type newLaneStartedMsg struct {
 	err      error
 }
 
+// newLaneLoginStartedMsg reports the outcome of front-door slice 7's own
+// "l" key (handleLoginKey below): the wrapper's own folder + CLAUDE.md
+// creation, then registering and starting the instance under the login
+// program instead of the normal launch. normalProgram carries the seat's
+// ordinary launch string - what the instance's Program field switches to
+// once the login pane is marked done (completePendingLogin).
+type newLaneLoginStartedMsg struct {
+	instance      *session.Instance
+	normalProgram string
+	err           error
+}
+
 // buildNewLaneOverlay reads the registry and this process's own live lanes
 // once, at the moment "n" is pressed, into the overlay's own account rows -
 // FRONTDOOR-SPEC.md "Step 2 account"'s columns (tag, config dir, credential
@@ -2151,12 +2204,16 @@ func (m *home) buildNewLaneOverlay() *overlay.NewLaneOverlay {
 	regAccounts, policy := clarity.LoadAccountsRegistryFull()
 	rows := make([]overlay.NewLaneAccountRow, 0, len(regAccounts))
 	for _, ra := range regAccounts {
-		cred := clarity.ReadSeatOAuthAccount(ra.ConfigDir)
+		// HasCredentialStore, not ReadSeatOAuthAccount - front-door slice 7
+		// item 6b, the owner's own first-use defect: ReadSeatOAuthAccount
+		// only reads a seat's .claude.json file, which is never how the
+		// primary seat's own login is stored (the macOS Keychain), so
+		// "main" always showed no login even when signed in.
 		pct, ok := m.maxFillForAccount(ra.Tag)
 		rows = append(rows, overlay.NewLaneAccountRow{
 			Tag:             ra.Tag,
 			ConfigDir:       ra.ConfigDir,
-			CredentialStore: cred.Present,
+			CredentialStore: clarity.HasCredentialStore(ra.ConfigDir),
 			FillPct:         pct,
 			HasLiveLane:     ok,
 			IsDefault:       ra.Tag == policy.DefaultAccount,
@@ -2198,8 +2255,8 @@ func (m *home) maxFillForAccount(tag string) (pct int, ok bool) {
 // handleNewLaneKey is every key the three-step overlay is open for -
 // FRONTDOOR-SPEC.md "The overlay": ctrl-c cancels the whole flow at any
 // step and creates nothing; each step's own enter/esc/up/down are handled
-// per step below; "l" at step 2 is slice 7's own placeholder (does nothing
-// but name the next slice in the footer).
+// per step below; "l" at step 2 is slice 7's own log-in key
+// (handleLoginKey).
 func (m *home) handleNewLaneKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	o := m.newLaneOverlay
 
@@ -2249,9 +2306,7 @@ func (m *home) handleNewLaneKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.String() == "l" {
-			// Slice 7 ("l" log in) is not built yet - the footer names it
-			// rather than the key doing nothing silently.
-			return m, m.setStatus("log in: next slice")
+			return m.handleLoginKey(o)
 		}
 		if name, ok := keys.GlobalKeyStringsMap[msg.String()]; ok {
 			switch name {
@@ -2299,6 +2354,20 @@ func newLaneProgram(base, configDir string) string {
 		return base
 	}
 	return fmt.Sprintf("%s CLAUDE_CONFIG_DIR=%s %s", clarity.EnvUnsetPrefix, configDir, base)
+}
+
+// loginProgram builds front-door slice 7's own login program string
+// (FRONTDOOR-SPEC.md "l - log in from the cockpit"): the pane runs
+// `claude /login` instead of the plain launch, under the seat's own
+// CLAUDE_CONFIG_DIR, so the interactive login happens in the pane the
+// owner is about to attach to. Nothing here reads, prints, logs or stores
+// a credential - configDir is a path already known from the registry, the
+// same one every other launch string in this file carries. Exactly
+// "CLAUDE_CONFIG_DIR=<config_dir> claude /login", per the spec's own
+// quoted program string - clarity.EnvUnsetPrefix is deliberately left off
+// this one string; the login flow needs only the seat's own config dir.
+func loginProgram(base, configDir string) string {
+	return fmt.Sprintf("CLAUDE_CONFIG_DIR=%s %s /login", configDir, base)
 }
 
 // clarityWrapperNew shells out to the real `clarity new ... --no-launch`
@@ -2363,6 +2432,86 @@ func (m *home) startNewLane(o *overlay.NewLaneOverlay) (tea.Model, tea.Cmd) {
 	}
 
 	return m, tea.Batch(tea.RequestWindowSize, startCmd)
+}
+
+// handleLoginKey is step 2's own "l" key (FRONTDOOR-SPEC.md "l - log in
+// from the cockpit", front-door slice 7 item 2). A seat that already has a
+// credential store is a no-op beyond naming why on the foot. A seat with
+// none gets its lane created and started the same way startNewLane does
+// (wrapper --no-launch, then session.NewInstance + Start), except under
+// loginProgram instead of the normal launch, with modality taken from step
+// 3's own default (overlay.DefaultModalityKey) since the overlay never
+// actually walks to step 3 for this key - and the overlay closes here
+// (unlike step 3's own Enter, which only closes once startNewLane returns
+// synchronously the same way). newLaneLoginStartedMsg's own handler
+// attaches the owner straight into the pane once the instance is up.
+func (m *home) handleLoginKey(o *overlay.NewLaneOverlay) (tea.Model, tea.Cmd) {
+	acc := o.SelectedAccount()
+	if clarity.HasCredentialStore(acc.ConfigDir) {
+		return m, m.setStatus("already logged in")
+	}
+
+	name := o.Name()
+	modKey := o.DefaultModalityKey()
+	program := m.program
+	cmdExec := m.cmdExec
+
+	m.newLaneOverlay = nil
+	m.state = stateDefault
+
+	startCmd := func() tea.Msg {
+		if err := clarityWrapperNew(cmdExec, name, acc.Tag, modKey); err != nil {
+			return newLaneLoginStartedMsg{err: err}
+		}
+
+		lanePath, err := clarity.ResolveExistingLaneDir(name)
+		if err != nil {
+			return newLaneLoginStartedMsg{err: err}
+		}
+
+		inst, err := session.NewInstance(session.InstanceOptions{
+			Title:      name,
+			Path:       lanePath,
+			Program:    loginProgram(program, acc.ConfigDir),
+			NoWorktree: true,
+			Account:    acc.Tag,
+			Modality:   modKey,
+		})
+		if err != nil {
+			return newLaneLoginStartedMsg{err: err}
+		}
+		if err := inst.Start(true); err != nil {
+			return newLaneLoginStartedMsg{err: err}
+		}
+		return newLaneLoginStartedMsg{instance: inst, normalProgram: newLaneProgram(program, acc.ConfigDir)}
+	}
+
+	return m, tea.Batch(tea.RequestWindowSize, startCmd)
+}
+
+// completePendingLogin flips a just-detached login instance's Program back
+// to its seat's normal launch string (FRONTDOOR-SPEC.md "l - log in from
+// the cockpit": "Claude proper starts on the next enter") and forgets it -
+// item 2's "On the next enter ... the instance's program becomes the
+// normal launch for that seat." A no-op when the currently selected
+// instance was never a pending login (every ordinary attach). Called only
+// from the instanceAttachFinishedMsg handler, once the owner has detached
+// from the pane; nothing here reads, prints or stores anything from a
+// credential store - only the program string this same file already built.
+func (m *home) completePendingLogin() {
+	inst := m.list.GetSelectedInstance()
+	if inst == nil {
+		return
+	}
+	normalProgram, pending := m.pendingLogins[inst]
+	if !pending {
+		return
+	}
+	inst.Program = normalProgram
+	delete(m.pendingLogins, inst)
+	if err := m.storage.SaveInstances(m.list.GetInstances()); err != nil {
+		log.ErrorLog.Printf("completePendingLogin: save after login: %v", err)
+	}
 }
 
 // branchSearchDebounceMsg fires after the debounce interval to trigger a search.

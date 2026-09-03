@@ -1,14 +1,42 @@
 package clarity
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"claude-squad/log"
 
 	"github.com/stretchr/testify/require"
 )
+
+// fakeSecurityOnPath puts a fake `security` script ahead of the real one on
+// PATH, so HasCredentialStore's own `security dump-keychain` call never
+// touches this machine's real keychain - the account_probe_verify.sh idiom
+// item 4a asks for. output is written verbatim to stdout, one line per
+// keychain entry; t.Setenv restores PATH on cleanup.
+func fakeSecurityOnPath(t *testing.T, output string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake security script is a POSIX shell script")
+	}
+	bin := t.TempDir()
+	script := "#!/bin/sh\ncat <<'EOF'\n" + output + "\nEOF\n"
+	path := filepath.Join(bin, "security")
+	require.NoError(t, os.WriteFile(path, []byte(script), 0755))
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// keychainSuffixHex mirrors keychainServiceName's own non-default branch so
+// tests can build a matching fake entry without reaching into the
+// unexported function directly.
+func keychainSuffixHex(configDir string) string {
+	sum := sha256.Sum256([]byte(filepath.Clean(configDir)))
+	return fmt.Sprintf("%x", sum[:4])
+}
 
 func writeRegistry(t *testing.T, path string, body string) {
 	t.Helper()
@@ -135,4 +163,58 @@ func TestReadSeatOAuthAccount_UnparseableJSONIsNotAnError(t *testing.T) {
 
 	got := ReadSeatOAuthAccount(dir)
 	require.False(t, got.Present)
+}
+
+// (4a) HasCredentialStore reports false for a fresh scratch dir with no
+// file store and an empty keychain, and true once account_probe_verify.sh's
+// own presence marker is present - the file-based branch, needing no fake
+// security at all.
+func TestHasCredentialStore_FreshDirIsFalse(t *testing.T) {
+	dir := t.TempDir()
+	fakeSecurityOnPath(t, "")
+	require.False(t, HasCredentialStore(dir), "a fresh scratch dir with an empty keychain must report no store")
+}
+
+func TestHasCredentialStore_CredentialsFileIsTrue(t *testing.T) {
+	dir := t.TempDir()
+	fakeSecurityOnPath(t, "") // must never even need to be read - the file wins first
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte("{}"), 0600))
+	require.True(t, HasCredentialStore(dir))
+}
+
+// (4a + 6b) the Keychain branch, keyed per seat: a fake `security dump-
+// keychain` printing THIS seat's own derived entry name reports true; the
+// SAME fake printing only ANOTHER seat's entry (or the bare default-seat
+// entry) reports false for this seat - proving the check reads its own
+// seat's entry, not just any entry on the keychain.
+func TestHasCredentialStore_KeychainEntry_KeyedPerSeat(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), ".claude-scratch-seat")
+	require.NoError(t, os.MkdirAll(dir, 0755))
+	suffix := keychainSuffixHex(dir)
+
+	fakeSecurityOnPath(t, fmt.Sprintf(`"svce"<blob>="Claude Code-credentials-%s"`, suffix))
+	require.True(t, HasCredentialStore(dir), "this seat's own derived keychain entry must report present")
+
+	otherDir := filepath.Join(t.TempDir(), ".claude-other-seat")
+	require.NoError(t, os.MkdirAll(otherDir, 0755))
+	require.NotEqual(t, suffix, keychainSuffixHex(otherDir), "the two scratch dirs must hash to different suffixes for this control to mean anything")
+	require.False(t, HasCredentialStore(otherDir), "another seat's entry on the keychain must never read as presence for THIS seat")
+
+	fakeSecurityOnPath(t, `"svce"<blob>="Claude Code-credentials"`) // the bare default-seat entry only
+	require.False(t, HasCredentialStore(dir), "the default seat's bare entry must never read as presence for a non-default seat")
+}
+
+// (6b) the primary seat (config dir the default ~/.claude) is keyed to the
+// BARE prefix with no hash suffix - the derivation this leg established by
+// reading this machine's own keychain metadata (session/clarity/accounts.go
+// keychainServiceName's own doc comment). A suffixed entry for some OTHER
+// seat must never read as presence for main.
+func TestHasCredentialStore_DefaultSeat_BareEntryKeyedSeparately(t *testing.T) {
+	defaultDir := filepath.Dir(DefaultClaudeProjectsRoot)
+
+	fakeSecurityOnPath(t, `"svce"<blob>="Claude Code-credentials"`)
+	require.True(t, HasCredentialStore(defaultDir), "the default seat's own bare keychain entry must report present")
+
+	fakeSecurityOnPath(t, `"svce"<blob>="Claude Code-credentials-deadbeef"`)
+	require.False(t, HasCredentialStore(defaultDir), "another seat's suffixed entry must never read as presence for the default seat")
 }
