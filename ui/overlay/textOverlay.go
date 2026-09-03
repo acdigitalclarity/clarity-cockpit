@@ -9,8 +9,12 @@ import (
 type TextOverlay struct {
 	// Whether the overlay has been dismissed
 	Dismissed bool
-	// Callback function to be called when the overlay is dismissed
-	OnDismiss func()
+	// Callback function to be called when the overlay is dismissed. It
+	// returns a tea.Cmd (rather than running its own side effects inline)
+	// so a dismiss that hands off the terminal - attaching to a tmux
+	// session - can be run through tea.Exec instead of blocking Update()
+	// while bubbletea's own input reader is still live (board slice 9).
+	OnDismiss func() tea.Cmd
 	// Content to display in the overlay
 	content string
 
@@ -25,16 +29,18 @@ func NewTextOverlay(content string) *TextOverlay {
 	}
 }
 
-// HandleKeyPress processes a key press and updates the state
-// Returns true if the overlay should be closed
-func (t *TextOverlay) HandleKeyPress(msg tea.KeyPressMsg) bool {
+// HandleKeyPress processes a key press and updates the state.
+// Returns true if the overlay should be closed, plus whatever tea.Cmd the
+// OnDismiss callback returns (nil if there is no callback or it returns
+// none) - the caller must return this Cmd from Update(), not discard it.
+func (t *TextOverlay) HandleKeyPress(msg tea.KeyPressMsg) (bool, tea.Cmd) {
 	// Close on any key
 	t.Dismissed = true
-	// Call the OnDismiss callback if it exists
+	var cmd tea.Cmd
 	if t.OnDismiss != nil {
-		t.OnDismiss()
+		cmd = t.OnDismiss()
 	}
-	return true
+	return true, cmd
 }
 
 // Render renders the text overlay

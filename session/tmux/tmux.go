@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"golang.org/x/term"
 )
 
 const ProgramClaude = "claude"
@@ -55,6 +56,24 @@ type TmuxSession struct {
 	ctx    context.Context
 	cancel func()
 	wg     *sync.WaitGroup
+	// stdinRawState is the real terminal's own termios state from just before
+	// Attach put it into raw mode, restored on Detach/DetachSafely. Nil when
+	// stdin isn't a terminal (tests, piped input) or we're not attached.
+	//
+	// Needed because Attach's own read loop below forwards stdin byte for
+	// byte (including a lone ctrl-q, detected as a single-byte read of 0x11)
+	// - that only works in raw mode. Whatever put the real terminal in raw
+	// mode before Attach ran (bubbletea's own Program, for the cockpit's own
+	// keyboard; nothing, for a bare terminal) is not guaranteed to still own
+	// it for Attach's duration: the cockpit hands the terminal to Attach via
+	// tea.Exec (app/attach_exec.go), which releases bubbletea's raw mode and
+	// restores whatever cooked state came before the Program started - not
+	// raw. Left uncorrected, the real terminal sits in canonical mode for
+	// the whole attach: printable keys don't reach the PTY until Enter
+	// completes a line, and a lone ctrl-q never completes a line on its own,
+	// so it sits in the kernel's line buffer until something else does -
+	// never delivered as the single byte this loop's `nr == 1` check needs.
+	stdinRawState *term.State
 }
 
 const TmuxPrefix = "claudesquad_"
@@ -269,6 +288,19 @@ func (t *TmuxSession) HasUpdated() (updated bool, hasPrompt bool) {
 func (t *TmuxSession) Attach() (chan struct{}, error) {
 	t.attachCh = make(chan struct{})
 
+	// Put the real terminal into raw mode for the duration of the attach -
+	// see stdinRawState's own comment for why this loop needs it regardless
+	// of what mode the terminal was already in. Mirrors main.go's
+	// clarityAttachCmd, which does the same MakeRaw/Restore pairing around
+	// its own (non-bubbletea) call to Instance.Attach.
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		if oldState, err := term.MakeRaw(int(os.Stdin.Fd())); err != nil {
+			log.WarningLog.Printf("could not set stdin to raw mode for attach: %v", err)
+		} else {
+			t.stdinRawState = oldState
+		}
+	}
+
 	t.wg = &sync.WaitGroup{}
 	t.wg.Add(1)
 	t.ctx, t.cancel = context.WithCancel(context.Background())
@@ -343,6 +375,20 @@ func (t *TmuxSession) Attach() (chan struct{}, error) {
 	return t.attachCh, nil
 }
 
+// restoreStdinRawState reverses whatever Attach's own term.MakeRaw call did
+// to the real terminal, if anything (stdinRawState is nil when stdin wasn't
+// a terminal, or MakeRaw itself failed). Called from both detach paths
+// below so the terminal is never left in Attach's raw state past Detach.
+func (t *TmuxSession) restoreStdinRawState() {
+	if t.stdinRawState == nil {
+		return
+	}
+	if err := term.Restore(int(os.Stdin.Fd()), t.stdinRawState); err != nil {
+		log.WarningLog.Printf("could not restore stdin terminal state after detach: %v", err)
+	}
+	t.stdinRawState = nil
+}
+
 // DetachSafely disconnects from the current tmux session without panicking
 func (t *TmuxSession) DetachSafely() error {
 	// Only detach if we're actually attached
@@ -351,6 +397,8 @@ func (t *TmuxSession) DetachSafely() error {
 	}
 
 	var errs []error
+
+	defer t.restoreStdinRawState()
 
 	// Close the attached pty session.
 	if t.ptmx != nil {
@@ -396,6 +444,7 @@ func (t *TmuxSession) Detach() {
 		t.ctx = nil
 		t.wg = nil
 	}()
+	defer t.restoreStdinRawState()
 
 	// Close the attached pty session.
 	err := t.ptmx.Close()
