@@ -1,24 +1,22 @@
 // Package ui: this file is the Terminal tab (design/cockpit-pane/
-// DECISIONS.md tab ruling 3, build slice 6). It shows two different things
-// depending on the selected row's own kind, resolved once per tick by the
-// caller (app.go's instanceChanged, mirroring SessionInfo's own "resolved
-// outside the pane" shape) into a TerminalTarget:
+// DECISIONS.md tab ruling 3, build slice 6; slice 15 replaces rule 3 below
+// on the owner's own word - "terminal i thought would just be terminal
+// rather than this session", 3 Sep). It shows two different things depending
+// on the selected row's own kind, resolved once per tick by the caller
+// (app.go's instanceChanged, mirroring SessionInfo's own "resolved outside
+// the pane" shape) into a TerminalTarget:
 //
-//   - a TRACKED instance: its own live tmux pane, mirrored exactly the way
-//     the dormant PreviewPane (ui/preview.go) used to show it under
-//     upstream's old "Preview" tab - instance.Preview()/PreviewFullHistory(),
-//     the same capture path, so a pending permission prompt in that lane is
-//     visible here even though the Session tab's own transcript view cannot
-//     show one. Attaching (Enter, outside this file - app.go) goes straight
-//     to the instance's own tmux session, exactly as it does on every other
-//     tab: this pane never owns a separate shell for a tracked row.
-//   - an EXTERNAL lane (runs in the owner's own terminal): a shell this
-//     pane opens lazily the first time the tab is viewed for that lane, as a
-//     tmux session named term_<lane> - upstream's own pre-existing
-//     mechanism for keeping one shell per instance, reused here verbatim
-//     (session name, lazy creation, Restore-or-Start, SetDetachedSize) but
-//     keyed by the external lane's own name instead of a tracked instance's
-//     title, since an external lane has no *session.Instance at all.
+//   - a TRACKED instance OR an EXTERNAL lane (runs in the owner's own
+//     terminal): always the cockpit-owned shell in that lane's own folder, a
+//     tmux session named term_<title-or-lane>, opened lazily the first time
+//     the tab is viewed for it and closed on quit - upstream's own
+//     pre-existing "one shell per instance" mechanism (session name, lazy
+//     creation, Restore-or-Start, SetDetachedSize), reused verbatim here for
+//     both row kinds alike, keyed by the tracked instance's own Title or the
+//     external lane's own Name. A tracked instance's live Claude session is
+//     never mirrored here any more (slice 6's old rule); it is reached with
+//     Enter (attach, outside this file - app.go) and read on the Session
+//     tab instead.
 //   - neither selected: the splash's resting frame, same as the Session tab
 //     (ui/session.go's own renderResting), never placeholder text.
 package ui
@@ -61,7 +59,8 @@ const (
 	// splash's resting frame.
 	TerminalTargetNone TerminalTargetKind = iota
 	// TerminalTargetTracked means a tracked instance is selected - the pane
-	// mirrors its own tmux pane.
+	// shows (opening lazily if needed) that instance's own term_<title>
+	// shell, never its live Claude pane (slice 15).
 	TerminalTargetTracked
 	// TerminalTargetExternal means an external lane is selected - the pane
 	// shows (opening lazily if needed) that lane's own term_<lane> shell.
@@ -84,9 +83,9 @@ type TerminalTarget struct {
 	WorkDir string
 }
 
-// TerminalPane renders the Terminal tab: a tracked instance's own tmux
-// mirror, an external lane's lazily-opened term_<lane> shell, or the
-// splash's resting frame when nothing is selected.
+// TerminalPane renders the Terminal tab: a lazily-opened term_<title> shell
+// for a tracked instance, a lazily-opened term_<lane> shell for an external
+// lane, or the splash's resting frame when nothing is selected.
 type TerminalPane struct {
 	mu            sync.Mutex
 	width, height int
@@ -190,17 +189,14 @@ func (t *TerminalPane) UpdateContent(target TerminalTarget) error {
 	}
 }
 
-// updateTrackedLocked mirrors the selected TRACKED instance's own tmux
-// pane - the dormant PreviewPane's own capture path (ui/preview.go's
-// UpdateContent), not a separate term_ shell - for as long as that pane has
-// a LIVE tmux session to mirror. A tracked instance with no live session
-// (paused, or one whose session died) has nothing to mirror, so it falls
-// through to the same term_<title> shell an external lane gets instead
-// (slice 8 rule 3): the splash resting frame is reserved for "nothing
-// selected", never "this row has no live session right now" - that used to
-// render here as a "Session is paused" fallback, wrong for a NoWorktree
-// instance (its own "Resume to use terminal" invited a worktree operation
-// that does not exist for it). Caller must hold t.mu.
+// updateTrackedLocked shows the selected TRACKED instance's own term_<title>
+// shell (slice 15: the Terminal tab is ALWAYS a shell, for tracked and
+// external rows alike - the owner's own word, "terminal i thought would just
+// be terminal rather than this session"). Its live Claude session is never
+// mirrored here any more, regardless of whether that session is alive,
+// paused, or dead - the splash resting frame stays reserved for "nothing
+// selected", never "this row has no live Claude session right now". Caller
+// must hold t.mu.
 func (t *TerminalPane) updateTrackedLocked(instance *session.Instance) error {
 	if instance == nil {
 		t.setFallbackState("Select an instance to open a terminal")
@@ -210,28 +206,26 @@ func (t *TerminalPane) updateTrackedLocked(instance *session.Instance) error {
 		t.setFallbackState("Instance is not started yet.")
 		return nil
 	}
-	if !instance.TmuxAlive() {
-		return t.updateExternalLocked(instance.Title, instance.Path)
-	}
-	if t.isScrolling {
-		// Full-history capture only happens lazily on entering scroll mode
-		// (enterScrollModeLocked below) - a mid-scroll tick must not
-		// overwrite the viewport's own content.
-		return nil
-	}
-
-	content, err := instance.Preview()
-	if err != nil {
-		return fmt.Errorf("terminal pane: failed to capture content: %w", err)
-	}
-	t.fallback = false
-	t.content = content
-	return nil
+	return t.updateExternalLocked(instance.Title, instanceWorkDir(instance))
 }
 
-// updateExternalLocked shows the EXTERNAL lane's own term_<lane> shell,
-// opening it first if this is the first tick the tab has been viewed for
-// this lane (ensureExternalSessionLocked). Caller must hold t.mu.
+// instanceWorkDir resolves a tracked instance's own folder - its git
+// worktree path if it has one, else its own Path (a NoWorktree
+// clarity-attach lane, which has no worktree at all) - the same resolution
+// app.go's own selectedFolderPath uses for the o key, since the term_<title>
+// shell must open in the same folder that key would open.
+func instanceWorkDir(instance *session.Instance) string {
+	if instance.HasWorktree() {
+		return instance.GetWorktreePath()
+	}
+	return instance.Path
+}
+
+// updateExternalLocked shows the lane's own term_<lane> shell (lane is a
+// tracked instance's own Title when called from updateTrackedLocked, or an
+// external lane's own Name), opening it first if this is the first tick the
+// tab has been viewed for this lane (ensureExternalSessionLocked). Caller
+// must hold t.mu.
 func (t *TerminalPane) updateExternalLocked(lane, workDir string) error {
 	if lane == "" {
 		t.setFallbackState("Select a lane to open a terminal")
@@ -259,10 +253,10 @@ func (t *TerminalPane) updateExternalLocked(lane, workDir string) error {
 }
 
 // ensureExternalSessionLocked creates or reuses the cached term_<lane> tmux
-// session for an external lane - upstream's own "one shell per instance"
+// session for the given key - upstream's own "one shell per instance"
 // mechanism (session name, lazy creation, Restore-or-Start,
-// SetDetachedSize), reused verbatim here but keyed by the lane's own name
-// rather than a tracked instance's title. Caller must hold t.mu.
+// SetDetachedSize), keyed by a tracked instance's own Title or an external
+// lane's own Name alike (slice 15). Caller must hold t.mu.
 func (t *TerminalPane) ensureExternalSessionLocked(lane, workDir string) error {
 	if lane == "" || workDir == "" {
 		return nil
@@ -452,45 +446,39 @@ func (t *TerminalPane) renderRestingLocked() string {
 	return lipgloss.Place(t.width, t.height, lipgloss.Center, lipgloss.Center, frame)
 }
 
-// enterScrollModeLocked captures the full pane history (tracked instance)
-// or full session history (external lane's term_ shell) and enters scroll
-// mode. Caller must hold t.mu.
-func (t *TerminalPane) enterScrollModeLocked() error {
-	var content string
-	var err error
-
+// targetShellKeyLocked returns the term_ shell's own map key for whichever
+// row is currently selected - a tracked instance's own Title or an external
+// lane's own Name (slice 15: both row kinds show a term_ shell alike) - ""
+// for TerminalTargetNone, or a tracked target with no Instance set. Caller
+// must hold t.mu.
+func (t *TerminalPane) targetShellKeyLocked() string {
 	switch t.target.Kind {
 	case TerminalTargetTracked:
 		if t.target.Instance == nil {
-			return nil
+			return ""
 		}
-		if t.target.Instance.TmuxAlive() {
-			content, err = t.target.Instance.PreviewFullHistory()
-		} else {
-			// No live session to mirror - this tracked row is showing its
-			// term_<title> shell instead (updateTrackedLocked above), so
-			// scroll mode must pull full history from THAT session, keyed
-			// by the same instance.Title.
-			s, ok := t.external[t.target.Instance.Title]
-			if !ok || s.tmuxSession == nil || !s.tmuxSession.DoesSessionExist() {
-				return nil
-			}
-			content, err = s.tmuxSession.CapturePaneContentWithOptions("-", "-")
-		}
-		if err != nil {
-			return fmt.Errorf("terminal pane: failed to capture full history: %w", err)
-		}
+		return t.target.Instance.Title
 	case TerminalTargetExternal:
-		s, ok := t.external[t.target.Lane]
-		if !ok || s.tmuxSession == nil || !s.tmuxSession.DoesSessionExist() {
-			return nil
-		}
-		content, err = s.tmuxSession.CapturePaneContentWithOptions("-", "-")
-		if err != nil {
-			return fmt.Errorf("terminal pane: failed to capture full history: %w", err)
-		}
+		return t.target.Lane
 	default:
+		return ""
+	}
+}
+
+// enterScrollModeLocked captures the selected row's own term_ shell's full
+// session history and enters scroll mode. Caller must hold t.mu.
+func (t *TerminalPane) enterScrollModeLocked() error {
+	key := t.targetShellKeyLocked()
+	if key == "" {
 		return nil
+	}
+	s, ok := t.external[key]
+	if !ok || s.tmuxSession == nil || !s.tmuxSession.DoesSessionExist() {
+		return nil
+	}
+	content, err := s.tmuxSession.CapturePaneContentWithOptions("-", "-")
+	if err != nil {
+		return fmt.Errorf("terminal pane: failed to capture full history: %w", err)
 	}
 
 	footer := terminalFooterStyle.Render("ESC to exit scroll mode")

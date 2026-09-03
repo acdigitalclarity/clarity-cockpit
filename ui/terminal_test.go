@@ -121,9 +121,11 @@ func mockCmdExec(captureContent string, sessionExists bool) cmd_test.MockCmdExec
 }
 
 // makeStartedInstance creates a minimal instance that reports as started
-// with the given title - its own tmux session's capture-pane calls return
-// captureContent, exactly the content the Terminal tab's tracked-row mirror
-// (instance.Preview()) must come back with.
+// with the given title - its own (Claude-side) tmux session's capture-pane
+// calls return captureContent, the content instance.Preview() itself would
+// return; the Terminal tab no longer calls that path at all (slice 15), so
+// tests use captureContent as the NEGATIVE fixture - proof a wrong wiring
+// would show up as this content rather than the term_<title> shell's own.
 func makeStartedInstance(t *testing.T, title string, captureContent string) *session.Instance {
 	t.Helper()
 	workdir := t.TempDir()
@@ -178,21 +180,28 @@ func makeStartedInstance(t *testing.T, title string, captureContent string) *ses
 	return instance
 }
 
-// TestTerminalPane_Tracked_MirrorsInstanceOwnPane is the brief's own "tab
-// content selection by row kind" case for a TRACKED row: the Terminal tab
-// shows the instance's OWN tmux pane (the dormant PreviewPane's own capture
-// path), never a separate term_<title> shell - upstream's old behaviour,
-// dropped by DECISIONS.md's tab ruling 3.
-func TestTerminalPane_Tracked_MirrorsInstanceOwnPane(t *testing.T) {
+// TestTerminalPane_Tracked_OpensTermShell is slice 15's own rewrite of the
+// tracked-row case (the owner's own word, 3 Sep: "terminal i thought would
+// just be terminal rather than this session"): a Started tracked instance's
+// Terminal target is its own term_<title> shell, never its own live Claude
+// pane. makeStartedInstance's Claude-side tmux double returns
+// claudePaneContent for ITS OWN capture-pane calls; the shell double
+// (newTerminalPaneWithDeps) returns a DIFFERENT string, so a wrong wiring
+// that still mirrored the Claude pane would show up as the wrong content,
+// not just a missing one.
+func TestTerminalPane_Tracked_OpensTermShell(t *testing.T) {
 	log.Initialize(false)
 	defer log.Close()
 
-	expectedContent := "$ whoami\nuser\n$ ls\nfile1.txt  file2.txt"
-
-	instance := makeStartedInstance(t, "update-content", expectedContent)
+	claudePaneContent := "$ whoami\nuser\n$ ls\nfile1.txt  file2.txt"
+	instance := makeStartedInstance(t, "update-content", claudePaneContent)
 	defer func() { _ = instance.Kill() }()
+	require.True(t, instance.TmuxAlive(), "the instance's own Claude session must be live for this case to be meaningful")
 
-	tp := NewTerminalPane()
+	shellContent := "$ pwd\n" + instance.Path
+	rec := newRecordingCmdExec(shellContent, false)
+	ptyFactory := &MockPtyFactory{t: t, cmdExec: rec.exec()}
+	tp := newTerminalPaneWithDeps(ptyFactory, rec.exec())
 	tp.SetSize(80, 30)
 
 	err := tp.UpdateContent(TerminalTarget{Kind: TerminalTargetTracked, Instance: instance})
@@ -200,12 +209,16 @@ func TestTerminalPane_Tracked_MirrorsInstanceOwnPane(t *testing.T) {
 
 	tp.mu.Lock()
 	require.False(t, tp.fallback, "should not be in fallback mode after successful content update")
-	require.Equal(t, expectedContent, tp.content, "content should match the instance's OWN captured pane output")
-	require.Empty(t, tp.external, "a tracked row must never open a separate term_ shell - it mirrors its own session")
+	require.Equal(t, shellContent, tp.content, "content must come from the term_<title> shell, never the instance's own live pane")
+	require.NotEqual(t, claudePaneContent, tp.content, "the instance's own Claude pane must never be mirrored here any more")
+	require.Contains(t, tp.external, instance.Title, "a tracked row's shell is cached the same way an external lane's is")
 	tp.mu.Unlock()
 
+	require.True(t, rec.sawCommand("term_"+instance.Title), "the tmux session must be named term_<title>")
+
 	rendered := tp.String()
-	require.Contains(t, rendered, "whoami", "rendered output should contain captured content")
+	require.Contains(t, rendered, "pwd", "rendered output should contain the shell's own captured content")
+	require.NotContains(t, rendered, "whoami", "the instance's own Claude pane content must not appear")
 }
 
 // TestTerminalPane_Tracked_FallbackStates covers the nil/not-started
@@ -319,14 +332,14 @@ func (m *multiSessionCmdExec) exec() cmd_test.MockCmdExec {
 }
 
 // TestTerminalPane_TrackedPaused_OpensTermShell is slice 8 rule 3's own
-// test, seen failing against the pre-fix code (which showed a "Session is
-// paused. Resume to use terminal." fallback here - the installed binary's
-// wordmark-plus-message the owner actually hit): a Paused tracked
-// instance's Terminal tab must instead open/mirror its own term_<title>
-// shell in its Path, exactly as an external lane's Terminal tab does - the
-// resting frame is reserved for "nothing selected", never "this row has no
-// live session right now". Uses a NoWorktree fixture (the exact shape of
-// the owner's report) so Pause() itself is real, not stubbed.
+// test (a Paused tracked instance's Terminal tab must open its own
+// term_<title> shell, never a "Session is paused" fallback), which slice 15
+// widened into the row's ONLY behaviour: a Started instance now takes the
+// same term_<title> shell path (TestTerminalPane_Tracked_OpensTermShell
+// above), so this case and that one together prove the shell path no longer
+// depends on whether the instance's own Claude session happens to be alive.
+// Uses a NoWorktree fixture (the exact shape of the owner's report) so
+// Pause() itself is real, not stubbed.
 func TestTerminalPane_TrackedPaused_OpensTermShell(t *testing.T) {
 	log.Initialize(false)
 	defer log.Close()
@@ -498,10 +511,10 @@ func TestTerminalPane_Caching(t *testing.T) {
 }
 
 // TestTerminalPane_Scrolling preserves the pre-redesign suite's own
-// scroll-mode case, adapted to an external lane (the tracked path's own
-// scroll now goes through instance.PreviewFullHistory instead, exercised by
-// TestTerminalPane_Tracked_MirrorsInstanceOwnPane's fixture indirectly via
-// the shared enterScrollModeLocked code path).
+// scroll-mode case, adapted to an external lane - slice 15 made the tracked
+// path share this exact same term_ shell scroll code (targetShellKeyLocked
+// resolves either row kind to the same map lookup), so one case here covers
+// both.
 func TestTerminalPane_Scrolling(t *testing.T) {
 	log.Initialize(false)
 	defer log.Close()

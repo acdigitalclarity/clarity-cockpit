@@ -56,6 +56,7 @@ func (h helpTypeGeneral) toContent() string {
 		descStyle.Render("             (a lane that runs in your own terminal resumes only when idle or stalled)"),
 		"",
 		headerStyle.Render("Terminal tab and keys:"),
+		descStyle.Render("             The Terminal tab is always a shell in the lane's own folder - ↵ still attaches to its Claude session"),
 		keyStyle.Render("c")+descStyle.Render("         - Copy the composer's text, or the selected Needs-you row's title and number"),
 		keyStyle.Render("o")+descStyle.Render("         - Open the selected lane's folder in the Finder"),
 		"",
