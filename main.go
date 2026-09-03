@@ -29,7 +29,15 @@ var (
 	noSplashFlag    bool
 	noButterflyFlag bool
 	binName         string
-	rootCmd         = &cobra.Command{
+	// accountFlag/modalityFlag are clarity-attach's own seat declaration
+	// (FRONTDOOR-SPEC.md slice 4 item 3): both optional, and when empty the
+	// command falls back to the lane's own .claude/CLAUDE.md Account:/
+	// Modality: lines (session/clarity's accountFromLaneDir/
+	// modalityFromLaneDir) so a declared lane registers with its seat even
+	// before the wrapper (scripts/clarity) passes these flags.
+	accountFlag  string
+	modalityFlag string
+	rootCmd      = &cobra.Command{
 		Use:   "claude-squad",
 		Short: "Clarity Workspace - Manage multiple AI agents like Claude Code, Aider, Codex, and Amp.",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -193,9 +201,12 @@ var (
 			if err != nil {
 				return fmt.Errorf("failed to load instances: %w", err)
 			}
+
+			account, modality := resolveAttachSeat(accountFlag, modalityFlag, lanePath)
+
 			for _, existing := range instances {
-				if existing.Title == lane {
-					return fmt.Errorf("an instance named %q already exists (status %v) - kill it first, or reattach to it from cs", lane, existing.Status)
+				if existing.Title == lane && existing.Account() == account {
+					return fmt.Errorf("an instance named %q already exists on account %q (status %v) - kill it first, or reattach to it from cs", lane, account, existing.Status)
 				}
 			}
 
@@ -204,6 +215,8 @@ var (
 				Path:       lanePath,
 				Program:    program,
 				NoWorktree: true,
+				Account:    account,
+				Modality:   modality,
 			})
 			if err != nil {
 				return fmt.Errorf("failed to create instance: %w", err)
@@ -430,6 +443,25 @@ var (
 	}
 )
 
+// resolveAttachSeat applies clarity-attach's account/modality resolution
+// (FRONTDOOR-SPEC.md slice 4 item 3): the --account/--modality flags win
+// when set; otherwise the lane folder's own declared Account:/Modality:
+// lines (session/clarity's accountFromLaneDir/modalityFromLaneDir, via the
+// AccountFromLaneDir/ModalityFromLaneDir wrappers). Split out from
+// clarityAttachCmd's RunE closure so it is testable without running the
+// full attach, which starts a real tmux session and blocks on Attach().
+func resolveAttachSeat(accountFlag, modalityFlag, lanePath string) (account, modality string) {
+	account = accountFlag
+	if account == "" {
+		account = clarity.AccountFromLaneDir(lanePath)
+	}
+	modality = modalityFlag
+	if modality == "" {
+		modality = clarity.ModalityFromLaneDir(lanePath)
+	}
+	return account, modality
+}
+
 func init() {
 	rootCmd.Flags().StringVarP(&programFlag, "program", "p", "",
 		"Program to run in new instances (e.g. 'aider --model ollama_chat/gemma3:1b')")
@@ -449,6 +481,10 @@ func init() {
 
 	clarityAttachCmd.Flags().StringVarP(&programFlag, "program", "p", "",
 		"Program to run in the attached instance (e.g. 'aider --model ollama_chat/gemma3:1b')")
+	clarityAttachCmd.Flags().StringVar(&accountFlag, "account", "",
+		"Seat tag to register this instance under (e.g. 'team-b'); defaults to the lane's own Account: line")
+	clarityAttachCmd.Flags().StringVar(&modalityFlag, "modality", "",
+		"Modality to register this instance under (e.g. 'bid'); defaults to the lane's own Modality: line")
 
 	laneTailCmd.Flags().IntVar(&laneTailTurnsFlag, "turns", clarity.DefaultTailTurns,
 		"Number of trailing turns to print")
