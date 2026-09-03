@@ -479,6 +479,22 @@ func (c *Composer) Render(width int, lane string) []string {
 	if displayExternal && !noLane {
 		title = fmt.Sprintf(" message %s%s ", displayLane, copyOnlySuffix)
 	}
+	// Board #295b: a composer OpenForIssue tagged (m on a board-sourced
+	// Needs-you row, board #313's own replay defect) is always titled by its
+	// issue number, never the generic "message <lane>"/NoLaneLabel shape -
+	// the row's raising lane may genuinely be unresolved at the moment m is
+	// pressed (the fetch has not landed, or neither the card's own Lane
+	// section nor its lane: label resolved one), and "(no lane on this
+	// row)" reads as "there is nothing to answer" when there plainly is
+	// (the issue number is right there). Enter still posts and closes
+	// either way (app.go's stateMsg handling) - this is display only.
+	if c.open && c.answerIssue != 0 {
+		if noLane {
+			title = fmt.Sprintf(" answer #%d (no lane known) ", c.answerIssue)
+		} else {
+			title = fmt.Sprintf(" answer #%d · to %s ", c.answerIssue, displayLane)
+		}
+	}
 	top := "┌" + title + strings.Repeat("─", maxInt0(width-2-lipgloss.Width(title))) + "┐"
 
 	wrapped := c.wrappedLines(width)

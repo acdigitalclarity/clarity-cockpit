@@ -4,8 +4,10 @@
 package app
 
 import (
+	"claude-squad/cmd/cmd_test"
 	"claude-squad/session/clarity"
 	"errors"
+	"os/exec"
 	"testing"
 	"time"
 
@@ -146,4 +148,149 @@ func TestMKey_TrackedRow_NeverTagsAnIssue_BehavesAsToday(t *testing.T) {
 	require.Equal(t, 0, result.issue)
 	require.Empty(t, rec.postCalls, "an ordinary message never touches the board")
 	require.Empty(t, rec.closeCalls)
+}
+
+// -- board #313's own replay defect: a board-shaped feed row (rank/state/
+// source/title, no lane column at all - fleet_queue_build.py's real owner-
+// action shape) must still reach the board on Enter, whether the row's
+// raising lane resolves from the fetched issue's own lane: label (a), never
+// resolves at all (b), or the fetch simply has not landed yet when Enter is
+// pressed (c). Before this fix, app.go's stateMsg Enter handler checked
+// composer.Lane() == "" BEFORE composer.AnswerIssue() != 0 - an unknown
+// lane silently dropped the whole answer (no POST, no PATCH), which is
+// exactly what the orchestrator's own replay against board #313 hit.
+
+// seedBoardRowUnrelatedTracked seeds one board-sourced Needs-you row (no
+// lane column, matching the real fleet_queue_build.py owner-action shape)
+// behind an UNRELATED tracked instance - so the row's raising lane resolves
+// (or fails to) purely from the fetched issue, never from a same-named
+// tracked lane sitting right there by coincidence.
+func seedBoardRowUnrelatedTracked(t *testing.T, h *home, source, title string) {
+	t.Helper()
+	inst := trackedInstanceWithFakeTmux(t, "unrelated-lane", "ok\n")
+	h.list.AddInstance(inst)
+	h.list.SetSelectedInstance(0)
+	h.list.SetNeedsYou([]clarity.FeedItem{{Rank: 1, Source: source, Lane: source, Title: title}}, "")
+	h.list.Up() // wraps from the tracked row onto the sole Needs-you row
+}
+
+// mockCopyExec is the same real-clipboard guard test 8 (answer_and_bank_
+// test.go) already uses: an unresolved-lane row falls through to the copy
+// path (composerTarget's own isExternal=true), which must never shell out
+// to the real pbcopy inside a test.
+func mockCopyExec() (*cmd_test.MockCmdExec, *[]string) {
+	var args []string
+	exec := &cmd_test.MockCmdExec{RunFunc: func(c *exec.Cmd) error {
+		args = c.Args
+		return nil
+	}}
+	return exec, &args
+}
+
+// test (a): the fetched issue's lane: label resolves to a TRACKED instance -
+// posts, closes, removes, footer names the lane by its literal delivery
+// text ("sent into <lane>").
+func TestMKey_BoardRowNoLaneColumn_LabelLaneResolvesTracked_PostsClosesRemoves(t *testing.T) {
+	rec := &ghExecRecorder{fetchBody: `{"body":"## Options\n(a) x.","labels":[{"name":"lane:fake-lane"},{"name":"type:owner-action"}]}`}
+	h := newAnswerTestHome(t, rec)
+	inst := trackedInstanceWithFakeTmux(t, "fake-lane", "ok\n")
+	h.list.AddInstance(inst)
+	h.list.SetSelectedInstance(0)
+	h.list.SetNeedsYou([]clarity.FeedItem{{Rank: 1, Source: "#313", Lane: "#313", Title: "Scratch row 13"}}, "")
+	h.list.Up()
+	h.boardCache.Get(313) // the fetch has landed before m is pressed
+
+	pressGlobalKey(h, tea.KeyPressMsg{Code: 'm', Text: "m"})
+	require.True(t, h.composer.IsOpen())
+	require.Equal(t, 313, h.composer.AnswerIssue())
+	title := h.composer.Render(80, "")[0]
+	require.Contains(t, title, "answer #313 · to fake-lane", "never the generic message/NoLaneLabel title once an issue is tagged")
+	require.NotContains(t, title, "no lane on this row")
+
+	h.composer.Type("test answer")
+	_, cmd := h.handleKeyPress(tea.KeyPressMsg{Code: tea.KeyEnter})
+	require.NotNil(t, cmd)
+	msg := cmd()
+	result := msg.(composerResultMsg)
+	require.NoError(t, result.err)
+	require.True(t, result.closed)
+	require.Equal(t, "answered #313 · closed · sent into fake-lane", result.result)
+	require.Len(t, rec.postCalls, 1)
+	require.Contains(t, rec.postCalls[0], "body=answered from the cockpit: test answer\nsent into fake-lane at ")
+	require.Len(t, rec.closeCalls, 1)
+
+	h.Update(msg)
+	require.Equal(t, 0, h.list.NumNeedsYou())
+}
+
+// test (b): neither the card's own Lane section, its lane: label, nor a
+// matching tracked/external row ever resolves a lane - posts, closes,
+// removes, footer says "copied (no lane known)".
+func TestMKey_BoardRowNoLaneColumn_LaneNeverResolves_PostsClosesFootersNoLaneKnown(t *testing.T) {
+	rec := &ghExecRecorder{fetchBody: `{"body":"## Options\n(a) x."}`}
+	h := newAnswerTestHome(t, rec)
+	copyExec, copiedArgs := mockCopyExec()
+	h.cmdExec = *copyExec
+	seedBoardRowUnrelatedTracked(t, h, "#314", "Scratch row 14")
+	h.boardCache.Get(314) // the fetch has landed - and still resolves nothing
+
+	pressGlobalKey(h, tea.KeyPressMsg{Code: 'm', Text: "m"})
+	require.True(t, h.composer.IsOpen())
+	require.Equal(t, 314, h.composer.AnswerIssue())
+	title := h.composer.Render(80, "")[0]
+	require.Contains(t, title, "answer #314 (no lane known)")
+	require.NotContains(t, title, "no lane on this row")
+
+	h.composer.Type("test answer")
+	_, cmd := h.handleKeyPress(tea.KeyPressMsg{Code: tea.KeyEnter})
+	require.NotNil(t, cmd)
+	msg := cmd()
+	result := msg.(composerResultMsg)
+	require.NoError(t, result.err)
+	require.True(t, result.closed)
+	require.Equal(t, "answered #314 · closed · copied (no lane known)", result.result)
+	require.Equal(t, []string{"pbcopy"}, *copiedArgs, "no lane known - the reply still goes somewhere the owner can read it")
+	require.Len(t, rec.postCalls, 1)
+	require.Len(t, rec.closeCalls, 1)
+
+	h.Update(msg)
+	require.Equal(t, 0, h.list.NumNeedsYou())
+}
+
+// test (c): Enter arrives BEFORE the board fetch has landed at all (no
+// boardCache.Get call yet - this is the orchestrator's exact replay timing,
+// board #313: m, type, Enter inside a handful of seconds) - the comment and
+// close still go, using whatever lane resolution is known at that instant
+// (none, here).
+func TestMKey_BoardRowNoLaneColumn_EnterBeforeFetchLands_StillPostsAndCloses(t *testing.T) {
+	rec := &ghExecRecorder{fetchBody: `{"body":"## Lane\nfake-lane"}`}
+	h := newAnswerTestHome(t, rec)
+	copyExec, copiedArgs := mockCopyExec()
+	h.cmdExec = *copyExec
+	seedBoardRowUnrelatedTracked(t, h, "#315", "Scratch row 15")
+	// Deliberately no h.boardCache.Get(315) here - the fetch has not landed.
+
+	pressGlobalKey(h, tea.KeyPressMsg{Code: 'm', Text: "m"})
+	require.True(t, h.composer.IsOpen())
+	require.Equal(t, 315, h.composer.AnswerIssue())
+	title := h.composer.Render(80, "")[0]
+	require.Contains(t, title, "answer #315 (no lane known)", "the fetch has not landed - nothing to resolve yet")
+
+	h.composer.Type("test answer")
+	_, cmd := h.handleKeyPress(tea.KeyPressMsg{Code: tea.KeyEnter})
+	require.NotNil(t, cmd)
+	msg := cmd()
+	result := msg.(composerResultMsg)
+	require.NoError(t, result.err)
+	require.True(t, result.closed, "the answer needs only the issue number - it never waits on the fetch")
+	require.Equal(t, "answered #315 · closed · copied (no lane known)", result.result)
+	require.Equal(t, []string{"pbcopy"}, *copiedArgs)
+	require.Len(t, rec.postCalls, 1)
+	require.Contains(t, rec.postCalls[0], "body=answered from the cockpit: test answer")
+	require.Len(t, rec.closeCalls, 1)
+	_, fetched := h.boardCache.Peek(315)
+	require.False(t, fetched, "the fetch never ran - the answer did not wait on it")
+
+	h.Update(msg)
+	require.Equal(t, 0, h.list.NumNeedsYou())
 }

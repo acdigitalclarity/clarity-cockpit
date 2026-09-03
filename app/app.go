@@ -1160,30 +1160,45 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 		switch msg.Code {
 		case tea.KeyEnter:
 			lane, isExternal := m.composer.Lane(), m.composer.IsExternal()
+			text := m.composer.Value()
+			// Board #313's own replay defect: an answer-tagged composer (m
+			// on a board-sourced Needs-you row, OpenForIssue) must ALWAYS
+			// post the comment and close the issue on Enter - it needs only
+			// the issue number, never the row's raising lane, which is
+			// frequently unresolved at this exact moment (the board fetch
+			// has not landed, or neither the card's own Lane section nor its
+			// lane: label ever resolves one). This check runs BEFORE the
+			// lane=="" bailout below, which exists only for the PLAIN
+			// message flow (no issue) - checking lane first, as this used
+			// to, silently dropped every answer whose lane was unknown: no
+			// comment POST, no close PATCH, just the row sitting there as if
+			// nothing had been typed at all.
+			if issue := m.composer.AnswerIssue(); issue != 0 {
+				if strings.TrimSpace(text) == "" {
+					m.composer.Close()
+					m.state = stateDefault
+					m.menu.SetState(ui.StateDefault)
+					return m, nil
+				}
+				return m, m.sendAnswerCmd(issue, lane, isExternal, text)
+			}
 			if lane == "" {
 				// Neither the board card's own Lane field nor the issue's
 				// lane: label resolved (board #280, slice 5b, DEFECT 2) -
 				// enter delivers nothing; the composer stays visible and
 				// shows why, the same way a successful send shows its own
-				// landed foot.
+				// landed foot. Only reachable here for a PLAIN message (no
+				// AnswerIssue) - an answer always posts/closes above.
 				m.composer.SetResult("no lane to send to")
 				m.state = stateDefault
 				m.menu.SetState(ui.StateDefault)
 				return m, nil
 			}
-			text := m.composer.Value()
 			if strings.TrimSpace(text) == "" {
 				m.composer.Close()
 				m.state = stateDefault
 				m.menu.SetState(ui.StateDefault)
 				return m, nil
-			}
-			// The y-key answer strip's own e chord (EditConfirmedAnswer)
-			// re-enters this same typing mode with AnswerIssue set - Enter
-			// here still runs the two-write answer flow, with whatever text
-			// was edited, rather than a plain message send (RULE 6).
-			if issue := m.composer.AnswerIssue(); issue != 0 {
-				return m, m.sendAnswerCmd(issue, lane, isExternal, text)
 			}
 			return m, m.sendComposerCmd(lane, isExternal, text)
 		case tea.KeyBackspace:
@@ -1403,8 +1418,11 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 				}
 			}
 
-			// Delete from storage first
-			if err := m.storage.DeleteInstance(selected.Title); err != nil {
+			// Delete from storage first - keyed on account plus title
+			// (front-door slice 4, session/storage.go's DeleteInstance-
+			// ByAccountTitle), so killing one seat's row never deletes
+			// another seat's row of the same title.
+			if err := m.storage.DeleteInstanceByAccountTitle(selected.Account(), selected.Title); err != nil {
 				return err
 			}
 
@@ -2420,6 +2438,13 @@ func (m *home) sendComposerCmd(lane string, isExternal bool, text string) tea.Cm
 // deliverResult.result ("copied · this lane runs in your own terminal,
 // paste it there"), which stays exactly as it already was for that flow.
 func copiedIntoLanePrefix(lane string) string {
+	if lane == "" {
+		// Board #313's own replay defect: an answer whose lane never
+		// resolved is still delivered (copied, since there is no tmux
+		// session to send it into) - the prefix says so plainly rather than
+		// naming a blank lane.
+		return "copied (no lane known)"
+	}
 	return fmt.Sprintf("copied · paste it in %s", lane)
 }
 
@@ -2430,10 +2455,19 @@ func copiedIntoLanePrefix(lane string) string {
 // they land on the first attempt (sendAnswerCmd) or a later retry (retry-
 // CommentCmd), so a caller never has to special-case which one produced it.
 func closedFooter(issue int, lane string, isExternal bool) string {
-	if isExternal {
-		return fmt.Sprintf("answered #%d · closed · copied (lane in your terminal)", issue)
+	if !isExternal {
+		return fmt.Sprintf("answered #%d · closed · sent into %s", issue, lane)
 	}
-	return fmt.Sprintf("answered #%d · closed · sent into %s", issue, lane)
+	if lane == "" {
+		// Board #313's own replay defect: the row's raising lane never
+		// resolved at all (no board fetch landed, no lane: label, no ##
+		// Lane section) - the reply is still copied and the issue still
+		// closed, and the footer says exactly why it copied rather than
+		// sent, distinct from the "lane in your terminal" case where the
+		// lane IS known but external.
+		return fmt.Sprintf("answered #%d · closed · copied (no lane known)", issue)
+	}
+	return fmt.Sprintf("answered #%d · closed · copied (lane in your terminal)", issue)
 }
 
 // sendAnswerCmd is the y-key answer flow's own Enter, and (board #295) m's
