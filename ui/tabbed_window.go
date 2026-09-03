@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"os"
@@ -240,6 +241,32 @@ type TabbedWindow struct {
 	butterflyNoticeTick        int  // ticks elapsed in the current notice phase
 	butterflyNoticeFromCol     int  // the column the outbound leg departs from
 	butterflyNoticeReturnTab   int  // the tab that was active when the notice started - where the inbound leg lands
+
+	// baseRenderValid/baseRenderKey/baseRenderRow/baseRenderWindow are
+	// String()'s own memoised BASE assembly (item 2, slice 20b) - the
+	// profile named this method's own lipgloss.Style.Render (the tab
+	// borders and the window box) and lipgloss.Place calls as the largest
+	// remaining idle-tick cost once List.String() was cached, and the
+	// butterfly's own rest-beat animation (see the doc comment above)
+	// changes every 100ms tick regardless of anything else - so a naive
+	// whole-method cache the way List.String() uses would almost never
+	// hit. Instead only the BASE pieces - the tab row before any butterfly
+	// overlay, and the content window - are cached, keyed on the four
+	// inputs that actually change them (width, height, activeTab, and the
+	// active pane's own rendered content); the butterfly overlay and the
+	// final JoinVertical still run on every call (cheap string splicing on
+	// already-built lines, not a fresh Style.Render/Place pass), so the
+	// wing still flaps and wanders exactly as before.
+	baseRenderValid  bool
+	baseRenderKey    string
+	baseRenderRow    string
+	baseRenderWindow string
+
+	// baseRenderCalls is a test-only observation hook (item 4a's own
+	// TabbedWindow counterpart): the number of times the base assembly
+	// (tab styling, window box) has actually run - never incremented when
+	// only the butterfly's own position or frame has moved.
+	baseRenderCalls int
 }
 
 // NewTabbedWindow wires the three tabs: Session (slice 3's replacement for
@@ -918,10 +945,67 @@ func (w *TabbedWindow) ResetTerminalToNormalMode() {
 	w.terminal.ResetToNormalMode()
 }
 
+// String renders the tab bar plus the active tab's own content. The
+// expensive BASE assembly (every tab's own bordered Style.Render, the
+// content window's Place/Render) is memoised via renderBase below, keyed
+// on the four inputs that can actually change it; the butterfly overlay
+// and the final JoinVertical still run on every call - see baseRenderKey's
+// own doc comment on TabbedWindow for why the whole method is never cached
+// the way List.String() is.
 func (w *TabbedWindow) String() string {
 	if w.width == 0 || w.height == 0 {
 		return ""
 	}
+
+	var content string
+	switch w.activeTab {
+	case SessionTab:
+		content = w.session.String()
+	case NeedsYouTab:
+		content = w.needsYou.String()
+	case TerminalTab:
+		content = w.terminal.String()
+	}
+
+	row, window := w.renderBase(content)
+
+	totalTabWidth := w.width + windowStyle.GetHorizontalFrameSize()
+
+	// Butterfly overlay (slice 21): the two blank rows above the tab bar
+	// (this used to be a single "\n" block - see git history - now built
+	// explicitly so the top-of-flight spacer row is addressable) and the
+	// tab row's own border line (row's first of its three lines - border,
+	// names, bottom border). Never drawn over the tab names one line down.
+	// Applied fresh on every call, even a base-cache hit: the butterfly's
+	// own rest-beat/wander animation moves regardless of whether the tab
+	// bar or window content itself has changed - a spinner-frame-on-a-
+	// working-row change, generalised to this pane's own moving glyph.
+	topSpacer := strings.Repeat(" ", totalTabWidth)
+	bottomSpacer := topSpacer
+	if w.butterflyEnabled {
+		if col, brow := w.butterflyPosition(); brow == -1 {
+			bottomSpacer = w.butterflyOverlay(bottomSpacer, col)
+		} else if lines := strings.SplitN(row, "\n", 2); len(lines) == 2 {
+			row = w.butterflyOverlay(lines[0], col) + "\n" + lines[1]
+		}
+	}
+
+	return lipgloss.JoinVertical(lipgloss.Left, topSpacer, bottomSpacer, row, window)
+}
+
+// renderBase returns the tab row (before any butterfly overlay) and the
+// content window, memoised on (width, height, activeTab, content) - the
+// only four inputs either piece actually depends on. A cache hit skips
+// every tab's own bordered Style.Render and the window's own Place/Render,
+// the profile's own named cost once List.String() was cached (item 2,
+// slice 20b); a miss runs exactly the same construction this method always
+// has and records the new base for next time.
+func (w *TabbedWindow) renderBase(content string) (row, window string) {
+	key := fmt.Sprintf("%d|%d|%d|%s", w.width, w.height, w.activeTab, content)
+	if w.baseRenderValid && w.baseRenderKey == key {
+		return w.baseRenderRow, w.baseRenderWindow
+	}
+	w.baseRenderCalls++
 
 	var renderedTabs []string
 
@@ -967,36 +1051,15 @@ func (w *TabbedWindow) String() string {
 		renderedTabs = append(renderedTabs, style.Render(t))
 	}
 
-	row := lipgloss.JoinHorizontal(lipgloss.Top, renderedTabs...)
-
-	// Butterfly overlay (slice 21): the two blank rows above the tab bar
-	// (this used to be a single "\n" block - see git history - now built
-	// explicitly so the top-of-flight spacer row is addressable) and the
-	// tab row's own border line (row's first of its three lines - border,
-	// names, bottom border). Never drawn over the tab names one line down.
-	topSpacer := strings.Repeat(" ", totalTabWidth)
-	bottomSpacer := topSpacer
-	if w.butterflyEnabled {
-		if col, brow := w.butterflyPosition(); brow == -1 {
-			bottomSpacer = w.butterflyOverlay(bottomSpacer, col)
-		} else if lines := strings.SplitN(row, "\n", 2); len(lines) == 2 {
-			row = w.butterflyOverlay(lines[0], col) + "\n" + lines[1]
-		}
-	}
-
-	var content string
-	switch w.activeTab {
-	case SessionTab:
-		content = w.session.String()
-	case NeedsYouTab:
-		content = w.needsYou.String()
-	case TerminalTab:
-		content = w.terminal.String()
-	}
-	window := windowStyle.Render(
+	row = lipgloss.JoinHorizontal(lipgloss.Top, renderedTabs...)
+	window = windowStyle.Render(
 		lipgloss.Place(
 			w.width, w.height-2-windowStyle.GetVerticalFrameSize()-tabHeight,
 			lipgloss.Left, lipgloss.Top, content))
 
-	return lipgloss.JoinVertical(lipgloss.Left, topSpacer, bottomSpacer, row, window)
+	w.baseRenderValid = true
+	w.baseRenderKey = key
+	w.baseRenderRow = row
+	w.baseRenderWindow = window
+	return row, window
 }

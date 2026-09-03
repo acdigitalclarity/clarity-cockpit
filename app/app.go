@@ -244,6 +244,16 @@ type home struct {
 	// directly in a test (skipping newHome) still works.
 	laneTailCache *clarity.LaneTailCache
 
+	// externalLaneScanner is DiscoverExternalLanes' own change-driven
+	// wrapper (item 3, slice 20b) - feedTickMsg's handler below calls
+	// Scan through it instead of calling clarity.DiscoverExternalLanes
+	// directly, so a tick whose fingerprint (session/clarity's
+	// ExternalLanesScanFingerprint) has not moved reuses the last walk's
+	// own lane list rather than re-globbing every root. The zero value is
+	// ready to use (ExternalLaneScanner's own doc comment); no lazy-init
+	// guard is needed the way laneTailCache above carries one.
+	externalLaneScanner clarity.ExternalLaneScanner
+
 	// laneSentAt is item 5's own "the cockpit sent into that lane" clock
 	// (WAITING HELD, cockpit-pane modalities research, 3 Sep): the last
 	// instant THIS process actually delivered text into a tracked lane's
@@ -668,17 +678,22 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.tabbedWindow.NoticeNeedsYou(needsYouItems)
 		}
 
-		// Refresh the external-lane rows on this same tick - exactly one
-		// glob per tick (clarity.DiscoverExternalLanes), same cadence as
-		// the feed above, never a tick of its own (the brief's requirement).
-		// Excluded by working-directory path (DEDUPE defect's root-cause
-		// fix), never by a name derived from either side's own transcript
-		// directory encoding.
+		// Refresh the external-lane rows on this same tick - same cadence
+		// as the feed above, never a tick of its own (the brief's
+		// requirement), but via externalLaneScanner (item 3, slice 20b)
+		// rather than clarity.DiscoverExternalLanes directly: the walk
+		// itself only actually runs when something under
+		// claudeProjectsRoots() has changed since the last tick, liveness
+		// is refreshed every tick regardless (one tmux list-sessions call,
+		// never one has-session subprocess per lane). Excluded by
+		// working-directory path (DEDUPE defect's root-cause fix), never
+		// by a name derived from either side's own transcript directory
+		// encoding.
 		trackedPaths := make([]string, 0, m.list.NumInstances())
 		for _, inst := range m.list.GetInstances() {
 			trackedPaths = append(trackedPaths, inst.Path)
 		}
-		if external, err := clarity.DiscoverExternalLanes(clarity.TrackedExclusionPaths(trackedPaths)); err != nil {
+		if external, err := m.externalLaneScanner.Scan(clarity.TrackedExclusionPaths(trackedPaths)); err != nil {
 			log.WarningLog.Printf("discover external lanes failed: %v", err)
 		} else {
 			// The state word every lane row now carries (item 1): read

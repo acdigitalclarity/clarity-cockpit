@@ -574,6 +574,31 @@ type List struct {
 	// follow. Only the tag SET matters to the fleet line below; the config
 	// dir values are not read here.
 	accountsRegistry map[string]string
+
+	// renderCacheValid/renderCacheKey/renderCacheValue are String()'s own
+	// memoised output (item 2, slice 20b) - the profile named
+	// groupLanesByModality plus every row's own ANSI render as the
+	// remaining idle-tick cost once slice 20's resting-frame fix landed.
+	// String() is a pure function of the fields renderFingerprint (below)
+	// reads - rows, states, selection, width, drawn order, attention rank
+	// - so two consecutive calls whose fingerprint has not moved return
+	// the same bytes without walking a single row. Keyed on that
+	// fingerprint STRING, never on wall-clock: laneStateGlyph carries no
+	// animated frame today (the *spinner.Model field on InstanceRenderer
+	// below is stored but never read by a row's own render), so nothing
+	// about a row's drawn bytes ever changes except through one of the
+	// fingerprinted fields - a genuinely animated glyph would need its own
+	// frame index folded into the fingerprint the same way every other
+	// field is, never a bare tick count.
+	renderCacheValid bool
+	renderCacheKey   string
+	renderCacheValue string
+
+	// externalRenderCalls is a test-only observation hook (item 4a): the
+	// number of times renderExternalRow has actually run - never
+	// incremented on a cache hit, since String() returns renderCacheValue
+	// before the row loop below is ever reached.
+	externalRenderCalls int
 }
 
 // SetCollapsed records whether the terminal itself is below
@@ -834,6 +859,12 @@ func (l *List) laneNameColWidth(showWord bool) int {
 type InstanceRenderer struct {
 	spinner *spinner.Model
 	width   int
+
+	// renderCalls is a test-only observation hook (item 4a, slice 20b):
+	// the number of times Render has actually run - never incremented on
+	// a List.String() cache hit, since that returns its own cached bytes
+	// before this method is ever reached.
+	renderCalls int
 }
 
 // setWidth records the list's own column width directly (defect 2: this
@@ -844,6 +875,7 @@ func (r *InstanceRenderer) setWidth(width int) {
 }
 
 func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, hasMultipleRepos bool, showWord bool, showTag bool) string {
+	r.renderCalls++
 	prefix := fmt.Sprintf("%d. ", idx)
 	if idx >= 10 {
 		prefix = prefix[:len(prefix)-1]
@@ -1097,6 +1129,7 @@ func (k laneAttentionKey) less(other laneAttentionKey) bool {
 // lanes (message only)" block, so the two paths can never drift out of step
 // on column layout.
 func (l *List) renderExternalRow(lane clarity.ExternalLane, selected, showWord, showTag bool, innerWidth int) string {
+	l.externalRenderCalls++
 	style := externalRowStyle
 	if selected {
 		style = externalRowSelectedStyle
@@ -1169,7 +1202,100 @@ func (l *List) fleetLine() string {
 	return strings.Join(parts, " · ")
 }
 
+// String renders the list - memoised (item 2, slice 20b) against
+// renderFingerprint below: a call whose fingerprint has not moved since the
+// last one returns the cached bytes without walking groupLanesByModality or
+// rendering a single row.
 func (l *List) String() string {
+	key := l.renderFingerprint()
+	if l.renderCacheValid && l.renderCacheKey == key {
+		return l.renderCacheValue
+	}
+	value := l.renderUncached()
+	l.renderCacheValid = true
+	l.renderCacheKey = key
+	l.renderCacheValue = value
+	return value
+}
+
+// renderFingerprint is a cheap string summary of every input String()'s own
+// render actually depends on: each tracked instance's own display fields
+// (state, last-turn, context fill, needs-key, alive/paused, account,
+// modality, title, branch, worktree), each external lane's own equivalent
+// fields, the Needs-you feed (plus which of its rows currently read
+// answered), the accounts registry's own tag set (the fleet line), the
+// repo-name-ambiguity flag, and the render-affecting List fields
+// themselves (width, height, collapsed, autoyes, and the current
+// selection). Built with fmt.Sprintf/strconv-cheap primitives only - no
+// ANSI style is resolved and no row is truncated here, so computing this on
+// every tick costs a small fraction of an actual render pass. Field ORDER
+// here mirrors groupLanesByModality's own scan order (items then external)
+// so two lists that would draw identically always fingerprint identically
+// too, never a false cache miss from pure map/slice iteration order.
+func (l *List) renderFingerprint() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "w%dh%dc%vay%vsel%dse%vsn%v;",
+		l.width, l.height, l.collapsed, l.autoyes, l.selectedIdx, l.selExternal, l.selNeedsYou)
+
+	b.WriteString("items:")
+	for _, it := range l.items {
+		writeInstanceFingerprint(&b, it)
+	}
+
+	b.WriteString("|ext:")
+	for _, ext := range l.external {
+		writeExternalFingerprint(&b, ext)
+	}
+
+	b.WriteString("|ny:")
+	fmt.Fprintf(&b, "%s;", l.needsYouStatus)
+	for _, item := range l.needsYou {
+		fmt.Fprintf(&b, "%d|%s|%s|%s|%s|%v;", item.Rank, item.Class, item.Source, item.Title, item.Lane, l.isAnsweredItem(item))
+	}
+
+	fmt.Fprintf(&b, "|repos:%v", len(l.repos) > 1)
+
+	b.WriteString("|reg:")
+	regTags := make([]string, 0, len(l.accountsRegistry))
+	for tag := range l.accountsRegistry {
+		regTags = append(regTags, tag)
+	}
+	sort.Strings(regTags)
+	for _, tag := range regTags {
+		fmt.Fprintf(&b, "%s;", tag)
+	}
+
+	return b.String()
+}
+
+// writeInstanceFingerprint appends one tracked instance's own render-
+// relevant fields to b - every value String()'s row render, sort or
+// grouping actually reads (laneLivenessState, laneAttentionRank,
+// InstanceRenderer.Render, groupLanesByModality), nothing more.
+func writeInstanceFingerprint(b *strings.Builder, i *session.Instance) {
+	pct, fillOK := i.GetContextFill()
+	state, lastTurn, turnOK := i.GetLaneState()
+	fmt.Fprintf(b, "%s|%s|%v|%s|%s|%v|%v|%v|%v|%s|%d|%v|%d|%v|%d;",
+		i.Title, i.Branch, i.HasWorktree(), i.Modality(), i.Account(),
+		i.Started(), i.Paused(), i.Alive(), i.NeedsKey(),
+		state, lastTurn.UnixNano(), turnOK,
+		pct, fillOK, i.GetAnsweredAt().UnixNano())
+}
+
+// writeExternalFingerprint is writeInstanceFingerprint's own external-lane
+// equivalent - every field externalLivenessState, laneAttentionRank or
+// renderExternalRow actually reads.
+func writeExternalFingerprint(b *strings.Builder, ext clarity.ExternalLane) {
+	fmt.Fprintf(b, "%s|%s|%s|%s|%s|%v|%v|%d|%v|%d|%v|%d;",
+		ext.Name, ext.Account, ext.SeatSource, ext.Modality,
+		ext.State, ext.StateOK, ext.Alive, ext.LastTurn.UnixNano(),
+		ext.FillOK, ext.Fill.Pct, ext.AnsweredAt.IsZero(), ext.AnsweredAt.UnixNano())
+}
+
+// renderUncached is String()'s own real render pass, unchanged from before
+// slice 20b's memoisation other than its name - String() above now decides
+// whether this ever runs.
+func (l *List) renderUncached() string {
 	const titleText = " Instances "
 	const autoYesText = " auto-yes "
 

@@ -370,18 +370,23 @@ func ExternalLaneAlive(name string, exec cmd.Executor, tmuxArgs ...string) bool 
 	return exec.Run(osexec.Command("tmux", args...)) == nil
 }
 
-// DiscoverExternalLanes derives the list of live external lanes: every
-// <root>/<encoded>/*.jsonl transcript across every root claudeProjectsRoots()
-// names, whose mtime is within ExternalLiveWindow, minus any path containing
-// "memory", minus any lane name starting with "subagents", minus any lane
-// whose transcript's own "cwd" field is already present in excludeDirs (see
-// TrackedExclusionPaths - a lane Claude Squad already tracks as an instance
-// is never ALSO shown as an external row) - collapsed to the single newest
-// transcript per (account, lane name) pair, sorted newest-first. The same
-// lane name under two different roots is two rows (different seats) - the
-// dedupe is scoped to one root's own lanes, never across roots. A nil or
-// empty excludeDirs is valid (no exclusions).
-func DiscoverExternalLanes(excludeDirs map[string]bool) ([]ExternalLane, error) {
+// discoverExternalLaneMetadata is DiscoverExternalLanes' own walk half
+// (item 3, slice 20b split): every <root>/<encoded>/*.jsonl transcript
+// across every root claudeProjectsRoots() names, whose mtime is within
+// ExternalLiveWindow, minus any path containing "memory", minus any lane
+// name starting with "subagents", minus any lane whose transcript's own
+// "cwd" field is already present in excludeDirs (see TrackedExclusionPaths
+// - a lane Claude Squad already tracks as an instance is never ALSO shown
+// as an external row) - collapsed to the single newest transcript per
+// (account, lane name) pair, sorted newest-first. The same lane name under
+// two different roots is two rows (different seats) - the dedupe is scoped
+// to one root's own lanes, never across roots. A nil or empty excludeDirs
+// is valid (no exclusions). Every row's Alive is left at its zero value
+// (false) - liveness is the caller's own concern (ExternalLanesAlive
+// below), batched once per pass rather than derived per lane here, so a
+// caller that already has a fresh lane list (ExternalLaneScanner, an
+// unchanged fingerprint) can refresh liveness alone without re-walking.
+func discoverExternalLaneMetadata(excludeDirs map[string]bool) ([]ExternalLane, error) {
 	now := time.Now()
 	var rows []externalTranscriptRow
 	for _, root := range claudeProjectsRoots() {
@@ -439,8 +444,163 @@ func DiscoverExternalLanes(excludeDirs map[string]bool) ([]ExternalLane, error) 
 			Account:        seatTag,
 			SeatSource:     seatSource,
 			Modality:       modalityFromLaneDir(cwd),
-			Alive:          ExternalLaneAlive(r.lane, cmd.MakeExecutor()),
 		})
 	}
 	return out, nil
+}
+
+// ExternalLanesAlive is ExternalLaneAlive's own batched replacement (item 3,
+// slice 20b): ONE `tmux list-sessions -F #S` process names every live
+// session on the addressed server at once, rather than one `tmux
+// has-session` subprocess per external lane - the same liveness ANSWER (a
+// session existing under this exact name), one process instead of N.
+// tmuxArgs is prepended before "list-sessions" the same way
+// ExternalLaneAlive's own tmuxArgs is (e.g. "-L", "sockname" for an
+// isolated test socket); the production caller passes none, the same
+// ambient default server ExternalLaneAlive always addressed. A server with
+// no sessions at all (or not running) reads every name as not alive, never
+// an error - exec.Output's own non-zero exit in that case is the expected
+// shape of "nothing is live here", not a failure to surface.
+func ExternalLanesAlive(names []string, exec cmd.Executor, tmuxArgs ...string) map[string]bool {
+	alive := make(map[string]bool, len(names))
+	args := append(append([]string{}, tmuxArgs...), "list-sessions", "-F", "#S")
+	out, err := exec.Output(osexec.Command("tmux", args...))
+	live := make(map[string]bool)
+	if err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" {
+				live[line] = true
+			}
+		}
+	}
+	for _, n := range names {
+		alive[n] = live[n]
+	}
+	return alive
+}
+
+// DiscoverExternalLanes derives the list of live external lanes:
+// discoverExternalLaneMetadata's own walk, then ExternalLanesAlive's own
+// single batched liveness pass over the resulting Keys. execOverride is
+// the test seam (item 4c: "count through the executor") - a MockCmdExec
+// that counts Output calls; omitted (the production shape, every existing
+// caller) it defaults to cmd.MakeExecutor(), exactly as before this split.
+func DiscoverExternalLanes(excludeDirs map[string]bool, execOverride ...cmd.Executor) ([]ExternalLane, error) {
+	lanes, err := discoverExternalLaneMetadata(excludeDirs)
+	if err != nil {
+		return nil, err
+	}
+	exec := cmd.MakeExecutor()
+	if len(execOverride) > 0 {
+		exec = execOverride[0]
+	}
+	names := make([]string, len(lanes))
+	for i, l := range lanes {
+		names[i] = l.Key
+	}
+	alive := ExternalLanesAlive(names, exec)
+	for i := range lanes {
+		lanes[i].Alive = alive[lanes[i].Key]
+	}
+	return lanes, nil
+}
+
+// ExternalLanesScanFingerprint is a cheap, read-only summary of every
+// directory discoverExternalLaneMetadata's own glob walk would touch (each
+// claudeProjectsRoots() root, plus every one of its immediate
+// subdirectories) - built from directory mtimes alone, never opening a
+// single *.jsonl file. Two consecutive calls returning the same
+// fingerprint mean the walk would enumerate the exact same set of
+// transcript files: a new or removed session subdirectory changes its own
+// root's mtime; a new or removed transcript inside an EXISTING session
+// subdirectory changes that subdirectory's own mtime - both are covered,
+// so ExternalLaneScanner.Scan below can skip the walk whenever this string
+// is unchanged. A root or subdirectory this process cannot stat is
+// recorded as "ERR" rather than silently omitted, so a permissions change
+// or a root disappearing still changes the fingerprint.
+func ExternalLanesScanFingerprint() string {
+	var b strings.Builder
+	for _, root := range claudeProjectsRoots() {
+		info, err := os.Stat(root.Path)
+		if err != nil {
+			fmt.Fprintf(&b, "%s=ERR;", root.Path)
+			continue
+		}
+		fmt.Fprintf(&b, "%s@%d;", root.Path, info.ModTime().UnixNano())
+		entries, err := os.ReadDir(root.Path)
+		if err != nil {
+			fmt.Fprintf(&b, "%s/*=ERR;", root.Path)
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			sub := filepath.Join(root.Path, e.Name())
+			si, statErr := os.Stat(sub)
+			if statErr != nil {
+				fmt.Fprintf(&b, "%s=ERR;", sub)
+				continue
+			}
+			fmt.Fprintf(&b, "%s@%d;", sub, si.ModTime().UnixNano())
+		}
+	}
+	return b.String()
+}
+
+// ExternalLaneScanner is DiscoverExternalLanes' own change-driven wrapper
+// (item 3, slice 20b) - app.go's feedTickMsg calls Scan on its existing 3s
+// cadence instead of DiscoverExternalLanes directly. Scan re-walks the
+// filesystem only when ExternalLanesScanFingerprint has actually changed
+// since the last call; on an unchanged pass it reuses the last walk's own
+// lane list and refreshes only their liveness (ExternalLanesAlive - one
+// tmux call, never a walk), so a lane's tmux session dying between two
+// otherwise-quiet ticks is still caught. The zero value is ready to use.
+type ExternalLaneScanner struct {
+	fingerprint string
+	lanes       []ExternalLane
+	primed      bool
+
+	// walkCount is a test-only observation hook (item 4b): the number of
+	// times Scan has actually performed discoverExternalLaneMetadata's own
+	// walk, never incremented on a fingerprint-unchanged pass.
+	walkCount int
+}
+
+// Scan returns the current external-lane list, walking the filesystem only
+// when ExternalLanesScanFingerprint has changed since the previous call.
+// excludeDirs is discoverExternalLaneMetadata's own parameter, re-applied
+// on every walk (never cached against a stale exclusion set - a lane
+// Claude Squad starts tracking between two ticks must stop appearing here
+// on the very next walk, not stay excluded-or-included from whichever set
+// happened to be in force the last time the walk actually ran). execOverride
+// is DiscoverExternalLanes' own test seam, passed straight through to
+// ExternalLanesAlive.
+func (s *ExternalLaneScanner) Scan(excludeDirs map[string]bool, execOverride ...cmd.Executor) ([]ExternalLane, error) {
+	fp := ExternalLanesScanFingerprint()
+	if !s.primed || fp != s.fingerprint {
+		lanes, err := discoverExternalLaneMetadata(excludeDirs)
+		if err != nil {
+			return nil, err
+		}
+		s.lanes = lanes
+		s.fingerprint = fp
+		s.primed = true
+		s.walkCount++
+	}
+
+	exec := cmd.MakeExecutor()
+	if len(execOverride) > 0 {
+		exec = execOverride[0]
+	}
+	names := make([]string, len(s.lanes))
+	for i, l := range s.lanes {
+		names[i] = l.Key
+	}
+	alive := ExternalLanesAlive(names, exec)
+	for i := range s.lanes {
+		s.lanes[i].Alive = alive[s.lanes[i].Key]
+	}
+	return s.lanes, nil
 }
