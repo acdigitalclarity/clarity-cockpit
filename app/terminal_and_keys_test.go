@@ -103,6 +103,7 @@ func homeWithMockedTerminal(t *testing.T, termStartFails bool) *home {
 		list:         ui.NewList(&sp, false),
 		menu:         ui.NewMenu(),
 		tabbedWindow: tw,
+		sessionPane:  sessionPane,
 		errBox:       ui.NewErrBox(),
 		statusBox:    ui.NewStatusBox(),
 		composer:     composer,

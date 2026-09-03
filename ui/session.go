@@ -46,6 +46,26 @@ var sessionClaudeStyle = lipgloss.NewStyle().
 var sessionRuleStyle = lipgloss.NewStyle().
 	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#DDDADA"), Dark: lipgloss.Color("#3C3C3C")})
 
+// sessionPickerAccentStyle is the v-key turn picker's own highlight colour
+// (slice 22, PART B: "the tag line in the accent") - laneStateAccentStyle
+// (ui/list.go's own "working" accent, #dde4f0) bolded, so the highlighted
+// turn's label reads distinctly from every other turn's own tag colour
+// without introducing a fourth hue (colour role rule 2, ui/session.go's own
+// convention).
+var sessionPickerAccentStyle = laneStateAccentStyle.Bold(true)
+
+// sessionPickerMarker/sessionPickerMarkerBlank are the picker's own
+// 2-column gutter marker (PART B: "a marker in the gutter") - "▶ " on the
+// highlighted turn's first line, "  " (same width) on every other turn's,
+// so the turns region's own left edge stays aligned whichever turn
+// currently carries the marker. Deliberately NOT "▸" - the composer's own
+// prompt prefix (ui/composer.go's composerPromptPrefix) already owns that
+// glyph, and the two boxes can be on screen at once.
+const (
+	sessionPickerMarker      = "▶ "
+	sessionPickerMarkerBlank = "  "
+)
+
 // sessionNonComposerBottomRows is the row cost of the bottom rule and the
 // state line - always reserved, regardless of how much of the turns region
 // above them is used (the "newest content pinned to the bottom"
@@ -141,6 +161,16 @@ type SessionPane struct {
 	// the single instance and wires it into both this pane and NeedsYouPane
 	// via SetComposer, since only one row can be the current send target.
 	composer *Composer
+
+	// pickerActive/pickerIdx implement the v-key turn picker (slice 22, PART
+	// B): pickerIdx indexes s.info.Tail.Turns (oldest-first, same order
+	// buildTurnLines walks), always -1 while the picker is closed.
+	// app.go's own stateSessionPicker intercepts up/down/c/esc while
+	// pickerActive is true, routing them to PickerOlder/PickerNewer/
+	// PickerCopyText/ClosePicker below rather than the ordinary list
+	// navigation those keys otherwise drive.
+	pickerActive bool
+	pickerIdx    int
 }
 
 // pad is the reading layout's own left/right inset inside the pane's
@@ -194,7 +224,7 @@ func (s *SessionPane) measure() int {
 // Clear) still need calling before String() shows anything meaningful,
 // same contract as PreviewPane/TerminalPane/DiffPane.
 func NewSessionPane() *SessionPane {
-	return &SessionPane{viewport: viewport.New(), composer: NewComposer()}
+	return &SessionPane{viewport: viewport.New(), composer: NewComposer(), pickerIdx: -1}
 }
 
 // SetComposer wires the shared Composer app.go owns into this pane's own
@@ -220,6 +250,16 @@ func (s *SessionPane) SetInfo(info *SessionInfo) {
 	rebuild := info == nil || s.info == nil || sig != s.turnsSig
 	s.info = info
 	s.turnsSig = sig
+	// The picker's own highlight indexes s.info.Tail.Turns - a feed tick
+	// that lands while it is open (the selected lane wrote a new turn, or
+	// selection moved to a lane with fewer/no turns) must never leave
+	// pickerIdx pointing past the end of a freshly-read tail, so it is
+	// closed outright rather than silently clamped to a turn the owner
+	// never asked to see.
+	if s.pickerActive && (info == nil || s.pickerIdx >= len(info.Tail.Turns)) {
+		s.pickerActive = false
+		s.pickerIdx = -1
+	}
 	if rebuild {
 		s.refreshViewport()
 	}
@@ -331,7 +371,20 @@ func (s *SessionPane) refreshViewport() {
 		s.lineMeta = nil
 		return
 	}
-	lines, meta := buildTurnLines(s.info.Tail.Turns, s.gutter(), s.measure(), s.info.Now)
+	// The picker's own marker column (sessionPickerMarker/-Blank, both 2
+	// cells wide) is reserved out of the wrap width for EVERY turn while it
+	// is active, not only the highlighted one - PickerOlder/PickerNewer both
+	// call this same rebuild on every move, so the wrap width would
+	// otherwise flicker by 2 columns as the highlight moves between turns.
+	measure := s.measure()
+	pickerIdx := -1
+	if s.pickerActive {
+		pickerIdx = s.pickerIdx
+		if measure -= 2; measure < 1 {
+			measure = 1
+		}
+	}
+	lines, meta := buildTurnLines(s.info.Tail.Turns, s.gutter(), measure, s.info.Now, pickerIdx)
 	s.lineMeta = meta
 	s.viewport.SetContent(strings.Join(lines, "\n"))
 	if wasAtBottom {
@@ -353,6 +406,149 @@ func (s *SessionPane) ScrollUp() {
 
 func (s *SessionPane) ScrollDown() {
 	s.viewport.ScrollDown(1)
+}
+
+// -- copy (slice 22, PART B) ---------------------------------------------
+
+// TurnCopyText renders one Turn as plain, ANSI-free text for the system
+// clipboard: the speaker tag and time on the first line, then the text
+// with its own paragraphs, for an owner/assistant turn; "▪ <tool>
+// <summary>  <result>" - the exact shape the brief names - for a tool
+// turn. now anchors a still-RUNNING tool's own elapsed-time label
+// (toolResultLabel's own contract, unchanged here), same as every other
+// reader of it in this file. ansi.Strip is a belt-and-braces pass, not the
+// only reason this is ANSI-free - t.Text/t.Summary/t.Tool are the
+// transcript's own raw fields, never a styled render - but a source field
+// that somehow already carries a raw escape sequence (a pasted terminal
+// capture, say) must not survive into the clipboard either.
+func TurnCopyText(t clarity.Turn, now time.Time) string {
+	var text string
+	switch t.Kind {
+	case clarity.TurnTool:
+		text = fmt.Sprintf("▪ %s  %s  %s", t.Tool, t.Summary, toolResultLabel(t, now))
+	case clarity.TurnOwner:
+		text = fmt.Sprintf("YOU  %s\n\n%s", t.At.Local().Format("15:04:05"), t.Text)
+	case clarity.TurnAssistant:
+		text = fmt.Sprintf("CLAUDE  %s\n\n%s", t.At.Local().Format("15:04:05"), t.Text)
+	default:
+		text = t.Text
+	}
+	return ansi.Strip(text)
+}
+
+// LastTurnCopyText returns the selected lane's most recent turn as plain
+// text (the c key with the composer closed, PART B) plus the line count
+// the footer names ("copied · last turn (N lines)") - ok is false when
+// nothing is selected or the selected lane's transcript has no turns yet,
+// so a caller never claims a copy of nothing.
+func (s *SessionPane) LastTurnCopyText() (text string, lines int, ok bool) {
+	if s.info == nil || len(s.info.Tail.Turns) == 0 {
+		return "", 0, false
+	}
+	last := s.info.Tail.Turns[len(s.info.Tail.Turns)-1]
+	text = TurnCopyText(last, s.info.Now)
+	return text, strings.Count(text, "\n") + 1, true
+}
+
+// TailCopyText joins every turn currently loaded (the C key, PART B's
+// "whole visible transcript tail" - the same Tail.Turns this pane itself
+// renders, not only the lines currently scrolled into view) into one
+// plain-text block, blank-line separated same as the pane's own turns
+// region, plus the turn count the footer names ("copied · N turns").
+func (s *SessionPane) TailCopyText() (text string, turns int, ok bool) {
+	if s.info == nil || len(s.info.Tail.Turns) == 0 {
+		return "", 0, false
+	}
+	parts := make([]string, len(s.info.Tail.Turns))
+	for i, t := range s.info.Tail.Turns {
+		parts[i] = TurnCopyText(t, s.info.Now)
+	}
+	return strings.Join(parts, "\n\n"), len(parts), true
+}
+
+// -- turn picker (slice 22, PART B, the v key) ---------------------------
+
+// OpenPicker enters the turn picker: the newest turn (Tail.Turns' own last
+// entry) starts highlighted, scrolled into view. A no-op (returns false)
+// when nothing is selected or the selected lane has no turns to pick from -
+// so the app never claims to have opened a picker with nothing in it.
+func (s *SessionPane) OpenPicker() bool {
+	if s.info == nil || len(s.info.Tail.Turns) == 0 {
+		return false
+	}
+	s.pickerActive = true
+	s.pickerIdx = len(s.info.Tail.Turns) - 1
+	s.refreshViewport()
+	s.revealPickerTurn()
+	return true
+}
+
+// ClosePicker leaves the picker (esc) - the viewport's own scroll position
+// is left wherever the picker last put it (refreshViewport's own "never
+// snap back down" rule), never reset.
+func (s *SessionPane) ClosePicker() {
+	s.pickerActive = false
+	s.pickerIdx = -1
+	s.refreshViewport()
+}
+
+// PickerActive reports whether the picker is open - app.go's own key
+// dispatch checks this before routing up/down/c/esc to the picker instead
+// of ordinary list navigation.
+func (s *SessionPane) PickerActive() bool {
+	return s.pickerActive
+}
+
+// PickerOlder/PickerNewer move the highlight toward the transcript's start/
+// end respectively (up = older, down = newer - PART B's own words), no-op
+// at either end, and re-scroll the viewport to keep the newly highlighted
+// turn visible.
+func (s *SessionPane) PickerOlder() {
+	if !s.pickerActive || s.pickerIdx <= 0 {
+		return
+	}
+	s.pickerIdx--
+	s.refreshViewport()
+	s.revealPickerTurn()
+}
+
+func (s *SessionPane) PickerNewer() {
+	if !s.pickerActive || s.info == nil || s.pickerIdx >= len(s.info.Tail.Turns)-1 {
+		return
+	}
+	s.pickerIdx++
+	s.refreshViewport()
+	s.revealPickerTurn()
+}
+
+// revealPickerTurn scrolls the viewport so the highlighted turn's own first
+// (label) line is visible - s.lineMeta (rebuilt by the refreshViewport call
+// every picker move already makes) is what maps a rendered line back to the
+// turn it belongs to.
+func (s *SessionPane) revealPickerTurn() {
+	for i, m := range s.lineMeta {
+		if m.turnIdx != s.pickerIdx {
+			continue
+		}
+		switch {
+		case i < s.viewport.YOffset():
+			s.viewport.SetYOffset(i)
+		case i >= s.viewport.YOffset()+s.viewport.Height():
+			s.viewport.SetYOffset(i - s.viewport.Height() + 1)
+		}
+		return
+	}
+}
+
+// PickerCopyText returns the highlighted turn's own plain-text form (the
+// picker's c key) plus its line count, same shape LastTurnCopyText
+// produces - ok is false when the picker is not open.
+func (s *SessionPane) PickerCopyText() (text string, lines int, ok bool) {
+	if !s.pickerActive || s.info == nil || s.pickerIdx < 0 || s.pickerIdx >= len(s.info.Tail.Turns) {
+		return "", 0, false
+	}
+	text = TurnCopyText(s.info.Tail.Turns[s.pickerIdx], s.info.Now)
+	return text, strings.Count(text, "\n") + 1, true
 }
 
 // String renders the pane: the resting frame when nothing is selected, or
@@ -913,23 +1109,40 @@ type sessionTurnLineTag struct {
 // Spacing section); tool turns as one line each, their own result styled by
 // outcome and right-aligned to the measure's own right edge. meta is
 // returned in lock-step with lines - see SessionPane.lineMeta.
-func buildTurnLines(turns []clarity.Turn, gutter, measure int, now time.Time) (lines []string, meta []sessionTurnLineTag) {
+//
+// pickerIdx is the v-key turn picker's own highlight (slice 22, PART B),
+// -1 when the picker is closed: turns then render exactly as before this
+// slice. Once open, EVERY turn's first line gets a 2-column marker prefix
+// (sessionPickerMarker/-Blank) so the region's left edge stays aligned as
+// the highlight moves - the highlighted turn's own marker and tag/tool line
+// carry sessionPickerAccentStyle instead of their ordinary colour.
+func buildTurnLines(turns []clarity.Turn, gutter, measure int, now time.Time, pickerIdx int) (lines []string, meta []sessionTurnLineTag) {
 	for i, t := range turns {
 		if i > 0 {
 			lines = append(lines, "")
 			meta = append(meta, sessionTurnLineTag{turnIdx: i})
+		}
+		marker := ""
+		highlighted := false
+		if pickerIdx >= 0 {
+			highlighted = i == pickerIdx
+			if highlighted {
+				marker = sessionPickerMarker
+			} else {
+				marker = sessionPickerMarkerBlank
+			}
 		}
 		var turnLines []string
 		var tag string
 		switch t.Kind {
 		case clarity.TurnOwner:
 			tag = "YOU"
-			turnLines = renderProseTurn(t, tag, needsYouTitleStyle, gutter, measure)
+			turnLines = renderProseTurn(t, tag, needsYouTitleStyle, gutter, measure, marker, highlighted)
 		case clarity.TurnAssistant:
 			tag = "CLAUDE"
-			turnLines = renderProseTurn(t, tag, sessionClaudeStyle, gutter, measure)
+			turnLines = renderProseTurn(t, tag, sessionClaudeStyle, gutter, measure, marker, highlighted)
 		case clarity.TurnTool:
-			turnLines = []string{renderToolTurn(t, gutter, measure, now)}
+			turnLines = []string{renderToolTurn(t, gutter, measure, now, marker, highlighted)}
 		}
 		for j, l := range turnLines {
 			lines = append(lines, l)
@@ -961,14 +1174,27 @@ func renderContinuedLabel(tag string) string {
 // into one paragraph was the defect this replaces), word-wrapped to measure
 // with a gutter-wide hanging indent under each line, list items hanging
 // under their own marker instead.
-func renderProseTurn(t clarity.Turn, tag string, tagStyle lipgloss.Style, gutter, measure int) []string {
-	label := tagStyle.Render(fmt.Sprintf("%-7s  ", tag)) + sessionMutedStyle.Render(t.At.Local().Format("15:04:05"))
+//
+// pickerMarker/highlighted are buildTurnLines' own picker prefix (slice 22,
+// PART B) - "" and false leave every byte of this turn's own render
+// identical to before that slice; a non-empty marker (always 2 columns
+// wide, sessionPickerMarker/-Blank) is prepended to the label line and the
+// body's own hanging indent alike, so paragraph wraps stay under the tag,
+// never the marker column, and highlighted swaps the label's own colour to
+// sessionPickerAccentStyle in place of tagStyle.
+func renderProseTurn(t clarity.Turn, tag string, tagStyle lipgloss.Style, gutter, measure int, pickerMarker string, highlighted bool) []string {
+	labelStyle := tagStyle
+	if highlighted {
+		labelStyle = sessionPickerAccentStyle
+	}
+	label := pickerMarker + labelStyle.Render(fmt.Sprintf("%-7s  ", tag)) + sessionMutedStyle.Render(t.At.Local().Format("15:04:05"))
 	lines := []string{label}
 
-	indent := strings.Repeat(" ", gutter)
+	markerPad := strings.Repeat(" ", len([]rune(pickerMarker)))
+	indent := markerPad + strings.Repeat(" ", gutter)
 	for _, block := range splitProseBlocks(t.Text) {
-		markerWidth := len([]rune(block.marker))
-		wrapWidth := measure - gutter - markerWidth
+		listMarkerWidth := len([]rune(block.marker))
+		wrapWidth := measure - gutter - listMarkerWidth
 		if wrapWidth < 10 {
 			wrapWidth = 10
 		}
@@ -980,7 +1206,7 @@ func renderProseTurn(t clarity.Turn, tag string, tagStyle lipgloss.Style, gutter
 			case i == 0:
 				prefix = indent + block.marker
 			default:
-				prefix = indent + strings.Repeat(" ", markerWidth)
+				prefix = indent + strings.Repeat(" ", listMarkerWidth)
 			}
 			lines = append(lines, prefix+renderTokenLine(wline))
 		}
@@ -1183,7 +1409,12 @@ func toolSummaryCap(gutter, rowWidth int) int {
 // (SESSION-READING-SPEC.md's Truncation section: tool name capped to 8
 // columns, summary capped per toolSummaryCap, the result block ending at
 // the measure's own right edge).
-func renderToolTurn(t clarity.Turn, gutter, measure int, now time.Time) string {
+//
+// pickerMarker/highlighted are buildTurnLines' own picker prefix (slice 22,
+// PART B), same contract as renderProseTurn's own: "" and false render
+// byte-identical to before that slice; highlighted swaps both halves of the
+// row from their ordinary muted/outcome colours to sessionPickerAccentStyle.
+func renderToolTurn(t clarity.Turn, gutter, measure int, now time.Time, pickerMarker string, highlighted bool) string {
 	indent := toolIndentFor(gutter)
 	rowWidth := gutter + measure - indent
 	if rowWidth < 20 {
@@ -1203,9 +1434,14 @@ func renderToolTurn(t clarity.Turn, gutter, measure int, now time.Time) string {
 		}
 	}
 
-	left := sessionMutedStyle.Render(fmt.Sprintf("▪ %-8s%s", name, summary))
+	leftStyle := sessionMutedStyle
 	right := toolResultStyled(t, now)
-	return strings.Repeat(" ", indent) + padRow(left, right, rowWidth)
+	if highlighted {
+		leftStyle = sessionPickerAccentStyle
+		right = sessionPickerAccentStyle.Render(toolResultLabel(t, now))
+	}
+	left := leftStyle.Render(fmt.Sprintf("▪ %-8s%s", name, summary))
+	return pickerMarker + strings.Repeat(" ", indent) + padRow(left, right, rowWidth)
 }
 
 // toolResultLabel is the tool line's right-hand PLAIN text: "exit 0
