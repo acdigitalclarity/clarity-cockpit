@@ -140,6 +140,12 @@ var laneStateStalledStyle = lipgloss.NewStyle().
 var laneStateIdleStyle = lipgloss.NewStyle().
 	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#777777"), Dark: lipgloss.Color("#999999")})
 
+// laneStateNeedsKeyStyle is clarity.StateNeedsKey's own colour - bold on
+// the waiting/stalled orange, since a live permission prompt is the single
+// most urgent thing a row can say (ANSWER-AND-BANK-SPEC.md item 7: "ahead
+// of every other word").
+var laneStateNeedsKeyStyle = laneStateWaitingStyle.Bold(true)
+
 // laneStateGlyph returns the glyph and style ClassifyState's four words
 // render as - working ● its own teal, waiting on you ◉ and stalled ◐ share
 // the orange, idle ○ dim. An unknown/not-yet-computed state (the empty
@@ -156,6 +162,8 @@ func laneStateGlyph(state string) (string, lipgloss.Style) {
 		return "◐", laneStateStalledStyle
 	case clarity.StateIdle:
 		return "○", laneStateIdleStyle
+	case clarity.StateNeedsKey:
+		return "◆", laneStateNeedsKeyStyle
 	default:
 		return " ", lipgloss.NewStyle()
 	}
@@ -364,6 +372,13 @@ type List struct {
 	// rows to show instead - never a silently empty section.
 	needsYouStatus string
 
+	// answeredIssues is the y-key answer flow's own in-memory marker set
+	// (ANSWER-AND-BANK-SPEC.md "Answered marker and its lifetime") - board
+	// issue numbers answered this session, refreshed by app.go every feed
+	// tick (and immediately on a successful send); never persisted, never
+	// read as truth by anything but the row/card tick-and-dim render below.
+	answeredIssues map[int]bool
+
 	// external holds the fleet's live lanes that are NOT tracked Claude
 	// Squad instances (see clarity.DiscoverExternalLanes), refreshed on the
 	// same tick as the rest of the metadata. Rendered below the tracked
@@ -393,6 +408,23 @@ type List struct {
 // app.go's collapsePreviewBelowWidth threshold.
 func (l *List) SetCollapsed(collapsed bool) {
 	l.collapsed = collapsed
+}
+
+// SetAnsweredIssues replaces the answered-marker set the needsYou row
+// render below reads.
+func (l *List) SetAnsweredIssues(set map[int]bool) {
+	l.answeredIssues = set
+}
+
+// isAnsweredItem reports whether item's own board issue number (a lane-file
+// row never resolves one and so is never answered) is in the current
+// answered-marker set.
+func (l *List) isAnsweredItem(item clarity.FeedItem) bool {
+	if len(l.answeredIssues) == 0 {
+		return false
+	}
+	n, ok := clarity.BoardIssueNumber(item.Source)
+	return ok && l.answeredIssues[n]
 }
 
 // SetNeedsYou replaces the "Needs you" feed rows shown above the instance
@@ -646,6 +678,13 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, h
 
 	pct, fillOK := i.GetContextFill()
 	state, lastTurn, turnOK := i.GetLaneState()
+	if i.NeedsKey() {
+		// Overrides the transcript-derived word, never the cached value
+		// itself (SetLaneState stays the pure transcript read - the r-key
+		// resume gate and anything else reading GetLaneState still sees the
+		// real state underneath).
+		state = clarity.StateNeedsKey
+	}
 	suffix := laneRowSuffix(rowBg, rowFg, pct, fillOK, state, lastTurn, turnOK, showWord, laneShowTime(rowInner))
 
 	content := nameStyle.Render(base) + branchStyle.Render(branchSuffix) + plain.Render(pad) + suffix
@@ -702,9 +741,20 @@ func (l *List) String() string {
 			if selected {
 				style = needsYouLineSelectedStyle
 			}
+			answered := l.isAnsweredItem(item)
+			if answered {
+				// Ticked and dimmed (ANSWER-AND-BANK-SPEC.md) - the row's own
+				// selected/unselected background is kept, only the foreground
+				// dims to the shared muted tone.
+				style = style.Foreground(sessionMutedStyle.GetForeground())
+			}
 			rowBg, rowFg := style.GetBackground(), style.GetForeground()
 			plain := lipgloss.NewStyle().Background(rowBg).Foreground(rowFg)
-			content := plain.Render(ansiTruncateRow(clarity.FeedLine(item), innerWidth))
+			text := clarity.FeedLine(item)
+			if answered {
+				text = "✓ " + text
+			}
+			content := plain.Render(ansiTruncateRow(text, innerWidth))
 			b.WriteString(laneRowFrame(rowBg, rowFg, selected, content))
 			b.WriteString("\n")
 		}

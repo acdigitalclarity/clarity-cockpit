@@ -60,9 +60,17 @@ func TestMenu_StateMsg_ThenClose_PreviousStateReturns(t *testing.T) {
 }
 
 // mockUpFooterText is PANE-MOCKUP-164x45.md/PANE-MOCKUP-120x36.md's own
-// footer line, verbatim (design/cockpit-pane/DECISIONS.md slice 7) - the
-// exact text a tracked row's default menu must render.
-const mockUpFooterText = "↑↓ select • ↵ attach │ m message • c copy • o open folder │ tab switch tab • ? help • q quit"
+// footer line (design/cockpit-pane/DECISIONS.md slice 7), extended by
+// slice 18's own b bank and close token (ANSWER-AND-BANK-SPEC.md "Footer
+// tokens") - the exact text a tracked or external row's default menu must
+// render.
+const mockUpFooterText = "↑↓ select • ↵ attach • b bank and close │ m message • c copy • o open folder │ tab switch tab • ? help • q quit"
+
+// needsYouFooterText is ANSWER-AND-BANK-MOCKUP-164x45.md screen 1's own
+// footer line - a Needs-you row carries y answer where a lane row carries
+// ↵ attach/b bank instead (there is nothing to attach to or bank on the
+// row itself).
+const needsYouFooterText = "↑↓ select • y answer with the recommendation │ m message • c copy • o open folder │ tab switch tab • ? help • q quit"
 
 // TestMenu_TrackedRow_FooterMatchesMockUpExactly is slice 7's own KEYS
 // requirement: c copy and o open folder land in ui/menu.go's option list at
@@ -126,8 +134,8 @@ func TestMenu_NeedsYouRow_FooterMatchesMockUpExactly(t *testing.T) {
 	m.SetSize(200, 1)
 
 	require.Equal(t, StateDefault, m.state)
-	require.Equal(t, mockUpFooterText, strings.TrimSpace(ansi.Strip(m.String())),
-		"a Needs-you row must draw the same footer line as a tracked or external row")
+	require.Equal(t, needsYouFooterText, strings.TrimSpace(ansi.Strip(m.String())),
+		"a Needs-you row draws y answer where a lane row draws ↵ attach/b bank")
 }
 
 // TestMenu_NeedsYouRow_AttachAndOpenFolderDimmed_MessageAndCopyLive pins the
@@ -151,4 +159,44 @@ func TestMenu_NeedsYouRow_AttachAndOpenFolderDimmed_MessageAndCopyLive(t *testin
 	plain := ansi.Strip(needsYou.String())
 	require.Contains(t, plain, "m message", "m message stays advertised on a Needs-you row")
 	require.Contains(t, plain, "c copy", "c copy stays advertised on a Needs-you row")
+}
+
+// TestMenu_NeedsYouRow_Answered_YTokenAbsent is ANSWER-AND-BANK-SPEC.md's
+// own "Footer tokens" rule: "the y token is absent on an answered row".
+func TestMenu_NeedsYouRow_Answered_YTokenAbsent(t *testing.T) {
+	m := NewMenu()
+	m.SetInstance(nil, false, true)
+	m.SetNeedsYouAnswered(true)
+	m.SetSize(200, 1)
+
+	plain := strings.TrimSpace(ansi.Strip(m.String()))
+	require.NotContains(t, plain, "y answer")
+	require.Contains(t, plain, "m message", "the row still offers m/c/o")
+}
+
+// TestMenu_LaneRow_BFooterToken_BankAndClose pins the b token's own exact
+// wording (ANSWER-AND-BANK-SPEC.md "Footer tokens").
+func TestMenu_LaneRow_BFooterToken_BankAndClose(t *testing.T) {
+	m := NewMenu()
+	inst, err := session.NewInstance(session.InstanceOptions{Title: "lane-a", Path: ".", Program: "echo"})
+	require.NoError(t, err)
+	m.SetInstance(inst, false, false)
+	m.SetSize(200, 1)
+
+	require.Contains(t, ansi.Strip(m.String()), "b bank and close")
+}
+
+// TestMenu_StateAnswerConfirm_FooterIsExactlyItsOwnFoot mirrors
+// TestMenu_StateMsg_FooterIsExactlyComposerText for the two new confirm
+// states (slice 18).
+func TestMenu_StateAnswerConfirm_FooterIsExactlyItsOwnFoot(t *testing.T) {
+	m := NewMenu()
+	m.SetState(StateAnswerConfirm)
+	require.Equal(t, AnswerConfirmFoot, ansi.Strip(m.String()))
+}
+
+func TestMenu_StateBankConfirm_FooterIsExactlyItsOwnFoot(t *testing.T) {
+	m := NewMenu()
+	m.SetState(StateBankConfirm)
+	require.Equal(t, BankConfirmFoot, ansi.Strip(m.String()))
 }

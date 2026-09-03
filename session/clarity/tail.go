@@ -44,6 +44,18 @@ const (
 	StateStalled    = "stalled"
 )
 
+// StateNeedsKey is the permission-prompt sentinel state (ANSWER-AND-BANK-
+// SPEC.md item 7 / research item 7) - never returned by ClassifyState (the
+// transcript carries no record of a pending prompt at all, DECISIONS.md:
+// "A pending permission prompt is invisible in the transcript"). Only a
+// tracked instance's own live tmux pane sample sets it (app.go's feed tick,
+// session.Instance.SetNeedsKey, IsPermissionPrompt below), overriding
+// whatever the transcript-derived word would otherwise read - "ahead of
+// every other word", the brief's own phrase - since app.go substitutes it
+// directly into the rendered LaneTail.State before the row/header draw.
+// External lanes never carry it (no tracked tmux session to sample).
+const StateNeedsKey = "needs a key"
+
 // DefaultTailMaxBytes is ReadLaneTail's default read window: the last
 // 256 KiB of the transcript, which comfortably covers several turns of a
 // normal working session without paying to scan the whole file.

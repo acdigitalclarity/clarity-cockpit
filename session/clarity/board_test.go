@@ -226,6 +226,36 @@ func TestNewBoardCache_UsesFleetBoardRepo(t *testing.T) {
 	require.Equal(t, "gh", c.ghBin)
 }
 
+// test 7 (the write half): PostComment is the REST path, never `gh issue
+// comment`, with the exact -f body=... shape the spec names.
+func TestBoardCache_PostComment_ShapeIsRESTPostNeverGhIssueComment(t *testing.T) {
+	var gotArgs []string
+	exec := cmd_test.MockCmdExec{
+		OutputFunc: func(cmd *exec.Cmd) ([]byte, error) {
+			gotArgs = cmd.Args
+			return []byte(""), nil
+		},
+	}
+	c := NewBoardCacheWithDeps(exec, "acdigitalclarity/clarity-tasks", "gh")
+	require.NoError(t, c.PostComment(277, "answered from the cockpit: text\nsent into lane-a at 11:42:07."))
+
+	require.Equal(t, []string{
+		"gh", "api", "-X", "POST", "repos/acdigitalclarity/clarity-tasks/issues/277/comments",
+		"-f", "body=answered from the cockpit: text\nsent into lane-a at 11:42:07.",
+	}, gotArgs)
+}
+
+func TestBoardCache_PostComment_PropagatesFailureReason(t *testing.T) {
+	exec := cmd_test.MockCmdExec{
+		OutputFunc: func(cmd *exec.Cmd) ([]byte, error) {
+			return nil, errors.New("rate limited")
+		},
+	}
+	c := NewBoardCacheWithDeps(exec, "acdigitalclarity/clarity-tasks", "gh")
+	err := c.PostComment(1, "body")
+	require.EqualError(t, err, "rate limited")
+}
+
 func TestReasonFromExecError_PrefersStderr(t *testing.T) {
 	exitErr := &exec.ExitError{Stderr: []byte("HTTP 403: rate limit exceeded\n")}
 	require.Equal(t, "HTTP 403: rate limit exceeded", reasonFromExecError(exitErr))

@@ -20,6 +20,7 @@
 package ui
 
 import (
+	"claude-squad/session/clarity"
 	"fmt"
 	"strings"
 
@@ -44,6 +45,29 @@ const (
 // nothing (app.go's stateMsg Enter handler checks Lane() == "" itself).
 const NoLaneLabel = "(no lane on this row)"
 
+// confirmKind distinguishes the two non-typing strips slice 18 adds - the
+// y-key answer confirmation and the b-key bank confirmation - from ordinary
+// typing mode (open==true). Both are rendered by their own dedicated
+// renderAnswerConfirm/renderBankConfirm below, never the typing-mode wrap/
+// cursor logic wrappedLines/Render already use.
+type confirmKind int
+
+const (
+	confirmNone confirmKind = iota
+	confirmAnswer
+	confirmBank
+)
+
+// AnswerConfirmFoot/BankConfirmFoot are the two confirm strips' own foot
+// text while they are open, verbatim (ANSWER-AND-BANK-SPEC.md "Keys") -
+// exported so ui/menu.go's own StateAnswerConfirm/StateBankConfirm can show
+// the identical text across the whole bottom bar, the same way
+// ComposerFootEditing already does for StateMsg.
+const (
+	AnswerConfirmFoot = "enter send · e edit · esc cancel"
+	BankConfirmFoot   = "enter send · esc cancel"
+)
+
 // Composer is the shared model behind both panes' inline message box: is it
 // open, what has been typed, and (once a send resolves) the result text the
 // foot shows instead of the idle/editing prompt.
@@ -62,6 +86,29 @@ type Composer struct {
 	// result is the foot's transient post-send text ("sent · landed
 	// 14:32:07" / "copied · ..."), cleared the next time Open is called.
 	result string
+	// resultTag correlates the CURRENTLY showing result with an in-flight
+	// background follow-up (a board-comment retry, or the bank line's own
+	// CONTINUATION-file watch) - "" for an ordinary message send, "issue:
+	// <n>" for a y-key answer, "bank" for a b-key bank. UpdateResultIfIssue/
+	// UpdateBankResult below only ever refresh c.result when this still
+	// matches: once the composer has moved on to something else (a fresh
+	// Open/SetResult), a stale retry/watch result silently no-ops rather
+	// than overwriting whatever the composer is showing now.
+	resultTag string
+
+	// answerIssue is the board issue number an in-progress TYPING-mode edit
+	// still belongs to, after the y-key answer strip's own e chord
+	// (EditConfirmedAnswer) - 0 for an ordinary m-key message, so Enter in
+	// app.go's stateMsg handling can tell "this typed text is still
+	// answering issue N" from "this is a plain message" and route to the
+	// same two-write flow the un-edited confirm strip would have.
+	answerIssue int
+
+	// confirmKind/confirmIssue/confirmText are the y/b confirm strips' own
+	// state - see OpenAnswerConfirm/OpenBankConfirm below.
+	confirmKind  confirmKind
+	confirmIssue int
+	confirmText  string
 }
 
 // NewComposer returns a closed, empty composer.
@@ -82,25 +129,108 @@ func (c *Composer) Open(lane string, isExternal bool) {
 	c.open = true
 	c.text = ""
 	c.result = ""
+	c.resultTag = ""
+	c.answerIssue = 0
 	c.lane = lane
 	c.isExternal = isExternal
+	c.confirmKind = confirmNone
+	c.confirmIssue = 0
+	c.confirmText = ""
+}
+
+// OpenAnswerConfirm loads the y key's confirm strip (RULE 6): text is
+// already the card's own recommended response, AnswerText-stripped by the
+// caller - the strip shows it verbatim, unedited, until enter sends it or e
+// reopens ordinary typing mode with it pre-filled (EditConfirmedAnswer).
+// issue is the board issue number the reply AND its follow-up comment both
+// target.
+func (c *Composer) OpenAnswerConfirm(issue int, lane string, isExternal bool, text string) {
+	c.open = false
+	c.text = ""
+	c.result = ""
+	c.resultTag = ""
+	c.answerIssue = 0
+	c.lane = lane
+	c.isExternal = isExternal
+	c.confirmKind = confirmAnswer
+	c.confirmIssue = issue
+	c.confirmText = text
+}
+
+// OpenBankConfirm loads the b key's confirm strip: the fixed bank line,
+// verbatim, into lane.
+func (c *Composer) OpenBankConfirm(lane string, isExternal bool) {
+	c.open = false
+	c.text = ""
+	c.result = ""
+	c.resultTag = ""
+	c.answerIssue = 0
+	c.lane = lane
+	c.isExternal = isExternal
+	c.confirmKind = confirmBank
+	c.confirmIssue = 0
+	c.confirmText = clarity.BankLine
+}
+
+// IsConfirming/IsAnswerConfirm/IsBankConfirm/ConfirmIssue report the
+// current confirm-strip state - app.go's own stateAnswerConfirm/
+// stateBankConfirm route on these rather than duplicating the confirmKind
+// enum outside this file.
+func (c *Composer) IsConfirming() bool    { return c.confirmKind != confirmNone }
+func (c *Composer) IsAnswerConfirm() bool { return c.confirmKind == confirmAnswer }
+func (c *Composer) IsBankConfirm() bool   { return c.confirmKind == confirmBank }
+func (c *Composer) ConfirmIssue() int     { return c.confirmIssue }
+
+// AnswerIssue reports the board issue number a typing-mode edit still
+// belongs to (0 for an ordinary m-key message) - see the field's own doc
+// comment.
+func (c *Composer) AnswerIssue() int { return c.answerIssue }
+
+// EditConfirmedAnswer is the answer strip's own e key (test 6): leaves
+// confirm mode and re-enters ordinary typing mode with the confirm text
+// pre-filled, so the reply can be changed before it is sent - the board
+// issue it targets survives the switch (AnswerIssue), so Enter afterwards
+// still runs the same two-write flow, with the edited text.
+func (c *Composer) EditConfirmedAnswer() {
+	if c.confirmKind != confirmAnswer {
+		return
+	}
+	c.text = c.confirmText
+	c.open = true
+	c.answerIssue = c.confirmIssue
+	c.confirmKind = confirmNone
+	c.confirmIssue = 0
+	c.confirmText = ""
 }
 
 // Close exits editing without sending, clearing the typed text but keeping
 // the target/result fields (harmless once closed - Open resets them on the
-// next use).
+// next use). Also leaves confirm mode with nothing sent (test 6: "esc
+// writes nothing anywhere").
 func (c *Composer) Close() {
 	c.open = false
 	c.text = ""
+	c.answerIssue = 0
+	c.confirmKind = confirmNone
+	c.confirmIssue = 0
+	c.confirmText = ""
 }
 
 // Lane/IsExternal report the send target captured when Open was last
 // called.
 func (c *Composer) Lane() string     { return c.lane }
 func (c *Composer) IsExternal() bool { return c.isExternal }
-func (c *Composer) Value() string    { return c.text }
-func (c *Composer) HasResult() bool  { return c.result != "" }
-func (c *Composer) Result() string   { return c.result }
+
+// Value is the text a send actually uses: the confirm strip's own fixed
+// text while confirming, the typed buffer otherwise.
+func (c *Composer) Value() string {
+	if c.confirmKind != confirmNone {
+		return c.confirmText
+	}
+	return c.text
+}
+func (c *Composer) HasResult() bool { return c.result != "" }
+func (c *Composer) Result() string  { return c.result }
 
 // Type appends s (a key press's own printable text, or a paste's own
 // possibly-multi-line text) to the composer's buffer verbatim - any
@@ -136,9 +266,60 @@ func (c *Composer) Backspace() {
 // the composer stays visually present (Open() still returns lane/
 // isExternal for the box's own title) until the next Open call replaces it.
 func (c *Composer) SetResult(text string) {
+	c.setResult(text)
+	c.resultTag = ""
+}
+
+// SetAnswerResult is SetResult tagged for the y-key answer flow: a later
+// board-comment retry (UpdateResultIfIssue) can refresh this exact foot
+// text, as long as the composer has not moved on to something else since.
+func (c *Composer) SetAnswerResult(text string, issue int) {
+	c.setResult(text)
+	c.resultTag = fmt.Sprintf("issue:%d", issue)
+}
+
+// SetBankResult is SetResult tagged for the b-key bank flow - the
+// CONTINUATION-file watch (UpdateBankResult) can refresh it once the file
+// appears.
+func (c *Composer) SetBankResult(text string) {
+	c.setResult(text)
+	c.resultTag = "bank"
+}
+
+// UpdateResultIfIssue refreshes the foot text IF it is still showing the
+// answer flow's own result for issue (a board-comment retry landing, or
+// finally being abandoned) - a no-op, returning false, once the composer
+// has moved on (a fresh Open/SetResult since).
+func (c *Composer) UpdateResultIfIssue(issue int, text string) bool {
+	if c.resultTag != fmt.Sprintf("issue:%d", issue) {
+		return false
+	}
+	c.result = text
+	return true
+}
+
+// UpdateBankResult refreshes the foot text IF it is still showing the bank
+// flow's own result (the CONTINUATION-file watch landing) - a no-op,
+// returning false, once the composer has moved on.
+func (c *Composer) UpdateBankResult(text string) bool {
+	if c.resultTag != "bank" {
+		return false
+	}
+	c.result = text
+	return true
+}
+
+// setResult is the shared core SetResult/SetAnswerResult/SetBankResult all
+// call - every ephemeral compose-in-progress field clears, whichever mode
+// (typing or confirming) was active.
+func (c *Composer) setResult(text string) {
 	c.result = text
 	c.open = false
 	c.text = ""
+	c.answerIssue = 0
+	c.confirmKind = confirmNone
+	c.confirmIssue = 0
+	c.confirmText = ""
 }
 
 // composerCursor is the mock-up's own cursor glyph (PANE-MOCKUP-164x45.md:
@@ -239,6 +420,13 @@ func (c *Composer) wrappedLines(width int) []string {
 // the pre-slice-16 fixed footprint); open grows with the wrapped line
 // count, capped at composerMaxVisibleLines+2.
 func (c *Composer) Height(width int) int {
+	if c.confirmKind != confirmNone {
+		n := len(c.confirmContentLines(width))
+		if n < 1 {
+			n = 1
+		}
+		return n + 2
+	}
 	n := len(c.wrappedLines(width))
 	if n > composerMaxVisibleLines {
 		n = composerMaxVisibleLines
@@ -260,6 +448,12 @@ func (c *Composer) Height(width int) int {
 // message right now, matching slice 3b's own static behaviour before m is
 // ever pressed).
 func (c *Composer) Render(width int, lane string) []string {
+	switch c.confirmKind {
+	case confirmAnswer:
+		return c.renderAnswerConfirm(width)
+	case confirmBank:
+		return c.renderBankConfirm(width)
+	}
 	displayLane := lane
 	displayExternal := false
 	if c.open || c.result != "" {
@@ -320,4 +514,122 @@ func (c *Composer) Render(width int, lane string) []string {
 	}
 	lines = append(lines, sessionMutedStyle.Render(fitRow(bottom, width)))
 	return lines
+}
+
+// -- confirm strips (slice 18: y answer, b bank) --------------------------
+
+// confirmWrapBlock word-wraps text to innerWidth, giving the FIRST wrapped
+// row firstPrefix and every continuation row a same-width blank pad instead
+// - the same continuation-indent idiom composerPromptPrefix already uses
+// for the typing mode's own first line, reused here for every line of the
+// confirm strip (the mock-up's own "▸ <text>" / two-space-indented follow-on
+// lines, ANSWER-AND-BANK-MOCKUP-164x45.md).
+func confirmWrapBlock(text, firstPrefix string, innerWidth int) []string {
+	prefixWidth := lipgloss.Width(firstPrefix)
+	wrapWidth := innerWidth - prefixWidth
+	if wrapWidth < 1 {
+		wrapWidth = 1
+	}
+	pad := strings.Repeat(" ", prefixWidth)
+	wrapped := composerWrap(text, wrapWidth)
+	out := make([]string, len(wrapped))
+	for i, w := range wrapped {
+		if i == 0 {
+			out[i] = firstPrefix + w
+		} else {
+			out[i] = pad + w
+		}
+	}
+	return out
+}
+
+// confirmTargetLine is the answer strip's own second line: "into <lane> ·
+// live tmux · the reply is sent" (tracked) or "into <lane> · your own
+// terminal · the reply is copied" (external) - ANSWER-AND-BANK-MOCKUP-
+// 164x45.md screen 2.
+func (c *Composer) confirmTargetLine() string {
+	lane := c.lane
+	if lane == "" {
+		lane = NoLaneLabel
+	}
+	if c.isExternal {
+		return fmt.Sprintf("into %s · your own terminal · the reply is copied", lane)
+	}
+	return fmt.Sprintf("into %s · live tmux · the reply is sent", lane)
+}
+
+// confirmBoardLine is the answer strip's own third line: the board comment
+// that follows the reply, named up front so nothing is written blind.
+func (c *Composer) confirmBoardLine() string {
+	return fmt.Sprintf("board #%d · comment: answered from the cockpit: %s", c.confirmIssue, c.confirmText)
+}
+
+// confirmContentLines builds the confirm strip's own content rows
+// (unbordered - Height and renderConfirmBox both call this, so the two can
+// never drift out of step): three wrapped blocks for the answer strip (the
+// text, the target line, the board line), one for the bank strip (the bank
+// line alone).
+func (c *Composer) confirmContentLines(width int) []string {
+	innerWidth := width - 4 // "│ " + " │"
+	if innerWidth < 1 {
+		innerWidth = 1
+	}
+	switch c.confirmKind {
+	case confirmAnswer:
+		var lines []string
+		lines = append(lines, confirmWrapBlock(c.confirmText, composerPromptPrefix, innerWidth)...)
+		lines = append(lines, confirmWrapBlock(c.confirmTargetLine(), "  ", innerWidth)...)
+		lines = append(lines, confirmWrapBlock(c.confirmBoardLine(), "  ", innerWidth)...)
+		return lines
+	case confirmBank:
+		return confirmWrapBlock(c.confirmText, composerPromptPrefix, innerWidth)
+	default:
+		return nil
+	}
+}
+
+// renderConfirmBox draws one confirm strip's box: title-bearing top border,
+// the content rows, and a foot-bearing bottom border - the same three-part
+// shape Render's own typing-mode box uses, factored out since both confirm
+// kinds share it exactly (only the title/foot text differ).
+func (c *Composer) renderConfirmBox(width int, title, foot string) []string {
+	top := "┌" + title + strings.Repeat("─", maxInt0(width-2-lipgloss.Width(title))) + "┐"
+
+	rows := c.confirmContentLines(width)
+	contentRows := make([]string, len(rows))
+	for i, r := range rows {
+		contentRows[i] = "│ " + r + strings.Repeat(" ", maxInt0(width-4-lipgloss.Width(r))) + " │"
+	}
+
+	footText := " " + foot + " "
+	bottom := "└" + strings.Repeat("─", maxInt0(width-2-lipgloss.Width(footText))) + footText + "─┘"
+
+	lines := make([]string, 0, 2+len(contentRows))
+	lines = append(lines, sessionMutedStyle.Render(fitRow(top, width)))
+	for _, r := range contentRows {
+		lines = append(lines, sessionMutedStyle.Render(fitRow(r, width)))
+	}
+	lines = append(lines, sessionMutedStyle.Render(fitRow(bottom, width)))
+	return lines
+}
+
+// renderAnswerConfirm draws " answer #<n> " (ANSWER-AND-BANK-MOCKUP-
+// 164x45.md screen 2).
+func (c *Composer) renderAnswerConfirm(width int) []string {
+	title := fmt.Sprintf(" answer #%d ", c.confirmIssue)
+	return c.renderConfirmBox(width, title, AnswerConfirmFoot)
+}
+
+// renderBankConfirm draws " bank <lane> " or " bank <lane> · copy only "
+// (screen 4, and the "A lane in your own terminal" bullet).
+func (c *Composer) renderBankConfirm(width int) []string {
+	lane := c.lane
+	if lane == "" {
+		lane = NoLaneLabel
+	}
+	title := fmt.Sprintf(" bank %s ", lane)
+	if c.isExternal && c.lane != "" {
+		title = fmt.Sprintf(" bank %s%s ", lane, copyOnlySuffix)
+	}
+	return c.renderConfirmBox(width, title, BankConfirmFoot)
 }

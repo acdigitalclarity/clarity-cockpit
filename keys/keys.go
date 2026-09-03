@@ -69,6 +69,17 @@ const (
 	// handler, the same shape KeyCheckout's dormant entry shows is fine
 	// for a one-line call.
 	KeyButterflyToggle
+	// KeyAnswer is y (slice 18, ANSWER-AND-BANK-SPEC.md): on a Needs-you
+	// row, loads the card's recommended response into the composer's own
+	// confirm strip - inert on an answered row and on a lane row (app.go's
+	// handleAnswerKey is the only place this is looked up; it is never
+	// reached while a lane row is selected, GlobalKeyStringsMap carries no
+	// per-row-kind awareness).
+	KeyAnswer
+	// KeyBank is b (slice 18): on a lane row (tracked or external), loads
+	// the standard bank-and-close line into the composer's own confirm
+	// strip - inert on a Needs-you row.
+	KeyBank
 	// KeySelect is a display-only menu entry ("↑↓ select") - it is never
 	// looked up in GlobalKeyStringsMap (Up/Down already dispatch via their
 	// own KeyUp/KeyDown), it exists purely so ui/menu.go can render the
@@ -102,6 +113,8 @@ var GlobalKeyStringsMap = map[string]KeyName{
 	"v":          KeyTurnPicker,
 	"o":          KeyOpenFolder,
 	"B":          KeyButterflyToggle,
+	"y":          KeyAnswer,
+	"b":          KeyBank,
 }
 
 // GlobalkeyBindings is a global, immutable map of KeyName tot keybinding.
@@ -199,6 +212,14 @@ var GlobalkeyBindings = map[KeyName]key.Binding{
 	KeyButterflyToggle: key.NewBinding(
 		key.WithKeys("B"),
 		key.WithHelp("B", "toggle butterfly"),
+	),
+	KeyAnswer: key.NewBinding(
+		key.WithKeys("y"),
+		key.WithHelp("y", "answer with the recommendation"),
+	),
+	KeyBank: key.NewBinding(
+		key.WithKeys("b"),
+		key.WithHelp("b", "bank and close"),
 	),
 	KeySelect: key.NewBinding(
 		key.WithHelp("↑↓", "select"),

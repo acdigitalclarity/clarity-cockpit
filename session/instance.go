@@ -70,6 +70,12 @@ type Instance struct {
 	contextFillPct int
 	contextFillOK  bool
 
+	// needsKey caches whether this tracked instance's own tmux pane last
+	// sampled a Claude Code permission prompt (ANSWER-AND-BANK-SPEC.md item
+	// 7) - main event loop only, same contract as laneState/contextFillPct
+	// below.
+	needsKey bool
+
 	// laneState/laneLastTurn/laneStateOK cache this instance's clarity-
 	// derived conversational state (see session/clarity/tail.go's
 	// ClassifyState: working/waiting on you/idle/stalled) and the last
@@ -789,6 +795,18 @@ func (i *Instance) SetLaneState(state string, lastTurn time.Time, ok bool) {
 // the first feed tick has computed it for this instance.
 func (i *Instance) GetLaneState() (state string, lastTurn time.Time, ok bool) {
 	return i.laneState, i.laneLastTurn, i.laneStateOK
+}
+
+// SetNeedsKey caches whether this instance's own tmux pane last sampled a
+// permission prompt - called from the main event loop only (app.go's feed
+// tick), same contract as SetContextFill/SetLaneState.
+func (i *Instance) SetNeedsKey(needsKey bool) {
+	i.needsKey = needsKey
+}
+
+// NeedsKey returns the cached permission-prompt sample.
+func (i *Instance) NeedsKey() bool {
+	return i.needsKey
 }
 
 // SendPrompt sends a prompt to the tmux session

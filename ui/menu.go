@@ -48,6 +48,11 @@ const (
 	// so wrongly showed "enter submit name" while a message was being
 	// typed.
 	StateMsg
+	// StateAnswerConfirm/StateBankConfirm are the y/b confirm strips' own
+	// menu states (slice 18) - same shape as StateMsg: String() shows the
+	// strip's own full-width foot text instead of the ordinary option list.
+	StateAnswerConfirm
+	StateBankConfirm
 )
 
 type Menu struct {
@@ -73,6 +78,12 @@ type Menu struct {
 	// stay live - the row's own raising lane is still a valid send/copy
 	// target (composerTarget resolves it separately).
 	isNeedsYou bool
+	// isAnswered marks the current selection as an ALREADY-answered
+	// Needs-you row (slice 18) - set by SetNeedsYouAnswered, independently
+	// of SetInstance (app.go's instanceChanged calls both). The y footer
+	// token is absent on such a row (ANSWER-AND-BANK-SPEC.md "the y token
+	// is absent on an answered row").
+	isAnswered bool
 	activeTab  int
 
 	// groupBounds is the CURRENT option list's own [start,end) vertical-
@@ -130,13 +141,22 @@ func (m *Menu) SetInstance(instance *session.Instance, isExternal, isNeedsYou bo
 	// Prompt or the composer's own Msg) - a feed tick's instanceChanged()
 	// must never kick the footer out of "enter send · esc cancel" while a
 	// message is being typed.
-	if m.state != StateNewInstance && m.state != StatePrompt && m.state != StateMsg {
+	if m.state != StateNewInstance && m.state != StatePrompt && m.state != StateMsg &&
+		m.state != StateAnswerConfirm && m.state != StateBankConfirm {
 		if m.instance != nil || m.isExternal || m.isNeedsYou {
 			m.state = StateDefault
 		} else {
 			m.state = StateEmpty
 		}
 	}
+	m.updateOptions()
+}
+
+// SetNeedsYouAnswered records whether the currently selected Needs-you row
+// has already been answered this session - see the isAnswered field's own
+// doc comment.
+func (m *Menu) SetNeedsYouAnswered(answered bool) {
+	m.isAnswered = answered
 	m.updateOptions()
 }
 
@@ -177,9 +197,9 @@ func (m *Menu) updateOptions() {
 	case StatePrompt:
 		m.options = promptMenuOptions
 		m.groupBounds = nil
-	case StateMsg:
-		// String() short-circuits StateMsg before m.options is ever read
-		// (the composer's own foot text, not the key-binding groups below).
+	case StateMsg, StateAnswerConfirm, StateBankConfirm:
+		// String() short-circuits these before m.options is ever read (the
+		// composer's own strip foot text, not the key-binding groups below).
 		m.options = nil
 		m.groupBounds = nil
 	}
@@ -205,7 +225,24 @@ func (m *Menu) addInstanceOptions() {
 		return
 	}
 
-	options := []keys.KeyName{keys.KeySelect, keys.KeyEnter, keys.KeyMsg, keys.KeyCopy, keys.KeyOpenFolder}
+	// group0: ↑↓ select, then the row-kind's own primary action - a
+	// Needs-you row never carries ↵ attach at all (nothing to attach TO -
+	// ANSWER-AND-BANK-MOCKUP-164x45.md screens 1 and 3 both drop it), y
+	// answer replacing it while the row is not yet answered; a lane row
+	// (tracked or external) keeps ↵ attach and gains b bank and close
+	// alongside it (ANSWER-AND-BANK-SPEC.md "Footer tokens").
+	var options []keys.KeyName
+	switch {
+	case m.isNeedsYou && !m.isAnswered:
+		options = []keys.KeyName{keys.KeySelect, keys.KeyAnswer}
+	case m.isNeedsYou:
+		options = []keys.KeyName{keys.KeySelect}
+	default:
+		options = []keys.KeyName{keys.KeySelect, keys.KeyEnter, keys.KeyBank}
+	}
+	group0End := len(options)
+
+	options = append(options, keys.KeyMsg, keys.KeyCopy, keys.KeyOpenFolder)
 
 	// Scroll hint (when in a scrollable tab) - appended before the system
 	// group, same position upstream used.
@@ -217,7 +254,7 @@ func (m *Menu) addInstanceOptions() {
 	options = append(options, keys.KeyTab, keys.KeyHelp, keys.KeyQuit)
 
 	m.options = options
-	m.groupBounds = [][2]int{{0, 2}, {2, systemStart}, {systemStart, len(options)}}
+	m.groupBounds = [][2]int{{0, group0End}, {group0End, systemStart}, {systemStart, len(options)}}
 }
 
 // SetSize sets the width of the window. The menu will be centered horizontally within this width.
@@ -235,9 +272,16 @@ func (m *Menu) SetSize(width, height int) {
 const composerFootMenuText = ComposerFootEditing
 
 func (m *Menu) String() string {
-	if m.state == StateMsg {
+	switch m.state {
+	case StateMsg:
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
 			menuStyle.Render(composerFootMenuText))
+	case StateAnswerConfirm:
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
+			menuStyle.Render(AnswerConfirmFoot))
+	case StateBankConfirm:
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
+			menuStyle.Render(BankConfirmFoot))
 	}
 
 	var s strings.Builder
@@ -263,14 +307,16 @@ func (m *Menu) String() string {
 		// as a clipboard copy (slice 5), ↵ still no-ops outside the Terminal
 		// tab and shows the "no terminal yet" footer inside it (app.go), so
 		// the dimming is cosmetic only, never a disabled control. A
-		// Needs-you row dims ↵ attach and o open folder instead (board #280
-		// pane-10 walkthrough DEFECT 3): there is no tracked instance or
-		// folder behind the row itself, but m message and c copy stay live -
-		// composerTarget resolves the row's own raising lane as a genuine
-		// send/copy target, distinct from ↵ attach/o open folder which need
-		// an actual tracked instance.
+		// Needs-you row dims o open folder (board #280 pane-10 walkthrough
+		// DEFECT 3): there is no folder behind the row itself, but m message
+		// and c copy stay live - composerTarget resolves the row's own
+		// raising lane as a genuine send/copy target, distinct from o open
+		// folder which needs an actual tracked instance. ↵ attach is no
+		// longer even IN the option list for a Needs-you row (slice 18: y
+		// answer, or nothing at all once answered, takes its place) - there
+		// is nothing left here to dim for it.
 		dim := (m.isExternal && (k == keys.KeyEnter || k == keys.KeyMsg)) ||
-			(m.isNeedsYou && (k == keys.KeyEnter || k == keys.KeyOpenFolder))
+			(m.isNeedsYou && k == keys.KeyOpenFolder)
 		if dim {
 			localActionStyle = localActionStyle.Faint(true)
 			localKeyStyle = localKeyStyle.Faint(true)

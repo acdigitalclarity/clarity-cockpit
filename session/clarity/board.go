@@ -152,6 +152,22 @@ func (c *BoardCache) Get(n int) BoardExplanation {
 	return result
 }
 
+// PostComment posts one comment to issue n via the SAME gh api REST path
+// contract fetch() above uses - `gh api -X POST repos/<repo>/issues/<n>/
+// comments -f body=<body>`, never `gh issue comment` (a different, GraphQL
+// path this fork's board contract does not use). This is the y-key answer
+// flow's second write (ANSWER-AND-BANK-SPEC.md): the reply is the act, this
+// comment is bookkeeping, and a caller never repeats the reply on a failure
+// here - see app.go's sendAnswerCmd/pendingComment retry queue.
+func (c *BoardCache) PostComment(n int, body string) error {
+	path := fmt.Sprintf("repos/%s/issues/%d/comments", c.repo, n)
+	command := exec.Command(c.ghBin, "api", "-X", "POST", path, "-f", "body="+body)
+	if _, err := c.exec.Output(command); err != nil {
+		return errors.New(reasonFromExecError(err))
+	}
+	return nil
+}
+
 func (c *BoardCache) fetch(n int) BoardExplanation {
 	path := fmt.Sprintf("repos/%s/issues/%d", c.repo, n)
 	command := exec.Command(c.ghBin, "api", path)
