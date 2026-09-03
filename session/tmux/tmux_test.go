@@ -11,7 +11,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"claude-squad/cmd/cmd_test"
 
@@ -201,4 +203,126 @@ func TestDetach_AfterDetachSafely_DoesNotPanic(t *testing.T) {
 
 	require.NotPanics(t, func() { session.Detach() },
 		"a second, stale Detach call after DetachSafely has already torn the cycle down must be a no-op, never a panic")
+}
+
+// TestStdinForwardLoop_DropsGapByteForwardsLiveByte is board #325's own
+// reproduction: a byte that arrives after attach1 ended but before attach2
+// started must never reach any pty, and a byte that arrives once attach2 is
+// live must reach attach2's own pty - never attach1's, and never dropped.
+// Exercises stdinForwardLoop directly (the extracted goroutine body, mirror
+// of how board #317's own tests exercise runAttachCopyLoop directly) with a
+// fake pipe standing in for stdin, so the byte's timing relative to the two
+// attach cycles is under the test's own control rather than a real
+// terminal's.
+func TestStdinForwardLoop_DropsGapByteForwardsLiveByte(t *testing.T) {
+	session := NewTmuxSessionWithDeps("gap", "program", NewMockPtyFactory(t), cmd_test.MockCmdExec{})
+
+	pr, pw := io.Pipe()
+	processed := make(chan struct{}, 8)
+	session.stdinProcessed = processed
+
+	var loopDone sync.WaitGroup
+	loopDone.Add(1)
+	go func() {
+		defer loopDone.Done()
+		session.stdinForwardLoop(pr)
+	}()
+
+	target1, err := os.CreateTemp(t.TempDir(), "pty1")
+	require.NoError(t, err)
+	defer target1.Close()
+
+	// attach1 is live.
+	session.stdinMu.Lock()
+	session.stdinGen++
+	session.stdinLive = true
+	session.stdinTarget = target1
+	session.stdinMu.Unlock()
+
+	// attach1 ends (mirrors both Detach and DetachSafely, which both clear
+	// exactly these two fields as the first thing they do).
+	session.stdinMu.Lock()
+	session.stdinLive = false
+	session.stdinTarget = nil
+	session.stdinMu.Unlock()
+
+	target2, err := os.CreateTemp(t.TempDir(), "pty2")
+	require.NoError(t, err)
+	defer target2.Close()
+
+	// A byte written into the gap: no attach is live, so this must be
+	// dropped - never forwarded to target1 (already ended) or, once it
+	// exists, target2.
+	_, err = pw.Write([]byte{'z'})
+	require.NoError(t, err)
+	select {
+	case <-processed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stdinForwardLoop never processed the gap byte")
+	}
+
+	// attach2 starts.
+	session.stdinMu.Lock()
+	session.stdinGen++
+	session.stdinLive = true
+	session.stdinTarget = target2
+	session.stdinMu.Unlock()
+
+	// A byte written while attach2 is live must reach target2.
+	_, err = pw.Write([]byte{'y'})
+	require.NoError(t, err)
+	select {
+	case <-processed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stdinForwardLoop never processed the live byte")
+	}
+
+	require.NoError(t, pw.Close())
+	loopDone.Wait()
+
+	content1, err := os.ReadFile(target1.Name())
+	require.NoError(t, err)
+	require.Empty(t, string(content1), "attach1's own pty must never see a byte written after attach1 ended")
+
+	content2, err := os.ReadFile(target2.Name())
+	require.NoError(t, err)
+	require.Equal(t, "y", string(content2), "a byte written while attach2 is live must reach attach2's pty")
+	require.NotContains(t, string(content2), "z", "the gap byte must never reach the NEXT attach's pty either")
+}
+
+// TestStartStdinReader_ReusesLeakedReaderNeverStacksIt is board #325's
+// dedup proof: while a reader is still blocked in Read (the leaked case -
+// an attach that ended without a detach byte, board #317), repeated
+// Attach-style calls to startStdinReader must never spawn a second one.
+// Only once that reader has genuinely returned (real EOF here, standing in
+// for the practically-never-happens real-stdin-closed case) does the next
+// call start a fresh one.
+func TestStartStdinReader_ReusesLeakedReaderNeverStacksIt(t *testing.T) {
+	session := NewTmuxSessionWithDeps("dedup", "program", NewMockPtyFactory(t), cmd_test.MockCmdExec{})
+
+	pr, pw := io.Pipe()
+	session.stdinReader = pr
+
+	session.startStdinReader()
+	require.EqualValues(t, 1, atomic.LoadInt32(&session.stdinReaderStarts))
+	require.EqualValues(t, 1, atomic.LoadInt32(&session.stdinReaderAlive))
+
+	// Simulate several more Attach cycles while this reader is still
+	// blocked in Read (never having seen a detach byte or EOF) - the exact
+	// condition board #325 was filed against.
+	for i := 0; i < 5; i++ {
+		session.startStdinReader()
+	}
+	require.EqualValues(t, 1, atomic.LoadInt32(&session.stdinReaderStarts),
+		"a reader still blocked in Read must never be joined by a second one")
+	require.EqualValues(t, 1, atomic.LoadInt32(&session.stdinReaderAlive))
+
+	require.NoError(t, pw.Close())
+	require.Eventually(t, func() bool {
+		return atomic.LoadInt32(&session.stdinReaderAlive) == 0
+	}, 2*time.Second, 5*time.Millisecond, "the reader must exit once its source hits EOF")
+
+	session.startStdinReader()
+	require.EqualValues(t, 2, atomic.LoadInt32(&session.stdinReaderStarts),
+		"once the old reader has genuinely exited, the next Attach must start a fresh one")
 }
