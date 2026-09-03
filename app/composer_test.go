@@ -479,23 +479,44 @@ func TestComposerFlow_MOpensStateMsg_NotStatePrompt(t *testing.T) {
 		"the footer while the composer is open, exactly - never StatePrompt's borrowed \"enter submit name\"")
 }
 
-// TestComposerFlow_NoLaneRow_TitleAndEnterMessage is board #280's slice 5b
-// DEFECT 2's composer-open half: a Needs-you row whose lane resolved to
-// neither the board card's Lane field nor its lane: label still opens the
-// composer, named "(no lane on this row)", and enter delivers nothing.
-func TestComposerFlow_NoLaneRow_TitleAndEnterMessage(t *testing.T) {
-	h := newComposerTestHome(t)
+// TestComposerFlow_NoLaneRow_TitleAndEnterAnswers is board #280's slice 5b
+// DEFECT 2's composer-open half, corrected by board #313's own replay fix
+// (slice 24b): a board-sourced Needs-you row whose lane resolves to neither
+// the card's own Lane field nor its lane: label still opens the composer -
+// but tagged to its own issue (AnswerIssue), so the title reads "answer #N
+// (no lane known)", never the generic "message (no lane on this row)" that
+// belongs to a row with no issue to answer at all. This used to also mean
+// Enter delivered nothing (checked composer.Lane() == "" before AnswerIssue
+// != 0) - the orchestrator's own replay against board #313 hit exactly this:
+// no comment POST, no close PATCH, ever. Enter now always posts and closes;
+// with no lane resolved, delivery falls back to copy.
+func TestComposerFlow_NoLaneRow_TitleAndEnterAnswers(t *testing.T) {
+	rec := &ghExecRecorder{fetchBody: `{"body":"## Options\n(a) x."}`}
+	h := newAnswerTestHome(t, rec)
+	var copyArgs []string
+	h.cmdExec = cmd_test.MockCmdExec{RunFunc: func(c *exec.Cmd) error {
+		copyArgs = c.Args
+		return nil
+	}}
 	h.list.SetNeedsYou([]clarity.FeedItem{{Rank: 1, Source: "#277", Lane: "#277", Title: "t"}}, "")
 	h.list.Up()
+	h.boardCache.Get(277)
 
 	pressGlobalKey(h, tea.KeyPressMsg{Code: 'm', Text: "m"})
 	require.True(t, h.composer.IsOpen())
 	require.Equal(t, "", h.composer.Lane())
-	require.Contains(t, strings.Join(h.composer.Render(80, ""), "\n"), "message (no lane on this row)")
+	require.Equal(t, 277, h.composer.AnswerIssue())
+	require.Contains(t, strings.Join(h.composer.Render(80, ""), "\n"), "answer #277 (no lane known)")
 
 	h.composer.Type("hi")
 	_, cmd := h.handleKeyPress(tea.KeyPressMsg{Code: tea.KeyEnter})
-	require.Nil(t, cmd, "no lane to send to - enter never dispatches a send")
-	require.False(t, h.composer.IsOpen())
-	require.Equal(t, "no lane to send to", h.composer.Result())
+	require.NotNil(t, cmd, "the issue number is enough - Enter always posts and closes now")
+	msg := cmd()
+	result := msg.(composerResultMsg)
+	require.NoError(t, result.err)
+	require.True(t, result.closed)
+	require.Equal(t, "answered #277 · closed · copied (no lane known)", result.result)
+	require.Equal(t, []string{"pbcopy"}, copyArgs)
+	require.Len(t, rec.postCalls, 1)
+	require.Len(t, rec.closeCalls, 1)
 }

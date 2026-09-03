@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
@@ -473,4 +474,55 @@ func TestConfirmationModalVisualAppearance(t *testing.T) {
 
 	// Test that the danger indicator is preserved
 	assert.Contains(t, rendered, "[!")
+}
+
+// TestKeyKill_DeleteUsesAccountTitle_LeavesOtherSeatsRow is front-door
+// slice 4's own wiring proof on this leg's app.go call site: killing the
+// selected instance now deletes by DeleteInstanceByAccountTitle(selected.
+// Account(), selected.Title), not the single-arg DeleteInstance(title) -
+// killing one seat's row must never delete another seat's row of the same
+// title. session/storage_test.go's own TestDeleteInstanceByAccountTitle_
+// OnOneSeat_LeavesOtherSeatsRow proves the storage half; this proves app.go
+// actually passes the account through on the real D-key path.
+func TestKeyKill_DeleteUsesAccountTitle_LeavesOtherSeatsRow(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	h := newComposerTestHome(t)
+	storage, err := session.NewStorage(config.LoadState())
+	require.NoError(t, err)
+	h.storage = storage
+
+	// The on-disk rows: two seats sharing one title, seeded the same
+	// Paused/NoWorktree way session/storage_test.go's own storage-level
+	// proof does (FromInstanceData never shells out - Kill() is never
+	// called on either of these, only DeleteInstanceByAccountTitle's own
+	// data-file match).
+	now := time.Now()
+	mainData := session.InstanceData{Title: "X", Path: t.TempDir(), Status: session.Paused, Program: "echo", CreatedAt: now, UpdatedAt: now, NoWorktree: true, Account: "main"}
+	teamBData := session.InstanceData{Title: "X", Path: t.TempDir(), Status: session.Paused, Program: "echo", CreatedAt: now, UpdatedAt: now, NoWorktree: true, Account: "team-b"}
+	mainOnDisk, err := session.FromInstanceData(mainData)
+	require.NoError(t, err)
+	teamBOnDisk, err := session.FromInstanceData(teamBData)
+	require.NoError(t, err)
+	require.NoError(t, storage.SaveInstances([]*session.Instance{mainOnDisk, teamBOnDisk}))
+
+	// The IN-MEMORY selected row app.go's own KeyKill handler acts on -
+	// never started, so list.Kill()'s own instance.Kill() short-circuits
+	// (no tmux session ever touched); only its Account()/Title feed the
+	// real DeleteInstanceByAccountTitle call this leg wired in.
+	selected, err := session.NewInstance(session.InstanceOptions{
+		Title: "X", Path: t.TempDir(), Program: "echo", NoWorktree: true, Account: "main",
+	})
+	require.NoError(t, err)
+	h.list.AddInstance(selected)
+	h.list.SetSelectedInstance(0)
+
+	pressGlobalKey(h, tea.KeyPressMsg{Code: 'D', Text: "D"})
+	require.Equal(t, stateConfirm, h.state)
+	require.NotNil(t, h.confirmationOverlay)
+	h.confirmationOverlay.OnConfirm()
+
+	onDisk, err := storage.LoadInstances()
+	require.NoError(t, err)
+	require.Len(t, onDisk, 1, "only main's own row is deleted")
+	require.Equal(t, "team-b", onDisk[0].Account())
 }

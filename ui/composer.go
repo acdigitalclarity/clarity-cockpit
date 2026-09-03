@@ -138,6 +138,17 @@ func (c *Composer) Open(lane string, isExternal bool) {
 	c.confirmText = ""
 }
 
+// OpenForIssue is Open (m on a Needs-you board row, board #295) plus a
+// tagged answerIssue: identical typing-mode box, but Enter (app.go's
+// stateMsg handling) sees a non-zero AnswerIssue and routes the typed text
+// through the same two-write answer flow OpenAnswerConfirm's own enter uses
+// (post the comment, then close the issue) rather than an ordinary message
+// send with no board write.
+func (c *Composer) OpenForIssue(lane string, isExternal bool, issue int) {
+	c.Open(lane, isExternal)
+	c.answerIssue = issue
+}
+
 // OpenAnswerConfirm loads the y key's confirm strip (RULE 6): text is
 // already the card's own recommended response, AnswerText-stripped by the
 // caller - the strip shows it verbatim, unedited, until enter sends it or e
@@ -467,6 +478,22 @@ func (c *Composer) Render(width int, lane string) []string {
 	title := fmt.Sprintf(" message %s ", displayLane)
 	if displayExternal && !noLane {
 		title = fmt.Sprintf(" message %s%s ", displayLane, copyOnlySuffix)
+	}
+	// Board #295b: a composer OpenForIssue tagged (m on a board-sourced
+	// Needs-you row, board #313's own replay defect) is always titled by its
+	// issue number, never the generic "message <lane>"/NoLaneLabel shape -
+	// the row's raising lane may genuinely be unresolved at the moment m is
+	// pressed (the fetch has not landed, or neither the card's own Lane
+	// section nor its lane: label resolved one), and "(no lane on this
+	// row)" reads as "there is nothing to answer" when there plainly is
+	// (the issue number is right there). Enter still posts and closes
+	// either way (app.go's stateMsg handling) - this is display only.
+	if c.open && c.answerIssue != 0 {
+		if noLane {
+			title = fmt.Sprintf(" answer #%d (no lane known) ", c.answerIssue)
+		} else {
+			title = fmt.Sprintf(" answer #%d · to %s ", c.answerIssue, displayLane)
+		}
 	}
 	top := "┌" + title + strings.Repeat("─", maxInt0(width-2-lipgloss.Width(title))) + "┐"
 

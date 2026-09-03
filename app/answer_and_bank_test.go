@@ -23,28 +23,45 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// ghExecRecorder is a cmd_test.MockCmdExec-backed fake for both halves of
-// board.go's own gh api seam - a plain GET fetch (BoardCache.Get/fetch) and
-// the -X POST comment write (BoardCache.PostComment) - branching on the
-// command's own args, since both ride the same *BoardCache's exec field.
+// ghExecRecorder is a cmd_test.MockCmdExec-backed fake for all three halves
+// of board.go's own gh api seam - a plain GET fetch (BoardCache.Get/fetch),
+// the -X POST comment write (BoardCache.PostComment) and the -X PATCH close
+// write (BoardCache.CloseIssue) - branching on the command's own
+// args, since all three ride the same *BoardCache's exec field.
 type ghExecRecorder struct {
-	fetchBody string // the GET fetch's own JSON body
-	postErr   error  // nil = every POST succeeds; non-nil = every POST fails with this
-	postCalls []string
+	fetchBody  string // the GET fetch's own JSON body
+	postErr    error  // nil = every POST succeeds; non-nil = every POST fails with this
+	closeErr   error  // nil = every PATCH close succeeds; non-nil = every close fails with this
+	postCalls  []string
+	closeCalls []string
+	// callOrder records "POST"/"PATCH" in the order the two writes actually
+	// happened - postCalls/closeCalls above are per-kind and cannot tell a
+	// caller which one landed first.
+	callOrder []string
 }
 
 func (g *ghExecRecorder) exec() cmd_test.MockCmdExec {
 	return cmd_test.MockCmdExec{
 		OutputFunc: func(cmd *exec.Cmd) ([]byte, error) {
 			args := strings.Join(cmd.Args, " ")
-			if strings.Contains(args, "-X POST") {
+			switch {
+			case strings.Contains(args, "-X POST"):
 				g.postCalls = append(g.postCalls, args)
+				g.callOrder = append(g.callOrder, "POST")
 				if g.postErr != nil {
 					return nil, g.postErr
 				}
 				return []byte(""), nil
+			case strings.Contains(args, "-X PATCH"):
+				g.closeCalls = append(g.closeCalls, args)
+				g.callOrder = append(g.callOrder, "PATCH")
+				if g.closeErr != nil {
+					return nil, g.closeErr
+				}
+				return []byte(""), nil
+			default:
+				return []byte(g.fetchBody), nil
 			}
-			return []byte(g.fetchBody), nil
 		},
 	}
 }
@@ -132,16 +149,19 @@ func TestAnswerFlow_TrackedSend_SendPromptOnceThenOnePostCommentTwoLineBody(t *t
 	result, ok := msg.(composerResultMsg)
 	require.True(t, ok)
 	require.NoError(t, result.err)
-	require.Contains(t, result.result, "sent · landed")
-	require.Contains(t, result.result, "board #277 commented")
+	require.Equal(t, "answered #277 · closed · sent into ways-of-working", result.result)
+	require.True(t, result.closed)
 
 	require.Len(t, rec.postCalls, 1, "exactly one board comment")
 	require.Contains(t, rec.postCalls[0], "repos/acdigitalclarity/clarity-tasks/issues/277/comments")
 	require.Contains(t, rec.postCalls[0],
 		"body=answered from the cockpit: (a) Make both edits yourself, two minutes.\nsent into ways-of-working at ")
+	require.Len(t, rec.closeCalls, 1, "exactly one board close, after the comment")
+	require.Contains(t, rec.closeCalls[0], "repos/acdigitalclarity/clarity-tasks/issues/277 -f state=closed")
 
 	h.Update(msg)
-	require.True(t, h.answeredIssues[277], "the row is marked answered")
+	require.False(t, h.answeredIssues[277], "the row is closed, not left ticked-and-dimmed")
+	require.Equal(t, 0, h.list.NumNeedsYou(), "the row must be gone from the list on this same tick")
 	require.Equal(t, stateDefault, h.state)
 }
 
@@ -175,6 +195,8 @@ func TestAnswerFlow_ExternalSend_CopiesNeverSendsPrompt_BodyCarriesCopiedFor(t *
 	require.NoError(t, result.err)
 	require.Equal(t, []string{"pbcopy"}, copiedArgs, "SendPrompt must never be attempted for an external lane")
 	require.Contains(t, rec.postCalls[0], "body=answered from the cockpit: (a) reply text.\ncopied for andy-e-bid (external lane); paste pending.")
+	require.Equal(t, "answered #244 · closed · copied (lane in your terminal)", result.result)
+	require.Len(t, rec.closeCalls, 1)
 }
 
 // -- test 9: send failure --------------------------------------------------
