@@ -1377,6 +1377,11 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 		return m, m.handleOpenPicker()
 	case keys.KeyOpenFolder:
 		return m, m.handleOpenFolder()
+	case keys.KeyButterflyToggle:
+		if m.tabbedWindow != nil {
+			m.tabbedWindow.ToggleButterflyEnabled()
+		}
+		return m, nil
 	default:
 		return m, nil
 	}

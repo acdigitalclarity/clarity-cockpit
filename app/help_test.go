@@ -37,3 +37,13 @@ func TestHelpGeneral_ListsSessionCopyKeys(t *testing.T) {
 	require.Contains(t, content, "whole visible transcript", "C's own help line must name the whole-tail copy")
 	require.Contains(t, content, "Turn picker", "v's own help line must name the turn picker")
 }
+
+// TestHelpGeneral_NamesButterflyToggle is design refinement 4's own "help
+// says so" requirement: capital B and what it does must appear in the
+// general help screen.
+func TestHelpGeneral_NamesButterflyToggle(t *testing.T) {
+	content := helpTypeGeneral{}.toContent()
+
+	require.Contains(t, content, "Toggle the tab-bar butterfly",
+		"B's own help line must name the butterfly toggle")
+}

@@ -63,6 +63,12 @@ const (
 	// `open`. Takes over "o" from its upstream role as a plain alias for
 	// KeyEnter (kept as one binding, "enter" only, below).
 	KeyOpenFolder
+	// KeyButterflyToggle is B (shift-b): toggles the tab-bar butterfly on
+	// or off live (design refinement 4) - app.go's key switch calls
+	// TabbedWindow.ToggleButterflyEnabled() directly, no dedicated
+	// handler, the same shape KeyCheckout's dormant entry shows is fine
+	// for a one-line call.
+	KeyButterflyToggle
 	// KeySelect is a display-only menu entry ("↑↓ select") - it is never
 	// looked up in GlobalKeyStringsMap (Up/Down already dispatch via their
 	// own KeyUp/KeyDown), it exists purely so ui/menu.go can render the
@@ -95,6 +101,7 @@ var GlobalKeyStringsMap = map[string]KeyName{
 	"C":          KeyCopyTail,
 	"v":          KeyTurnPicker,
 	"o":          KeyOpenFolder,
+	"B":          KeyButterflyToggle,
 }
 
 // GlobalkeyBindings is a global, immutable map of KeyName tot keybinding.
@@ -188,6 +195,10 @@ var GlobalkeyBindings = map[KeyName]key.Binding{
 	KeyOpenFolder: key.NewBinding(
 		key.WithKeys("o"),
 		key.WithHelp("o", "open folder"),
+	),
+	KeyButterflyToggle: key.NewBinding(
+		key.WithKeys("B"),
+		key.WithHelp("B", "toggle butterfly"),
 	),
 	KeySelect: key.NewBinding(
 		key.WithHelp("↑↓", "select"),
