@@ -82,6 +82,9 @@ type ExternalLane struct {
 	State    string
 	LastTurn time.Time
 	StateOK  bool
+	// AnsweredAt mirrors LaneTail.AnsweredAt (item 5, WAITING HELD) - same
+	// caller, same tick, same zero-value contract as State/LastTurn above.
+	AnsweredAt time.Time
 }
 
 // externalTranscriptRow is the pre-dedupe intermediate the discovery loop

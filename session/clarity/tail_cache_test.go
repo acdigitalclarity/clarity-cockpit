@@ -14,19 +14,19 @@ import (
 // contract directly: with the file's mtime and size held fixed, a SECOND
 // call to Get must return the FIRST parse's result even after the file's
 // content on disk has since changed underneath it - if Get had reparsed,
-// it would see the new (working) state instead of the stale (idle) one
-// still cached.
+// it would see the new (working) state instead of the stale (waiting on
+// you, item 5's held state for an old closed turn) one still cached.
 func TestLaneTailCache_UnchangedFileNotReparsed(t *testing.T) {
 	now := time.Now()
-	idleAt := now.Add(-2 * time.Hour)
-	path := writeFixture(t, []string{turnDurationLine(idleAt, 1000, 3, 0)})
+	staleAt := now.Add(-2 * time.Hour)
+	path := writeFixture(t, []string{turnDurationLine(staleAt, 1000, 3, 0)})
 	info, err := os.Stat(path)
 	require.NoError(t, err)
 
 	c := NewLaneTailCache()
-	first, err := c.Get(path, 0, now)
+	first, err := c.Get(path, 0, now, time.Time{})
 	require.NoError(t, err)
-	require.Equal(t, StateIdle, first.State)
+	require.Equal(t, StateWaitingYou, first.State)
 
 	// Overwrite with content that would classify as "working" if reparsed -
 	// built to the SAME byte length as the original line (same field digit
@@ -37,9 +37,9 @@ func TestLaneTailCache_UnchangedFileNotReparsed(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte(workingLine), 0644))
 	require.NoError(t, os.Chtimes(path, info.ModTime(), info.ModTime()))
 
-	second, err := c.Get(path, 0, now)
+	second, err := c.Get(path, 0, now, time.Time{})
 	require.NoError(t, err)
-	require.Equal(t, StateIdle, second.State, "mtime and size unchanged: Get must return the cached (stale) result, not reparse")
+	require.Equal(t, StateWaitingYou, second.State, "mtime and size unchanged: Get must return the cached (stale) result, not reparse")
 }
 
 // TestLaneTailCache_ChangedSizeReparses is the cache's other half: once the
@@ -47,18 +47,18 @@ func TestLaneTailCache_UnchangedFileNotReparsed(t *testing.T) {
 // content, not serve the stale cached entry forever.
 func TestLaneTailCache_ChangedSizeReparses(t *testing.T) {
 	now := time.Now()
-	idleAt := now.Add(-2 * time.Hour)
-	path := writeFixture(t, []string{turnDurationLine(idleAt, 1000, 3, 0)})
+	staleAt := now.Add(-2 * time.Hour)
+	path := writeFixture(t, []string{turnDurationLine(staleAt, 1000, 3, 0)})
 
 	c := NewLaneTailCache()
-	first, err := c.Get(path, 0, now)
+	first, err := c.Get(path, 0, now, time.Time{})
 	require.NoError(t, err)
-	require.Equal(t, StateIdle, first.State)
+	require.Equal(t, StateWaitingYou, first.State)
 
 	workingAt := now.Add(-time.Second)
 	require.NoError(t, os.WriteFile(path, []byte(turnDurationLine(workingAt, 1000, 1, 2)+"\n"), 0644))
 
-	second, err := c.Get(path, 0, now)
+	second, err := c.Get(path, 0, now, time.Time{})
 	require.NoError(t, err)
 	require.Equal(t, StateWorking, second.State, "a changed file must be reparsed, not served from the stale cache")
 }
@@ -77,11 +77,11 @@ func TestLaneTailCache_WiderMaxTurnsReparses(t *testing.T) {
 	path := writeFixture(t, lines)
 
 	c := NewLaneTailCache()
-	first, err := c.Get(path, 3, now)
+	first, err := c.Get(path, 3, now, time.Time{})
 	require.NoError(t, err)
 	require.Len(t, first.Turns, 3, "the narrower request must be served exactly that many turns")
 
-	second, err := c.Get(path, 8, now)
+	second, err := c.Get(path, 8, now, time.Time{})
 	require.NoError(t, err)
 	require.Len(t, second.Turns, 8, "a wider request against the same unchanged file must reparse for the extra history, not return the narrower cached slice")
 }
@@ -114,13 +114,13 @@ func BenchmarkLaneTailCache_Get_UnchangedFile(b *testing.B) {
 	require.NoError(b, os.WriteFile(path, []byte(body), 0644))
 
 	c := NewLaneTailCache()
-	if _, err := c.Get(path, 40, now); err != nil {
+	if _, err := c.Get(path, 40, now, time.Time{}); err != nil {
 		b.Fatal(err)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := c.Get(path, 40, now); err != nil {
+		if _, err := c.Get(path, 40, now, time.Time{}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -148,7 +148,7 @@ func BenchmarkLaneTailCache_Get_ChangedFile(b *testing.B) {
 			b.Fatal(err)
 		}
 		b.StartTimer()
-		if _, err := c.Get(path, 40, now); err != nil {
+		if _, err := c.Get(path, 40, now, time.Time{}); err != nil {
 			b.Fatal(err)
 		}
 	}

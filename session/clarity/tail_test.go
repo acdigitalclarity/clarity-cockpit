@@ -104,6 +104,22 @@ func queueOperationLineWithTimestamp(ts time.Time) string {
 	return fmt.Sprintf(`{"type":"queue-operation","operation":"enqueue","timestamp":%q}`, fixtureTimestamp(ts))
 }
 
+// parseFixtureRecords parses fixture line builders' own JSON output straight
+// into []rawRecord, the way ReadLaneTail's own scanner does internally - for
+// tests that exercise ClassifyState directly (item 5's sentAt cases), never
+// through a written file, since sentAt is not itself part of LaneTail's read
+// path.
+func parseFixtureRecords(t *testing.T, lines []string) []rawRecord {
+	t.Helper()
+	records := make([]rawRecord, 0, len(lines))
+	for _, l := range lines {
+		var rec rawRecord
+		require.NoError(t, json.Unmarshal([]byte(l), &rec))
+		records = append(records, rec)
+	}
+	return records
+}
+
 func writeFixture(t *testing.T, lines []string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -173,16 +189,92 @@ func TestClassifyState_ClosedFiveMinutesAgoNoAgents_WaitingOnYou(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, StateWaitingYou, tail.State)
 	require.Equal(t, 0, tail.PendingAgents)
+	require.True(t, tail.AnsweredAt.IsZero(), "no transition has happened yet")
 }
 
-func TestClassifyState_ClosedTwoHoursAgo_Idle(t *testing.T) {
+// TestClassifyState_ClosedTwoHoursAgo_StaysWaitingOnYou is item 5's own
+// UPDATE to the pre-existing "2 hours -> idle" fixture (WAITING HELD,
+// cockpit-pane modalities research item 5): the 30-minute time-only decay
+// this test used to prove is gone - nothing has answered this lane (no owner
+// turn, no cockpit send), so a closed turn with no pending agents now stays
+// "waiting on you" no matter how old.
+func TestClassifyState_ClosedTwoHoursAgo_StaysWaitingOnYou(t *testing.T) {
 	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
 	path := writeFixture(t, []string{
 		turnDurationLine(now.Add(-2*time.Hour), 1000, 3, 0),
 	})
 	tail, err := ReadLaneTail(path, DefaultTailMaxBytes, DefaultTailTurns, now)
 	require.NoError(t, err)
+	require.Equal(t, StateWaitingYou, tail.State, "no time-only decay to idle any more")
+	require.True(t, tail.AnsweredAt.IsZero())
+}
+
+// TestClassifyState_OwnerRepliedAfterClose_Idle is item 5's own named test:
+// a closed, pending-free turn followed by a genuine owner reply (not a
+// harness-tagged record) reads idle/answered, never the generic open-turn
+// "working" an owner-authored anchor would otherwise fall into.
+func TestClassifyState_OwnerRepliedAfterClose_Idle(t *testing.T) {
+	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
+	closedAt := now.Add(-2 * time.Hour)
+	answeredAt := now.Add(-5 * time.Minute)
+	path := writeFixture(t, []string{
+		turnDurationLine(closedAt, 1000, 3, 0),
+		ownerLine(answeredAt, "sorry, was away - go ahead"),
+	})
+	tail, err := ReadLaneTail(path, DefaultTailMaxBytes, DefaultTailTurns, now)
+	require.NoError(t, err)
 	require.Equal(t, StateIdle, tail.State)
+	require.WithinDuration(t, answeredAt, tail.AnsweredAt, time.Second)
+	require.Contains(t, tail.StateReason, "answered 5m ago")
+}
+
+// TestClassifyState_OwnerReplyWithNoPriorClose_FallsToOpenTurnRule proves
+// the owner-turn special case is scoped to the exact "answering a
+// pending-free close" pattern: an owner's FIRST message in a fresh
+// conversation (nothing before it at all) is not "answered" anything, so it
+// still falls through to the ordinary open-turn age split.
+func TestClassifyState_OwnerReplyWithNoPriorClose_FallsToOpenTurnRule(t *testing.T) {
+	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
+	path := writeFixture(t, []string{
+		ownerLine(now.Add(-2*time.Minute), "let's start"),
+	})
+	tail, err := ReadLaneTail(path, DefaultTailMaxBytes, DefaultTailTurns, now)
+	require.NoError(t, err)
+	require.Equal(t, StateWorking, tail.State)
+	require.True(t, tail.OpenTurn)
+	require.True(t, tail.AnsweredAt.IsZero())
+}
+
+// TestClassifyState_CockpitSentAfterClose_Idle is item 5's second trigger:
+// the transcript still shows only the closed, pending-free turn (no owner
+// reply has landed there yet), but the caller's own sentAt says the cockpit
+// already sent into this lane after the close - answered, without waiting
+// for the transcript to catch up.
+func TestClassifyState_CockpitSentAfterClose_Idle(t *testing.T) {
+	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
+	closedAt := now.Add(-20 * time.Minute)
+	sentAt := now.Add(-3 * time.Minute)
+	records := parseFixtureRecords(t, []string{
+		turnDurationLine(closedAt, 1000, 3, 0),
+	})
+	state := ClassifyState(records, now, sentAt)
+	require.Equal(t, StateIdle, state.State)
+	require.WithinDuration(t, sentAt, state.AnsweredAt, time.Second)
+}
+
+// TestClassifyState_CockpitSentBeforeClose_StillWaiting proves sentAt only
+// answers a close that happened AFTER it - a stale send time from before
+// the turn even closed again must never suppress "waiting on you".
+func TestClassifyState_CockpitSentBeforeClose_StillWaiting(t *testing.T) {
+	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
+	sentAt := now.Add(-30 * time.Minute)
+	closedAt := now.Add(-5 * time.Minute)
+	records := parseFixtureRecords(t, []string{
+		turnDurationLine(closedAt, 1000, 3, 0),
+	})
+	state := ClassifyState(records, now, sentAt)
+	require.Equal(t, StateWaitingYou, state.State)
+	require.True(t, state.AnsweredAt.IsZero())
 }
 
 func TestClassifyState_OpenTurnFifteenMinutesOld_Stalled(t *testing.T) {
@@ -675,7 +767,61 @@ func TestClassifyState_SystemSummaryAfterClose_StaysClosed(t *testing.T) {
 	})
 	tail, err := ReadLaneTail(path, DefaultTailMaxBytes, DefaultTailTurns, now)
 	require.NoError(t, err)
-	require.Equal(t, StateIdle, tail.State, "system summaries after the close must not re-open the turn")
+	// Item 5 (WAITING HELD) dropped the old 30-minute idle decay this test
+	// used to prove StateIdle with - the real thing under test is that the
+	// anchor stays on the turn_duration record (never re-opened by the
+	// trailing system summaries), which a held "waiting on you" two hours
+	// later still proves just as well: LastTurn pinned to closedAt, OpenTurn
+	// false.
+	require.Equal(t, StateWaitingYou, tail.State, "system summaries after the close must not re-open the turn")
 	require.False(t, tail.OpenTurn)
 	require.WithinDuration(t, closedAt, tail.LastTurn, time.Second)
+}
+
+// awaySummaryLine builds a real away_summary record - the record shape
+// confirmed against five live transcripts before this file was written
+// (quoted in the leg's report), e.g.
+// /Users/allencoates/.claude/projects/-Users-allencoates-projects-Clarity-sessions-fastned-hs/e790cd1f-1879-422b-9efb-b22d00a9ea20.jsonl:
+// {"type":"system","subtype":"away_summary","content":"Prepping tomorrow's
+// 14:00 Fastned OOB H&S demo: ... Next action: you impersonate
+// maria.patel.demo and submit the rehearsal incident via Employee Center.
+// (disable recaps in /config)","timestamp":"2026-07-20T13:45:06.808Z", ...}
+// - content is always a single free-text string, never separate Goal/Next
+// fields.
+func awaySummaryLine(ts time.Time, content string) string {
+	return fmt.Sprintf(`{"type":"system","subtype":"away_summary","timestamp":%q,"content":%q}`, fixtureTimestamp(ts), content)
+}
+
+// TestReadLaneTail_AwaySummary_NewestKept is item 4's own record-shape
+// proof: two away_summary records in the tail window, ReadLaneTail keeps
+// only the NEWEST one's text and timestamp - never the first seen, never
+// concatenated.
+func TestReadLaneTail_AwaySummary_NewestKept(t *testing.T) {
+	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
+	older := now.Add(-3 * time.Hour)
+	newer := now.Add(-1 * time.Hour)
+	path := writeFixture(t, []string{
+		awaySummaryLine(older, "Goal: an older recap. Next: stale."),
+		turnDurationLine(older.Add(time.Minute), 1000, 3, 0),
+		awaySummaryLine(newer, "Goal: prepping the demo. Next: impersonate the rehearsal account."),
+		turnDurationLine(newer.Add(time.Minute), 1000, 3, 0),
+	})
+	tail, err := ReadLaneTail(path, DefaultTailMaxBytes, DefaultTailTurns, now)
+	require.NoError(t, err)
+	require.Equal(t, "Goal: prepping the demo. Next: impersonate the rehearsal account.", tail.AwaySummary.Text)
+	require.WithinDuration(t, newer, tail.AwaySummary.At, time.Second)
+}
+
+// TestReadLaneTail_AwaySummary_AbsentWhenNone proves the zero value (never a
+// panic, never a stray empty-string record) when the tail window carries no
+// away_summary at all.
+func TestReadLaneTail_AwaySummary_AbsentWhenNone(t *testing.T) {
+	now := time.Date(2026, 9, 2, 20, 0, 0, 0, time.UTC)
+	path := writeFixture(t, []string{
+		turnDurationLine(now.Add(-5*time.Minute), 1000, 3, 0),
+	})
+	tail, err := ReadLaneTail(path, DefaultTailMaxBytes, DefaultTailTurns, now)
+	require.NoError(t, err)
+	require.True(t, tail.AwaySummary.At.IsZero())
+	require.Empty(t, tail.AwaySummary.Text)
 }
