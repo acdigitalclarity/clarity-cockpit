@@ -159,6 +159,20 @@ var laneStateStalledStyle = lipgloss.NewStyle().
 var laneStateIdleStyle = lipgloss.NewStyle().
 	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#777777"), Dark: lipgloss.Color("#999999")})
 
+// laneStateStoppedStyle is a dead lane's own colour (slice 17b) - the same
+// muted grey idle already uses, since neither is an attention state, but a
+// distinct glyph (laneStateGlyph below) still tells the two apart: idle
+// means answered and caught up, stopped means nothing is running at all.
+var laneStateStoppedStyle = laneStateIdleStyle
+
+// laneStatePausedWord is the state-word column's own text for a tracked
+// row that is specifically Paused (slice 17b, item 2: "the row's existing
+// Paused word for a tracked row") - distinct from clarity.StateStopped,
+// which an external lane or a tracked row whose tmux session died without
+// a Status transition both read instead (laneLivenessState below). Lower-
+// case, matching every other word this column ever shows.
+const laneStatePausedWord = "paused"
+
 // laneStateNeedsKeyStyle is clarity.StateNeedsKey's own colour - bold on
 // the waiting/stalled orange, since a live permission prompt is the single
 // most urgent thing a row can say (ANSWER-AND-BANK-SPEC.md item 7: "ahead
@@ -183,6 +197,8 @@ func laneStateGlyph(state string) (string, lipgloss.Style) {
 		return "○", laneStateIdleStyle
 	case clarity.StateNeedsKey:
 		return "◆", laneStateNeedsKeyStyle
+	case clarity.StateStopped, laneStatePausedWord:
+		return "×", laneStateStoppedStyle
 	default:
 		return " ", lipgloss.NewStyle()
 	}
@@ -198,6 +214,34 @@ func laneStateDisplayWord(state string) string {
 		return "waiting"
 	}
 	return state
+}
+
+// laneLivenessState resolves a tracked instance's own DISPLAYED state word
+// through the slice 17b liveness gate (item 2): an alive row's own
+// classifier word is returned unchanged; a dead one reads laneStatePausedWord
+// when it is specifically Paused, or clarity.StateStopped otherwise (a tmux
+// session gone with Status never having caught up - the 3 Sep 18:47:57
+// incident's own shape). This is the ONE place that decision is made - both
+// InstanceRenderer.Render (the drawn word) and groupLanesByModality's own
+// sort comparator (the drawn ORDER) call this rather than re-deriving it,
+// so a row can never sort as though it were waiting while its own glyph
+// reads stopped.
+func laneLivenessState(i *session.Instance, state string) string {
+	if i.Alive() {
+		return state
+	}
+	if i.Paused() {
+		return laneStatePausedWord
+	}
+	return clarity.StateStopped
+}
+
+// externalLivenessState is laneLivenessState's own external-lane
+// equivalent: clarity.ApplyLiveness against DiscoverExternalLanes' own
+// Alive signal (item 1) - external lanes carry no Paused concept of their
+// own, so a dead one always reads clarity.StateStopped, never a second word.
+func externalLivenessState(lane clarity.ExternalLane) string {
+	return clarity.ApplyLiveness(lane.State, lane.Alive)
 }
 
 // laneStateWordWidth is the widest of the row's own four display words
@@ -850,6 +894,13 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, h
 
 	pct, fillOK := i.GetContextFill()
 	state, lastTurn, turnOK := i.GetLaneState()
+	// Liveness gate (item 2, slice 17b) runs BEFORE the NeedsKey override
+	// below - a dead row's tmux pane cannot carry a live permission prompt
+	// either (app.go's own sampleNeedsKey already forces NeedsKey false
+	// once TmuxAlive is false, so this ordering never actually conflicts
+	// with it; it is here for the same reason as that guard, not instead of
+	// it).
+	state = laneLivenessState(i, state)
 	if i.NeedsKey() {
 		// Overrides the transcript-derived word, never the cached value
 		// itself (SetLaneState stays the pure transcript read - the r-key
@@ -974,19 +1025,27 @@ func groupLanesByModality(items []*session.Instance, external []clarity.External
 			ia, ib := items[g.itemIdx[a]], items[g.itemIdx[b]]
 			sa, la, oka := ia.GetLaneState()
 			sb, lb, okb := ib.GetLaneState()
+			// Liveness gate (item 5, slice 17b): sort by the SAME word the
+			// row itself draws (laneLivenessState), never the raw
+			// classifier word - a dead row must sort into the stopped/
+			// paused rank below, not wherever its own stale transcript
+			// would otherwise place it.
+			sa, sb = laneLivenessState(ia, sa), laneLivenessState(ib, sb)
 			return newLaneAttentionKey(sa, la, oka, ia.NeedsKey()).less(newLaneAttentionKey(sb, lb, okb, ib.NeedsKey()))
 		})
 		sort.SliceStable(g.externalIdx, func(a, b int) bool {
 			ea, eb := external[g.externalIdx[a]], external[g.externalIdx[b]]
-			return newLaneAttentionKey(ea.State, ea.LastTurn, ea.StateOK, false).less(newLaneAttentionKey(eb.State, eb.LastTurn, eb.StateOK, false))
+			sa, sb := externalLivenessState(ea), externalLivenessState(eb)
+			return newLaneAttentionKey(sa, ea.LastTurn, ea.StateOK, false).less(newLaneAttentionKey(sb, eb.LastTurn, eb.StateOK, false))
 		})
 	}
 	return groups
 }
 
-// laneAttentionKey is one row's own sort key for item 2's attention order:
-// waiting on you, stalled, working, idle (the brief's own list, rank 0-3);
-// a needs-a-key row ranks ahead of all four (-1), the same "ahead of every
+// laneAttentionKey is one row's own sort key for item 2's attention order,
+// extended by slice 17b (item 5): waiting on you, stalled, working, idle,
+// then stopped/paused (rank 0-4, the dead-lane rank added here) - a
+// needs-a-key row ranks ahead of all of them (-1), the same "ahead of every
 // other word" convention laneStateNeedsKeyStyle's own comment already gives
 // the glyph - live-permission-prompt is always the single most urgent thing
 // a row can say. Ties (equal rank) break by last turn NEWEST first; a row
@@ -1018,8 +1077,10 @@ func laneAttentionRank(state string, needsKey bool) int {
 		return 2
 	case clarity.StateIdle:
 		return 3
-	default:
+	case clarity.StateStopped, laneStatePausedWord:
 		return 4
+	default:
+		return 5
 	}
 }
 
@@ -1054,7 +1115,7 @@ func (l *List) renderExternalRow(lane clarity.ExternalLane, selected, showWord, 
 	nameCol := l.laneNameColWidth(showWord)
 	name := runewidth.FillRight(ansiTruncateRow(lane.Name, nameCol), nameCol)
 	suffix := laneRowSuffix(rowBg, rowFg, externalRowTag(lane), showTag,
-		lane.Fill.Pct, lane.FillOK, lane.State, lane.LastTurn, lane.AnsweredAt, lane.StateOK, showWord, laneShowTime(innerWidth))
+		lane.Fill.Pct, lane.FillOK, externalLivenessState(lane), lane.LastTurn, lane.AnsweredAt, lane.StateOK, showWord, laneShowTime(innerWidth))
 	line := nameStyle.Render(name) + suffix
 	content := ansiTruncateRow(line, innerWidth)
 	return laneRowFrame(rowBg, rowFg, selected, content)

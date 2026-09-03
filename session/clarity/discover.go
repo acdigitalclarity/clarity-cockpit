@@ -14,8 +14,11 @@ package clarity
 import (
 	"bufio"
 	"bytes"
+	"claude-squad/cmd"
 	"encoding/json"
+	"fmt"
 	"os"
+	osexec "os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -85,6 +88,16 @@ type ExternalLane struct {
 	// AnsweredAt mirrors LaneTail.AnsweredAt (item 5, WAITING HELD) - same
 	// caller, same tick, same zero-value contract as State/LastTurn above.
 	AnsweredAt time.Time
+
+	// Alive is DiscoverExternalLanes' own liveness signal (item 1, slice
+	// 17b): ExternalLaneAlive(Key), computed once per discovery pass on the
+	// same tick as everything else above. A stale-but-still-fresh transcript
+	// (inside ExternalLiveWindow, which is only ever 90 minutes wide) is not
+	// proof a process is still behind it - the 3 Sep 18:47:57 incident. The
+	// state-word/sort/attention layers (ui/list.go, app/attention.go) all
+	// read this rather than re-deriving it, so a caller can never disagree
+	// with discovery about which external rows are actually alive.
+	Alive bool
 }
 
 // externalTranscriptRow is the pre-dedupe intermediate the discovery loop
@@ -334,6 +347,29 @@ func claudeMDFieldValue(line, field string) (value string, ok bool) {
 	return strings.TrimSpace(trimmed[len(prefix):]), true
 }
 
+// ExternalLaneAlive is discover.go's own fallback external-lane liveness
+// signal (item 1, slice 17b): DiscoverExternalLanes reads no pid, lock or
+// heartbeat field from a transcript today - confirmed against a live
+// transcript's own JSON key set before this was written (this leg's own
+// report quotes the full key set; "pid"/"lock"/"heartbeat" are absent from
+// it) - so this falls back to the same session-liveness primitive
+// session/instance.go's own dead-lane reload path already relies on:
+// `tmux has-session`, the exact command session/tmux's DoesSessionExist
+// shells (session/tmux/tmux.go, "-t=<name>" for an exact match, never a
+// prefix match), applied here to the external lane's own bare key rather
+// than a tracked instance's claudesquad_-prefixed one, since an external
+// lane has no such prefix to begin with. tmuxArgs is prepended before
+// "has-session" (e.g. "-L", "sockname" for an isolated test socket) - the
+// production caller below passes none, exactly like DoesSessionExist,
+// which never passes a socket flag either (the whole fleet, tracked and
+// external alike, shares tmux's own single ambient default server - the 3
+// Sep 18:47:57 incident's own root cause was a bare `tmux kill-server`
+// taking that ONE shared server down).
+func ExternalLaneAlive(name string, exec cmd.Executor, tmuxArgs ...string) bool {
+	args := append(append([]string{}, tmuxArgs...), "has-session", fmt.Sprintf("-t=%s", name))
+	return exec.Run(osexec.Command("tmux", args...)) == nil
+}
+
 // DiscoverExternalLanes derives the list of live external lanes: every
 // <root>/<encoded>/*.jsonl transcript across every root claudeProjectsRoots()
 // names, whose mtime is within ExternalLiveWindow, minus any path containing
@@ -403,6 +439,7 @@ func DiscoverExternalLanes(excludeDirs map[string]bool) ([]ExternalLane, error) 
 			Account:        seatTag,
 			SeatSource:     seatSource,
 			Modality:       modalityFromLaneDir(cwd),
+			Alive:          ExternalLaneAlive(r.lane, cmd.MakeExecutor()),
 		})
 	}
 	return out, nil

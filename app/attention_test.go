@@ -3,9 +3,12 @@
 package app
 
 import (
+	"claude-squad/cmd/cmd_test"
 	"claude-squad/session"
 	"claude-squad/session/clarity"
+	"claude-squad/session/tmux"
 	"claude-squad/ui"
+	"os/exec"
 	"testing"
 	"time"
 
@@ -17,7 +20,12 @@ import (
 // lane-state reading, the same minimal shape ui package's
 // frontdoor5Instance uses (this package cannot import ui's own test
 // helpers, so it is duplicated here rather than exported across a
-// package boundary purely for a test).
+// package boundary purely for a test). Alive (slice 17b): a fake tmux
+// session whose Run always succeeds - every existing caller of this
+// helper is testing attention behaviour unrelated to liveness, so it
+// keeps reading exactly the alive lane it always implicitly was before
+// liveness existed as a concept; the dead-lane cases get their own
+// fixture (attention_liveness_test.go).
 func attentionTestInstance(t *testing.T, title, state string) *session.Instance {
 	t.Helper()
 	inst, err := session.NewInstance(session.InstanceOptions{
@@ -26,12 +34,15 @@ func attentionTestInstance(t *testing.T, title, state string) *session.Instance 
 		Program: "echo",
 	})
 	require.NoError(t, err)
+	inst.SetTmuxSession(tmux.NewTmuxSessionWithDeps(title, "echo", nil, cmd_test.MockCmdExec{
+		RunFunc: func(cmd *exec.Cmd) error { return nil },
+	}))
 	inst.SetLaneState(state, time.Now(), true)
 	return inst
 }
 
 func attentionTestExternal(name, state string) clarity.ExternalLane {
-	return clarity.ExternalLane{Name: name, State: state, StateOK: true, LastTurn: time.Now()}
+	return clarity.ExternalLane{Name: name, State: state, StateOK: true, LastTurn: time.Now(), Alive: true}
 }
 
 // TestUpdateAttention_EdgeRingsBell_LevelDoesNot is item 3's own core case:

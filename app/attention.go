@@ -82,6 +82,18 @@ func (m *home) updateAttention(now time.Time) tea.Cmd {
 		if !ok {
 			continue
 		}
+		// Liveness gate (item 1/3, slice 17b, WoW ruling 3 Sep 22:3x): a
+		// dead lane - Paused, or its tmux session gone with Status never
+		// having caught up - never rings the bell or counts in the title,
+		// no matter what its own transcript's last closed turn says. This
+		// is a hard skip of classifyAttention entirely, not a state
+		// substitution, since classifyAttention has no "stopped" word to
+		// recognise and does not need one - the result is attentionNone
+		// either way.
+		if !inst.Alive() {
+			m.attentionState[key] = attentionNone
+			continue
+		}
 		cat := classifyAttention(state, inst.NeedsKey())
 		if cat != attentionNone {
 			n++
@@ -95,6 +107,14 @@ func (m *home) updateAttention(now time.Time) tea.Cmd {
 		key := "external:" + lane.Name
 		seen[key] = true
 		if !lane.StateOK {
+			continue
+		}
+		// Same liveness gate as the tracked loop above, reading
+		// DiscoverExternalLanes' own Alive signal (item 1) rather than a
+		// tmux session directly - an external lane carries no tracked tmux
+		// pane of its own to check.
+		if !lane.Alive {
+			m.attentionState[key] = attentionNone
 			continue
 		}
 		// External lanes never carry NeedsKey (no tracked tmux pane to

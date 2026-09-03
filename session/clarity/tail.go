@@ -56,6 +56,21 @@ const (
 // External lanes never carry it (no tracked tmux session to sample).
 const StateNeedsKey = "needs a key"
 
+// StateStopped is the display word a lane reads when nothing is running
+// behind it (cockpit-pane slice 17b, WoW ruling 3 Sep 22:3x: "waiting
+// persists without decay ... but only for an alive lane"). Never produced
+// by ClassifyState itself, which stays a pure transcript read with no
+// liveness signal of its own - the layer above it (ui/list.go's row
+// word/sort, app/attention.go's bell/title) substitutes this in place of
+// whatever ClassifyState returned once it knows the lane is dead, the same
+// "ahead of every other word" substitution StateNeedsKey already gets from
+// app.go's tmux pane sample. External lanes read this word directly; a
+// tracked row that is specifically Paused reads its own separate word
+// instead (ui/list.go's laneStatePausedWord) so the two dead-tracked-row
+// cases (tmux session gone but Status never transitioned, vs. explicitly
+// Paused) stay visually distinct.
+const StateStopped = "stopped"
+
 // DefaultTailMaxBytes is ReadLaneTail's default read window: the last
 // 256 KiB of the transcript, which comfortably covers several turns of a
 // normal working session without paying to scan the whole file.
@@ -368,6 +383,25 @@ func ReadLaneTail(transcriptPath string, maxBytes int, maxTurns int, now time.Ti
 		AnsweredAt:     state.AnsweredAt,
 		AwaySummary:    latestAwaySummary(records),
 	}, nil
+}
+
+// ApplyLiveness is the layer above ClassifyState the brief calls out
+// (item 1/2, slice 17b): alive returns state unchanged; not alive returns
+// StateStopped regardless of what the transcript itself says, since a dead
+// lane cannot be working, waiting on you, or stalled - nothing is running
+// to be any of those. Kept as its own function, never folded into
+// ClassifyState, so ClassifyState itself never takes a liveness argument
+// and stays a pure transcript read - callers apply this once, after
+// ClassifyState, with whatever liveness signal their own lane kind reads
+// (session.Instance.Alive() for a tracked row, clarity.ExternalLane.Alive
+// for an external one). A tracked row's own Paused word is a further UI-
+// only refinement layered on top of this (ui/list.go's laneLivenessState)
+// for the specific case Status itself already names.
+func ApplyLiveness(state string, alive bool) string {
+	if alive {
+		return state
+	}
+	return StateStopped
 }
 
 // stateResult is ClassifyState's return value.

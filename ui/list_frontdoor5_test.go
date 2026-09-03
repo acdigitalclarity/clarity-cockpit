@@ -1,8 +1,11 @@
 package ui
 
 import (
+	"claude-squad/cmd/cmd_test"
 	"claude-squad/session"
 	"claude-squad/session/clarity"
+	"claude-squad/session/tmux"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -33,7 +36,15 @@ func frontdoor5Time(hh, mm int) time.Time {
 
 // frontdoor5Instance builds a tracked instance carrying an account, a
 // modality and a resolved context-fill/state reading - the three fields
-// slice 5's grouped list, tag column and fleet line all key on.
+// slice 5's grouped list, tag column and fleet line all key on. Alive
+// (slice 17b): a fake tmux session whose Run always succeeds, so
+// TmuxAlive() reads true - the same SetTmuxSession/NewTmuxSessionWithDeps
+// seam composer_test.go already uses for a "live tmux" fixture - since
+// this helper's own tests are exercising state/sort/attention behaviour
+// unrelated to liveness, every existing caller keeps reading exactly the
+// alive lane it always implicitly was before liveness existed as a
+// concept; TestFrontdoor5* callers that specifically want a DEAD row build
+// one directly instead (see list_liveness_test.go).
 func frontdoor5Instance(t *testing.T, title, account, modality string, pct int, state string, when time.Time) *session.Instance {
 	t.Helper()
 	inst, err := session.NewInstance(session.InstanceOptions{
@@ -44,12 +55,17 @@ func frontdoor5Instance(t *testing.T, title, account, modality string, pct int, 
 		Modality: modality,
 	})
 	require.NoError(t, err)
+	inst.SetTmuxSession(tmux.NewTmuxSessionWithDeps(title, "echo", nil, cmd_test.MockCmdExec{
+		RunFunc: func(cmd *exec.Cmd) error { return nil },
+	}))
 	inst.SetContextFill(pct, true)
 	inst.SetLaneState(state, when, true)
 	return inst
 }
 
 // frontdoor5External builds an external lane with the same three fields.
+// Alive defaults true (slice 17b) for the same "already implicitly alive"
+// reason frontdoor5Instance's own doc comment gives.
 func frontdoor5External(name, account, seatSource, modality string, pct int, state string, when time.Time) clarity.ExternalLane {
 	return clarity.ExternalLane{
 		Name:       name,
@@ -62,6 +78,7 @@ func frontdoor5External(name, account, seatSource, modality string, pct int, sta
 		LastTurn:   when,
 		StateOK:    true,
 		LastWrite:  when,
+		Alive:      true,
 	}
 }
 
