@@ -26,3 +26,14 @@ func TestHelpGeneral_NamesTerminalTabIsAlwaysAShell(t *testing.T) {
 	require.True(t, strings.Contains(content, "own folder"),
 		"the general help screen must say the shell opens in the lane's own folder")
 }
+
+// TestHelpGeneral_ListsSessionCopyKeys is slice 22 PART B's own "the help
+// lists the three keys" requirement: c, C and v must all appear in the
+// general help screen, each with its own description.
+func TestHelpGeneral_ListsSessionCopyKeys(t *testing.T) {
+	content := helpTypeGeneral{}.toContent()
+
+	require.Contains(t, content, "last turn", "c's own help line must name the Session tab's last-turn copy")
+	require.Contains(t, content, "whole visible transcript", "C's own help line must name the whole-tail copy")
+	require.Contains(t, content, "Turn picker", "v's own help line must name the turn picker")
+}

@@ -722,7 +722,7 @@ func TestSessionPane_BlankLineBetweenTurns_NoneInside(t *testing.T) {
 	lines, _ := buildTurnLines([]clarity.Turn{
 		{Kind: clarity.TurnOwner, At: base, Text: "paragraph one\n\nparagraph two"},
 		{Kind: clarity.TurnAssistant, At: base, Text: "reply"},
-	}, 2, 96, base)
+	}, 2, 96, base, -1)
 
 	blankCount := 0
 	for _, l := range lines {
@@ -742,7 +742,7 @@ func TestSessionPane_TagLineFormat_AlignsYouAndClaude(t *testing.T) {
 	lines, _ := buildTurnLines([]clarity.Turn{
 		{Kind: clarity.TurnOwner, At: base, Text: "hi"},
 		{Kind: clarity.TurnAssistant, At: base, Text: "hi"},
-	}, 2, 96, base)
+	}, 2, 96, base, -1)
 
 	you := ansi.Strip(lines[0])
 	// lines[1] is YOU's own wrapped body ("hi"), lines[2] the blank
@@ -820,4 +820,204 @@ func TestSessionPane_ChromeReachesPaneEdge_AtNamedGeometries(t *testing.T) {
 		lines := strings.Split(s.String(), "\n")
 		require.Equal(t, w, ansi.StringWidth(lines[2]), "the header rule must reach exactly the pane's own received width %d", w)
 	}
+}
+
+// -- slice 22, PART B: copy from the Session tab -------------------------
+
+// TestTurnCopyText_ProseTurn_TagTimeThenParagraphs is PART B's own named
+// shape: an owner/assistant turn copies as "<TAG>  hh:mm:ss", a blank line,
+// then the turn's own text with its paragraphs intact (never collapsed to
+// one line, never word-wrapped for the clipboard).
+func TestTurnCopyText_ProseTurn_TagTimeThenParagraphs(t *testing.T) {
+	at := time.Date(2026, 9, 3, 14, 22, 5, 0, time.Local)
+	turn := clarity.Turn{Kind: clarity.TurnAssistant, At: at, Text: "paragraph one\n\nparagraph two"}
+
+	got := TurnCopyText(turn, at)
+	want := "CLAUDE  14:22:05\n\nparagraph one\n\nparagraph two"
+	require.Equal(t, want, got)
+}
+
+// TestTurnCopyText_ToolTurn_MarkerSummaryResult is PART B's own named tool
+// shape, verbatim: "▪ <tool>  <summary>  <result>".
+func TestTurnCopyText_ToolTurn_MarkerSummaryResult(t *testing.T) {
+	at := time.Date(2026, 9, 3, 14, 22, 5, 0, time.Local)
+	turn := clarity.Turn{Kind: clarity.TurnTool, At: at, Tool: "Bash", Summary: "run the check", Result: clarity.ResultOK, Duration: 2100 * time.Millisecond}
+
+	got := TurnCopyText(turn, at)
+	require.Equal(t, "▪ Bash  run the check  exit 0     2.1s", got)
+}
+
+// TestTurnCopyText_StripsRawANSI proves the ansi.Strip pass is actually
+// wired in: a turn whose own transcript text somehow carries a raw escape
+// sequence (a pasted terminal capture, say) never reaches the clipboard
+// with it still attached.
+func TestTurnCopyText_StripsRawANSI(t *testing.T) {
+	at := time.Date(2026, 9, 3, 14, 22, 5, 0, time.Local)
+	turn := clarity.Turn{Kind: clarity.TurnOwner, At: at, Text: "\x1b[31mred\x1b[0m plain"}
+
+	got := TurnCopyText(turn, at)
+	require.NotContains(t, got, "\x1b[")
+	require.Contains(t, got, "red plain")
+}
+
+// TestSessionPane_LastTurnCopyText_ReturnsLastTurnAndLineCount proves the c
+// key's own source: the SELECTED lane's most recent turn, plus the line
+// count the footer names ("copied · last turn (N lines)").
+func TestSessionPane_LastTurnCopyText_ReturnsLastTurnAndLineCount(t *testing.T) {
+	pinHome(t)
+	s := NewSessionPane()
+	s.SetSize(116, 40)
+	s.SetInfo(fixtureInfo())
+
+	text, lines, ok := s.LastTurnCopyText()
+	require.True(t, ok)
+	require.Contains(t, text, "▪ Bash  run the check  exit 0     2.1s", "the fixture's own LAST turn is the tool turn")
+	require.Equal(t, 1, lines)
+}
+
+// TestSessionPane_LastTurnCopyText_NothingSelected_NoOp proves ok=false
+// with no SessionInfo set - the c key never claims a copy of nothing.
+func TestSessionPane_LastTurnCopyText_NothingSelected_NoOp(t *testing.T) {
+	s := NewSessionPane()
+	_, _, ok := s.LastTurnCopyText()
+	require.False(t, ok)
+}
+
+// TestSessionPane_TailCopyText_JoinsEveryLoadedTurn is the C key's own
+// source: every turn currently loaded (Tail.Turns), not only the lines
+// scrolled into view, blank-line joined, plus the turn count the footer
+// names ("copied · N turns").
+func TestSessionPane_TailCopyText_JoinsEveryLoadedTurn(t *testing.T) {
+	pinHome(t)
+	s := NewSessionPane()
+	s.SetSize(116, 40)
+	s.SetInfo(fixtureInfo())
+
+	text, turns, ok := s.TailCopyText()
+	require.True(t, ok)
+	require.Equal(t, 3, turns, "the fixture carries all three turn kinds")
+	require.True(t, strings.HasPrefix(text, "YOU  18:03:25"), "the first turn leads the joined block")
+	require.True(t, strings.HasSuffix(text, "▪ Bash  run the check  exit 0     2.1s"), "the last turn trails the joined block")
+}
+
+// TestSessionPane_Picker_OpenHighlightsNewestTurn proves v starts the
+// picker on the NEWEST turn (Tail.Turns' own last entry) - the fixture's
+// tool turn - marked with the picker's own gutter marker and accent style.
+func TestSessionPane_Picker_OpenHighlightsNewestTurn(t *testing.T) {
+	pinHome(t)
+	s := NewSessionPane()
+	s.SetSize(116, 40)
+	s.SetInfo(fixtureInfo())
+
+	require.False(t, s.PickerActive())
+	require.True(t, s.OpenPicker())
+	require.True(t, s.PickerActive())
+
+	out := ansi.Strip(s.String())
+	var toolLine string
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "▪ Bash") {
+			toolLine = l
+			break
+		}
+	}
+	require.NotEmpty(t, toolLine, "the tool turn must still render its own line")
+	require.True(t, strings.HasPrefix(strings.TrimLeft(toolLine, " "), sessionPickerMarker),
+		"the newest (last) turn - the tool turn - starts highlighted, marker and all: %q", toolLine)
+	require.Contains(t, toolLine, "run the check")
+}
+
+// TestSessionPane_Picker_UpMovesToOlderTurn_CopiesHighlighted proves
+// PickerOlder moves the highlight to the previous (older) turn and
+// PickerCopyText then copies THAT turn, not the last one.
+func TestSessionPane_Picker_UpMovesToOlderTurn_CopiesHighlighted(t *testing.T) {
+	pinHome(t)
+	s := NewSessionPane()
+	s.SetSize(116, 40)
+	s.SetInfo(fixtureInfo())
+	require.True(t, s.OpenPicker())
+
+	// Fixture order (oldest first): owner, assistant, tool. Newest (tool)
+	// starts highlighted; one PickerOlder step must land on the assistant
+	// turn.
+	s.PickerOlder()
+
+	text, _, ok := s.PickerCopyText()
+	require.True(t, ok)
+	require.Contains(t, text, "CLAUDE  18:03:41")
+	require.Contains(t, text, "Understood: the right pane mirrors the selected lane's live session")
+
+	out := ansi.Strip(s.String())
+	var claudeLine string
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "CLAUDE") {
+			claudeLine = l
+			break
+		}
+	}
+	require.NotEmpty(t, claudeLine)
+	require.True(t, strings.HasPrefix(strings.TrimLeft(claudeLine, " "), sessionPickerMarker+"CLAUDE"),
+		"the picker's own marker must have moved onto the newly-highlighted turn's label: %q", claudeLine)
+}
+
+// TestSessionPane_Picker_OlderAtStart_NoOp proves PickerOlder is a no-op
+// once the highlight is already on the OLDEST turn (index 0) - never wraps
+// or panics past the start of the transcript.
+func TestSessionPane_Picker_OlderAtStart_NoOp(t *testing.T) {
+	pinHome(t)
+	s := NewSessionPane()
+	s.SetSize(116, 40)
+	s.SetInfo(fixtureInfo())
+	require.True(t, s.OpenPicker())
+	s.PickerOlder() // tool -> assistant
+	s.PickerOlder() // assistant -> owner (oldest)
+	s.PickerOlder() // no-op: already oldest
+
+	text, _, ok := s.PickerCopyText()
+	require.True(t, ok)
+	require.Contains(t, text, "YOU  18:03:25")
+}
+
+// TestSessionPane_Picker_NewerAtEnd_NoOp mirrors the above at the newest
+// end - PickerNewer never moves past Tail.Turns' own last entry.
+func TestSessionPane_Picker_NewerAtEnd_NoOp(t *testing.T) {
+	pinHome(t)
+	s := NewSessionPane()
+	s.SetSize(116, 40)
+	s.SetInfo(fixtureInfo())
+	require.True(t, s.OpenPicker()) // starts on the newest (tool) turn
+	s.PickerNewer()                 // no-op: already newest
+
+	text, _, ok := s.PickerCopyText()
+	require.True(t, ok)
+	require.Contains(t, text, "▪ Bash")
+}
+
+// TestSessionPane_Picker_Close_ReturnsToOrdinaryRender proves esc (via
+// ClosePicker) leaves the picker: PickerActive reports false and no marker
+// remains in the rendered turns.
+func TestSessionPane_Picker_Close_ReturnsToOrdinaryRender(t *testing.T) {
+	pinHome(t)
+	s := NewSessionPane()
+	s.SetSize(116, 40)
+	s.SetInfo(fixtureInfo())
+	require.True(t, s.OpenPicker())
+
+	s.ClosePicker()
+	require.False(t, s.PickerActive())
+	out := ansi.Strip(s.String())
+	require.NotContains(t, out, sessionPickerMarker)
+
+	_, _, ok := s.PickerCopyText()
+	require.False(t, ok, "PickerCopyText must refuse once the picker is closed")
+}
+
+// TestSessionPane_Picker_NothingToPickFrom_NoOp proves OpenPicker refuses
+// (returns false, never enters picker state) when the selected lane has no
+// turns yet - v never opens an empty picker.
+func TestSessionPane_Picker_NothingToPickFrom_NoOp(t *testing.T) {
+	s := NewSessionPane()
+	s.SetSize(116, 40)
+	require.False(t, s.OpenPicker())
+	require.False(t, s.PickerActive())
 }

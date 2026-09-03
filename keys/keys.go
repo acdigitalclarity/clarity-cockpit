@@ -46,6 +46,18 @@ const (
 	// longer shows - KeyCheckout's own handler stays in app.go, dormant,
 	// same as PreviewPane/DiffPane (tabbed_window.go's own comment).
 	KeyCopy
+	// KeyCopyTail is C (shift-c): copies the WHOLE visible transcript tail
+	// (every turn currently loaded, not only what is scrolled into view) as
+	// plain text (slice 22, PART B) - only meaningful on the Session tab,
+	// app.go's own gate, this map carries no tab awareness.
+	KeyCopyTail
+	// KeyTurnPicker is v: opens the Session tab's turn picker (slice 22,
+	// PART B) - app.go's own stateSessionPicker then intercepts up/down/c/
+	// esc directly, dispatching them to the picker instead of ordinary list
+	// navigation; they are never looked up fresh against this map while it
+	// is open, they are still KeyUp/KeyDown/KeyCopy by design (the picker
+	// moves with the SAME keys ordinary list navigation uses).
+	KeyTurnPicker
 	// KeyOpenFolder opens the selected lane's own folder (a tracked
 	// instance's worktree path or an external lane's WorkDir) with macOS
 	// `open`. Takes over "o" from its upstream role as a plain alias for
@@ -80,6 +92,8 @@ var GlobalKeyStringsMap = map[string]KeyName{
 	"?":          KeyHelp,
 	"m":          KeyMsg,
 	"c":          KeyCopy,
+	"C":          KeyCopyTail,
+	"v":          KeyTurnPicker,
 	"o":          KeyOpenFolder,
 }
 
@@ -162,6 +176,14 @@ var GlobalkeyBindings = map[KeyName]key.Binding{
 	KeyCopy: key.NewBinding(
 		key.WithKeys("c"),
 		key.WithHelp("c", "copy"),
+	),
+	KeyCopyTail: key.NewBinding(
+		key.WithKeys("C"),
+		key.WithHelp("C", "copy tail"),
+	),
+	KeyTurnPicker: key.NewBinding(
+		key.WithKeys("v"),
+		key.WithHelp("v", "pick turn"),
 	),
 	KeyOpenFolder: key.NewBinding(
 		key.WithKeys("o"),

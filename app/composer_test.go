@@ -52,6 +52,7 @@ func newComposerTestHome(t *testing.T) *home {
 		list:         ui.NewList(&sp, false),
 		menu:         ui.NewMenu(),
 		tabbedWindow: tw,
+		sessionPane:  sessionPane,
 		errBox:       ui.NewErrBox(),
 		statusBox:    ui.NewStatusBox(),
 		composer:     composer,
