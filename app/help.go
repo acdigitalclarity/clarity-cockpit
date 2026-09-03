@@ -66,7 +66,9 @@ func (h helpTypeGeneral) toContent() string {
 		keyStyle.Render("tab")+descStyle.Render("       - Switch between session, needs-you, and terminal tabs"),
 		keyStyle.Render("shift-↓/↑")+descStyle.Render(" - Scroll in the active tab"),
 		keyStyle.Render("q")+descStyle.Render("         - Quit the application"),
-		descStyle.Render("             A calm butterfly drifts along the tab bar when you switch tabs; --no-butterfly hides it"),
+		keyStyle.Render("B")+descStyle.Render("         - Toggle the tab-bar butterfly on or off"),
+		descStyle.Render("             A calm butterfly drifts along the tab bar when you switch tabs, wanders now and then at rest,"),
+		descStyle.Render("             and glides over to Needs you when a new row for you arrives; --no-butterfly hides it"),
 	)
 	return content
 }

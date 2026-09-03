@@ -546,6 +546,13 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// driven, never a blocking polling loop.
 		needsYouItems, needsYouStatus := clarity.RankedNeedsYou(clarity.DefaultFeedPath(), feedTopN)
 		m.list.SetNeedsYou(needsYouItems, needsYouStatus)
+		// Slice 23 rule 3: fly to Needs you on a genuinely new row - nil-guarded
+		// the same way this tick's other tabbedWindow calls below are (a
+		// lightweight test home built without one, e.g. fit_test.go's own
+		// context-fill fixture, must still take this tick cleanly).
+		if m.tabbedWindow != nil {
+			m.tabbedWindow.NoticeNeedsYou(needsYouItems)
+		}
 
 		// Refresh the external-lane rows on this same tick - exactly one
 		// glob per tick (clarity.DiscoverExternalLanes), same cadence as
@@ -1370,6 +1377,11 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 		return m, m.handleOpenPicker()
 	case keys.KeyOpenFolder:
 		return m, m.handleOpenFolder()
+	case keys.KeyButterflyToggle:
+		if m.tabbedWindow != nil {
+			m.tabbedWindow.ToggleButterflyEnabled()
+		}
+		return m, nil
 	default:
 		return m, nil
 	}
