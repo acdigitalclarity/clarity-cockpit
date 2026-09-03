@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -648,6 +649,13 @@ func (m *home) handleQuit() (tea.Model, tea.Cmd) {
 	if err := m.storage.SaveInstances(m.list.GetInstances()); err != nil {
 		return m, m.handleError(err)
 	}
+	// Kill every external lane's own term_<lane> shell (design/cockpit-pane/
+	// DECISIONS.md slice 6's own "killed when the cockpit quits, exactly as
+	// upstream tears down its term_ shells") - a tracked row's Terminal tab
+	// mirrors its own instance session and owns nothing here to close.
+	if m.tabbedWindow != nil {
+		m.tabbedWindow.CleanupTerminal()
+	}
 	return m, tea.Quit
 }
 
@@ -1040,9 +1048,6 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 				}
 			}
 
-			// Clean up terminal session for this instance
-			m.tabbedWindow.CleanupTerminalForInstance(selected.Title)
-
 			// Delete from storage first
 			if err := m.storage.DeleteInstance(selected.Title); err != nil {
 				return err
@@ -1093,7 +1098,6 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 			if err := selected.Pause(); err != nil {
 				m.handleError(err)
 			}
-			m.tabbedWindow.CleanupTerminalForInstance(selected.Title)
 			m.instanceChanged()
 		})
 		return m, nil
@@ -1132,6 +1136,29 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 		}
 		return m, tea.RequestWindowSize
 	case keys.KeyEnter:
+		// Terminal tab, external row: attach to that lane's own term_<lane>
+		// shell if it has one already (opened lazily the first time the tab
+		// was viewed for it - UpdateTerminal/ensureExternalSessionLocked),
+		// else say so in the footer. This branches BEFORE the tracked-only
+		// guard below, since GetSelectedInstance() is nil for an external
+		// row and would otherwise fall straight through to the no-op
+		// default case (this is the one case in this leg where that no-op
+		// is not the right answer - see DECISIONS.md slice 6).
+		if m.tabbedWindow.IsInTerminalTab() {
+			if ext, ok := m.list.GetSelectedExternalLane(); ok {
+				m.showHelpScreen(helpTypeInstanceAttach{}, func() {
+					ch, err := m.tabbedWindow.AttachTerminal(ext.Name)
+					if err != nil {
+						m.state = stateDefault
+						m.setStatus("no terminal for this lane yet: press tab to Terminal first")
+						return
+					}
+					<-ch
+					m.state = stateDefault
+				})
+				return m, nil
+			}
+		}
 		if m.list.NumInstances() == 0 {
 			return m, nil
 		}
@@ -1139,20 +1166,11 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 		if selected == nil || selected.Paused() || selected.Status == session.Loading || !selected.TmuxAlive() {
 			return m, nil
 		}
-		// Terminal tab: attach to terminal session
-		if m.tabbedWindow.IsInTerminalTab() {
-			m.showHelpScreen(helpTypeInstanceAttach{}, func() {
-				ch, err := m.tabbedWindow.AttachTerminal()
-				if err != nil {
-					m.handleError(err)
-					return
-				}
-				<-ch
-				m.state = stateDefault
-			})
-			return m, nil
-		}
-		// Show help screen before attaching
+		// A tracked row attaches through its own tmux session regardless of
+		// which tab is active (DECISIONS.md slice 6: "Enter on a tracked row
+		// still attaches, upstream behaviour") - the Terminal tab merely
+		// mirrors that same session, it never owns a separate one for a
+		// tracked instance.
 		m.showHelpScreen(helpTypeInstanceAttach{}, func() {
 			ch, err := m.list.Attach()
 			if err != nil {
@@ -1164,27 +1182,105 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 			m.instanceChanged()
 		})
 		return m, nil
+	case keys.KeyCopy:
+		return m, m.handleCopy()
+	case keys.KeyOpenFolder:
+		return m, m.handleOpenFolder()
 	default:
 		return m, nil
 	}
 }
 
-// instanceChanged updates the terminal pane and the menu based on the
-// selected TRACKED instance (nil for an external or Needs-you row, or no
-// selection). Neither the Session tab nor the Needs-you tab is touched
-// here - both come from the feed tick only (see feedTickMsg's own blocks
-// below), on the SELECTED row whichever kind it is.
+// handleCopy is the c key (design/cockpit-pane/DECISIONS.md slice 7): the
+// composer's current text when it is open, else the selected Needs-you
+// row's own title and number (clarity.FeedLine - the exact text the row
+// itself renders, "#nnn - <title>" for a board row), copied to the system
+// clipboard via the same helper the external-lane message path already
+// uses. A no-op when neither applies (no composer open, cursor not on a
+// Needs-you row) - never a claimed copy of nothing.
+func (m *home) handleCopy() tea.Cmd {
+	var text string
+	switch {
+	case m.composer.IsOpen():
+		text = m.composer.Value()
+	default:
+		item, ok := m.list.GetSelectedNeedsYou()
+		if !ok {
+			return nil
+		}
+		text = clarity.FeedLine(item)
+	}
+	if text == "" {
+		return nil
+	}
+	if err := clarity.CopyToClipboard(m.cmdExec, text); err != nil {
+		return m.handleError(err)
+	}
+	return m.setStatus("copied")
+}
+
+// handleOpenFolder is the o key (design/cockpit-pane/DECISIONS.md slice 7):
+// opens the selected lane's own folder (a tracked instance's worktree path,
+// or an external lane's WorkDir) with macOS `open`, through the same
+// cmd.Executor seam the clipboard helper uses (so a test can inject a fake
+// without ever shelling out for real). A no-op when the selection resolves
+// to no path at all (nothing selected, or an external lane whose transcript
+// scan never found a cwd).
+func (m *home) handleOpenFolder() tea.Cmd {
+	path := m.selectedFolderPath()
+	if path == "" {
+		return nil
+	}
+	if err := m.cmdExec.Run(exec.Command("open", path)); err != nil {
+		return m.handleError(err)
+	}
+	return m.setStatus(fmt.Sprintf("opened %s", path))
+}
+
+// selectedFolderPath resolves the CURRENT selection's own folder: a tracked
+// instance's git worktree path, or an external lane's own working
+// directory ("" when neither is selected, or an external lane's own cwd
+// scan never found one).
+func (m *home) selectedFolderPath() string {
+	if selected := m.list.GetSelectedInstance(); selected != nil {
+		return selected.GetWorktreePath()
+	}
+	if ext, ok := m.list.GetSelectedExternalLane(); ok {
+		return ext.WorkDir
+	}
+	return ""
+}
+
+// instanceChanged updates the Terminal tab and the menu based on whichever
+// row is currently selected (tracked, external, or neither). Neither the
+// Session tab nor the Needs-you tab is touched here - both come from the
+// feed tick only (see feedTickMsg's own blocks below), on the SELECTED row
+// whichever kind it is.
 func (m *home) instanceChanged() tea.Cmd {
-	// selected may be nil
 	selected := m.list.GetSelectedInstance()
+	_, isExternal := m.list.GetSelectedExternalLane()
 
 	// Update menu with current instance
-	m.menu.SetInstance(selected)
+	m.menu.SetInstance(selected, isExternal)
 
-	if err := m.tabbedWindow.UpdateTerminal(selected); err != nil {
+	if err := m.tabbedWindow.UpdateTerminal(m.terminalTarget()); err != nil {
 		return m.handleError(err)
 	}
 	return nil
+}
+
+// terminalTarget resolves the Terminal tab's own per-tick input (design/
+// cockpit-pane/DECISIONS.md slice 6) for whichever row is currently
+// selected: a tracked instance's own mirror, an external lane's term_ shell,
+// or neither (the resting frame).
+func (m *home) terminalTarget() ui.TerminalTarget {
+	if selected := m.list.GetSelectedInstance(); selected != nil {
+		return ui.TerminalTarget{Kind: ui.TerminalTargetTracked, Instance: selected}
+	}
+	if ext, ok := m.list.GetSelectedExternalLane(); ok {
+		return ui.TerminalTarget{Kind: ui.TerminalTargetExternal, Lane: ext.Name, WorkDir: ext.WorkDir}
+	}
+	return ui.TerminalTarget{Kind: ui.TerminalTargetNone}
 }
 
 // composerTarget resolves the CURRENT selection's own send target: the
@@ -1529,6 +1625,7 @@ func (m *home) updateSessionTabInfo(now time.Time) {
 
 	live, needsYou := splash.FleetCounts()
 	m.tabbedWindow.SetSessionFleetCounts(live, needsYou)
+	m.tabbedWindow.SetTerminalFleetCounts(live, needsYou)
 }
 
 // selectedSessionInfo builds the ui.SessionInfo for whichever row is

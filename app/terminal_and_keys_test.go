@@ -1,0 +1,225 @@
+// Package app: this file tests slice 6 (Terminal tab wiring at the app
+// level - Enter's own row-kind branching) and slice 7 (the c copy / o open
+// folder keys) of design/cockpit-pane/DECISIONS.md.
+package app
+
+import (
+	"claude-squad/cmd"
+	"claude-squad/cmd/cmd_test"
+	"claude-squad/config"
+	"claude-squad/session/clarity"
+	"claude-squad/ui"
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"charm.land/bubbles/v2/spinner"
+	tea "charm.land/bubbletea/v2"
+	"github.com/stretchr/testify/require"
+)
+
+// termPtyFactory stands in for a live tmux PTY the same way
+// capturingPtyFactory (composer_test.go) does - a temp file - but also
+// flips sessionExists to true on a successful Start, which the has-session
+// mock below reads, so tmux.Session.Start's own existence-poll loop exits
+// immediately instead of running out its 2-second timeout. fail simulates
+// the PTY never starting at all (a real tmux new-session failure).
+type termPtyFactory struct {
+	t             *testing.T
+	sessionExists *bool
+	fail          bool
+}
+
+func (f *termPtyFactory) Start(cmd *exec.Cmd) (*os.File, error) {
+	if f.fail {
+		return nil, fmt.Errorf("pty start failed (simulated)")
+	}
+	*f.sessionExists = true
+	path := filepath.Join(f.t.TempDir(), "ptmx")
+	return os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
+}
+
+func (f *termPtyFactory) Close() {}
+
+// homeWithMockedTerminal builds a *home the same shape as
+// newComposerTestHome (composer_test.go), except its TabbedWindow's
+// TerminalPane is built with ui.NewTerminalPaneWithDeps - so an external
+// row's term_<lane> shell is created through a mocked PTY/executor, never
+// the real tmux binary. newComposerTestHome itself is left untouched (its
+// own tests never exercise the Terminal tab's external-lane path, so it has
+// no need for this).
+//
+// termStartFails, when true, makes the term_<lane> shell's own PTY fail to
+// start - the only way DECISIONS.md slice 6's "no terminal for this lane
+// yet" branch is actually reachable through the UI: the shell is opened
+// LAZILY the moment the Terminal tab is viewed for a lane (the same key
+// press/tick that would otherwise create it), so the only gap between
+// "viewed" and "has a session" is the underlying tmux session genuinely
+// failing to start.
+func homeWithMockedTerminal(t *testing.T, termStartFails bool) *home {
+	t.Helper()
+	sp := spinner.New()
+	composer := ui.NewComposer()
+	sessionPane := ui.NewSessionPane()
+	sessionPane.SetComposer(composer)
+	needsYouPane := ui.NewNeedsYouPane()
+	needsYouPane.SetComposer(composer)
+
+	sessionExists := false
+	termCmdExec := cmd_test.MockCmdExec{
+		RunFunc: func(c *exec.Cmd) error {
+			cmdStr := c.String()
+			if strings.Contains(cmdStr, "has-session") {
+				if sessionExists {
+					return nil
+				}
+				return fmt.Errorf("session does not exist")
+			}
+			return nil
+		},
+		OutputFunc: func(c *exec.Cmd) ([]byte, error) {
+			if strings.Contains(c.String(), "capture-pane") {
+				return []byte("$ pwd\n" + t.TempDir()), nil
+			}
+			return []byte(""), nil
+		},
+	}
+	ptyFactory := &termPtyFactory{t: t, sessionExists: &sessionExists, fail: termStartFails}
+	terminalPane := ui.NewTerminalPaneWithDeps(ptyFactory, termCmdExec)
+
+	tw := ui.NewTabbedWindow(sessionPane, needsYouPane, terminalPane)
+	tw.SetSize(120, 40)
+
+	return &home{
+		ctx:          context.Background(),
+		list:         ui.NewList(&sp, false),
+		menu:         ui.NewMenu(),
+		tabbedWindow: tw,
+		errBox:       ui.NewErrBox(),
+		statusBox:    ui.NewStatusBox(),
+		composer:     composer,
+		cmdExec:      cmd.MakeExecutor(),
+		laneTab:      ui.SessionTab,
+		needsYouTab:  ui.NeedsYouTab,
+		prevRowKind:  ui.RowKindTracked,
+		// HelpScreensSeen already carries helpTypeInstanceAttach's own mask
+		// (app/help.go, 1<<2) - Enter's showHelpScreen call then takes its
+		// "already seen" path and calls onDismiss immediately, synchronously,
+		// rather than opening the overlay (and, critically, never calling
+		// config.SaveState against this machine's real ~/.claude-squad/
+		// state.json, which the "not yet seen" path would).
+		appState: &config.State{HelpScreensSeen: 1 << 2},
+	}
+}
+
+// TestKeyEnter_ExternalRow_TerminalTab_NoShellYet_ShowsFooterLine is the
+// brief's own TESTS FIRST case: Enter on an external row, Terminal tab
+// active, when that lane's term_ shell failed to open - the footer shows
+// the "no terminal yet" line, never a claimed attach to the owner's own
+// terminal.
+func TestKeyEnter_ExternalRow_TerminalTab_NoShellYet_ShowsFooterLine(t *testing.T) {
+	h := homeWithMockedTerminal(t, true)
+	h.list.SetExternal([]clarity.ExternalLane{{Name: "scratchfix-ext", WorkDir: t.TempDir()}})
+	h.list.Down() // -> the external row
+
+	pressGlobalKey(h, tea.KeyPressMsg{Code: tea.KeyTab})
+	pressGlobalKey(h, tea.KeyPressMsg{Code: tea.KeyTab})
+	require.Equal(t, ui.TerminalTab, h.tabbedWindow.GetActiveTab())
+
+	pressGlobalKey(h, tea.KeyPressMsg{Code: tea.KeyEnter})
+
+	require.Equal(t, "no terminal for this lane yet: press tab to Terminal first", h.statusText)
+	require.Equal(t, stateDefault, h.state)
+}
+
+// TestKeyCopy_ComposerOpen_CopiesComposerText proves c copies the
+// composer's CURRENT text when it is open, over the Needs-you fallback.
+func TestKeyCopy_ComposerOpen_CopiesComposerText(t *testing.T) {
+	h := newComposerTestHome()
+	var copiedStdin string
+	h.cmdExec = cmd_test.MockCmdExec{
+		RunFunc: func(cmd *exec.Cmd) error {
+			buf := make([]byte, 4096)
+			n, _ := cmd.Stdin.Read(buf)
+			copiedStdin = string(buf[:n])
+			return nil
+		},
+	}
+	h.composer.Open("lane-a", false)
+	h.composer.Type("draft reply text")
+
+	cmd := h.handleCopy()
+	require.NotNil(t, cmd, "setStatus's own 4-second auto-hide timer Cmd")
+	require.Equal(t, "draft reply text", copiedStdin)
+	require.Equal(t, "copied", h.statusText)
+}
+
+// TestKeyCopy_NeedsYouRowSelected_CopiesFeedLine proves c copies the
+// selected Needs-you row's own title and number (clarity.FeedLine - the
+// exact text the row itself renders) when the composer is closed.
+func TestKeyCopy_NeedsYouRowSelected_CopiesFeedLine(t *testing.T) {
+	h := newComposerTestHome()
+	h.list.SetNeedsYou([]clarity.FeedItem{{Lane: "#277", Title: "Owner: one settings act"}}, "")
+	h.list.Up() // the sole tracked-group cursor wraps to the sole Needs-you row (empty list otherwise)
+
+	var copiedStdin string
+	h.cmdExec = cmd_test.MockCmdExec{
+		RunFunc: func(cmd *exec.Cmd) error {
+			buf := make([]byte, 4096)
+			n, _ := cmd.Stdin.Read(buf)
+			copiedStdin = string(buf[:n])
+			return nil
+		},
+	}
+
+	h.handleCopy()
+	require.Equal(t, "#277 - Owner: one settings act", copiedStdin)
+	require.Equal(t, "copied", h.statusText)
+}
+
+// TestKeyOpenFolder_ExternalRow_OpensWorkDir proves o opens an external
+// lane's own WorkDir with macOS `open`, through the stubbed executor, and
+// shows the "opened <path>" footer.
+func TestKeyOpenFolder_ExternalRow_OpensWorkDir(t *testing.T) {
+	h := newComposerTestHome()
+	workDir := t.TempDir()
+	h.list.SetExternal([]clarity.ExternalLane{{Name: "scratchfix-ext", WorkDir: workDir}})
+	h.list.Down() // -> the external row
+
+	var openedArgs []string
+	h.cmdExec = cmd_test.MockCmdExec{
+		RunFunc: func(cmd *exec.Cmd) error {
+			openedArgs = cmd.Args
+			return nil
+		},
+	}
+
+	h.handleOpenFolder()
+
+	require.Equal(t, []string{"open", workDir}, openedArgs)
+	require.Equal(t, "opened "+workDir, h.statusText)
+}
+
+// TestKeyOpenFolder_NothingSelected_NoOp proves o is a safe no-op (no
+// command run, no footer shown) when neither a tracked instance nor an
+// external lane is selected.
+func TestKeyOpenFolder_NothingSelected_NoOp(t *testing.T) {
+	h := newComposerTestHome()
+
+	ran := false
+	h.cmdExec = cmd_test.MockCmdExec{
+		RunFunc: func(cmd *exec.Cmd) error {
+			ran = true
+			return nil
+		},
+	}
+
+	cmd := h.handleOpenFolder()
+	require.Nil(t, cmd)
+	require.False(t, ran, "no folder to open means no `open` command must run")
+	require.Empty(t, h.statusText)
+}

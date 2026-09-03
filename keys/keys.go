@@ -37,6 +37,26 @@ const (
 	// row's live tmux prompt - a tracked instance or an external (cockpit-
 	// external) lane alike (Digital Clarity workspace enhancement).
 	KeyMsg
+
+	// KeyCopy copies the composer's current text (when open) or the
+	// selected Needs-you row's title and number (when closed) to the
+	// system clipboard (design/cockpit-pane/DECISIONS.md slice 7). Takes
+	// over "c" from the upstream KeyCheckout binding below, which the
+	// redesigned footer (PANE-MOCKUP-164x45.md/PANE-MOCKUP-120x36.md) no
+	// longer shows - KeyCheckout's own handler stays in app.go, dormant,
+	// same as PreviewPane/DiffPane (tabbed_window.go's own comment).
+	KeyCopy
+	// KeyOpenFolder opens the selected lane's own folder (a tracked
+	// instance's worktree path or an external lane's WorkDir) with macOS
+	// `open`. Takes over "o" from its upstream role as a plain alias for
+	// KeyEnter (kept as one binding, "enter" only, below).
+	KeyOpenFolder
+	// KeySelect is a display-only menu entry ("↑↓ select") - it is never
+	// looked up in GlobalKeyStringsMap (Up/Down already dispatch via their
+	// own KeyUp/KeyDown), it exists purely so ui/menu.go can render the
+	// mock-up's combined "↑↓ select" token as one option alongside the
+	// real key-bound ones.
+	KeySelect
 )
 
 // GlobalKeyStringsMap is a global, immutable map string to keybinding.
@@ -51,16 +71,16 @@ var GlobalKeyStringsMap = map[string]KeyName{
 	"K":          KeyMoveUp,
 	"N":          KeyPrompt,
 	"enter":      KeyEnter,
-	"o":          KeyEnter,
 	"n":          KeyNew,
 	"D":          KeyKill,
 	"q":          KeyQuit,
 	"tab":        KeyTab,
-	"c":          KeyCheckout,
 	"r":          KeyResume,
 	"p":          KeySubmit,
 	"?":          KeyHelp,
 	"m":          KeyMsg,
+	"c":          KeyCopy,
+	"o":          KeyOpenFolder,
 }
 
 // GlobalkeyBindings is a global, immutable map of KeyName tot keybinding.
@@ -82,8 +102,8 @@ var GlobalkeyBindings = map[KeyName]key.Binding{
 		key.WithHelp("shift+↓", "scroll"),
 	),
 	KeyEnter: key.NewBinding(
-		key.WithKeys("enter", "o"),
-		key.WithHelp("↵/o", "open"),
+		key.WithKeys("enter"),
+		key.WithHelp("↵", "attach"),
 	),
 	KeyNew: key.NewBinding(
 		key.WithKeys("n"),
@@ -109,8 +129,13 @@ var GlobalkeyBindings = map[KeyName]key.Binding{
 		key.WithKeys("N"),
 		key.WithHelp("N", "new with prompt"),
 	),
+	// KeyCheckout is no longer reachable from any key ("c" now dispatches to
+	// KeyCopy, GlobalKeyStringsMap above) - its own handler (app.go) and
+	// help screen (app/help.go's helpTypeInstanceCheckout) are left in
+	// place, dormant, the same way this fork already leaves PreviewPane and
+	// DiffPane in the tree once a slice moves past them
+	// (ui/tabbed_window.go's own comment).
 	KeyCheckout: key.NewBinding(
-		key.WithKeys("c"),
 		key.WithHelp("c", "checkout"),
 	),
 	KeyTab: key.NewBinding(
@@ -133,6 +158,17 @@ var GlobalkeyBindings = map[KeyName]key.Binding{
 	KeyMsg: key.NewBinding(
 		key.WithKeys("m"),
 		key.WithHelp("m", "message"),
+	),
+	KeyCopy: key.NewBinding(
+		key.WithKeys("c"),
+		key.WithHelp("c", "copy"),
+	),
+	KeyOpenFolder: key.NewBinding(
+		key.WithKeys("o"),
+		key.WithHelp("o", "open folder"),
+	),
+	KeySelect: key.NewBinding(
+		key.WithHelp("↑↓", "select"),
 	),
 
 	// -- Special keybindings --

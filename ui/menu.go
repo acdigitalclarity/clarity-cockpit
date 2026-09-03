@@ -55,7 +55,22 @@ type Menu struct {
 	height, width int
 	state         MenuState
 	instance      *session.Instance
-	activeTab     int
+	// isExternal marks the current selection as an external lane (no
+	// tracked tmux session or worktree) - set alongside instance by
+	// SetInstance. ↵ attach and m message are dimmed on this row (they
+	// still work: m still copies per slice 5) rather than removed, since
+	// the footer's own shape must not shift between row kinds.
+	isExternal bool
+	activeTab  int
+
+	// groupBounds is the CURRENT option list's own [start,end) vertical-
+	// separator boundaries (design/cockpit-pane/PANE-MOCKUP-*.md's "│"
+	// dividers) - built by updateOptions alongside m.options itself, so
+	// String() never has to re-derive group shape from option count (DEFECT:
+	// the upstream version hardcoded {0,2},{2,5},{6,8} regardless of what
+	// m.options actually held, which silently drifted the moment the list's
+	// own length changed - see addInstanceOptions' own comment).
+	groupBounds [][2]int
 
 	// keyDown is the key which is pressed. The default is -1.
 	keyDown keys.KeyName
@@ -88,15 +103,21 @@ func (m *Menu) SetState(state MenuState) {
 	m.updateOptions()
 }
 
-// SetInstance updates the current instance and refreshes menu options
-func (m *Menu) SetInstance(instance *session.Instance) {
+// SetInstance updates the current selection and refreshes menu options.
+// isExternal marks a selected external lane (GetSelectedInstance returns nil
+// for one too, same as "nothing selected" - the caller, app.go's
+// instanceChanged, is the only place that can tell the two apart): an
+// external row still gets the full default option list (↵ attach and m
+// message dimmed, per DECISIONS.md slice 7), never the bare StateEmpty one.
+func (m *Menu) SetInstance(instance *session.Instance, isExternal bool) {
 	m.instance = instance
+	m.isExternal = isExternal
 	// Only change the state if we're not in a special state (NewInstance,
 	// Prompt or the composer's own Msg) - a feed tick's instanceChanged()
 	// must never kick the footer out of "enter send · esc cancel" while a
 	// message is being typed.
 	if m.state != StateNewInstance && m.state != StatePrompt && m.state != StateMsg {
-		if m.instance != nil {
+		if m.instance != nil || m.isExternal {
 			m.state = StateDefault
 		} else {
 			m.state = StateEmpty
@@ -111,61 +132,77 @@ func (m *Menu) SetActiveTab(tab int) {
 	m.updateOptions()
 }
 
+// emptyGroupBounds is the StateEmpty/StateDefault-with-nothing-selected
+// option list's own separator shape - a single "│" after index 1 ("N new
+// with prompt"), everywhere else " • " (the render loop's own
+// `i != len(options)-1` guard already suppresses any separator after the
+// last item, so {2,5}'s own end-1=4 never fires) - unchanged by slice 7,
+// since defaultMenuOptions itself was not touched.
+var emptyGroupBounds = [][2]int{{0, 2}, {2, 5}}
+
 // updateOptions updates the menu options based on current state and instance
 func (m *Menu) updateOptions() {
 	switch m.state {
 	case StateEmpty:
 		m.options = defaultMenuOptions
+		m.groupBounds = emptyGroupBounds
 	case StateDefault:
-		if m.instance != nil {
-			// When there is an instance, show that instance's options
+		if m.instance != nil || m.isExternal {
+			// A tracked instance OR an external lane is selected: show the
+			// lane-action options (dimmed on an external row - see String()).
 			m.addInstanceOptions()
 		} else {
-			// When there is no instance, show the empty state
+			// Nothing at all is selected.
 			m.options = defaultMenuOptions
+			m.groupBounds = emptyGroupBounds
 		}
 	case StateNewInstance:
 		m.options = newInstanceMenuOptions
+		m.groupBounds = nil
 	case StatePrompt:
 		m.options = promptMenuOptions
+		m.groupBounds = nil
 	case StateMsg:
 		// String() short-circuits StateMsg before m.options is ever read
 		// (the composer's own foot text, not the key-binding groups below).
 		m.options = nil
+		m.groupBounds = nil
 	}
 }
 
+// addInstanceOptions builds the redesigned lane-action option list
+// (design/cockpit-pane/PANE-MOCKUP-164x45.md's own foot: "↑↓ select • ↵
+// attach │ m message • c copy • o open folder │ tab switch tab • ? help •
+// q quit"). Upstream's git-worktree group (new/kill/push/checkout/resume)
+// is no longer part of this persistent bar - the mock-up the owner approved
+// ("looks good", DECISIONS.md) drops it entirely for both a tracked and an
+// external row alike; those keys keep their own bindings (n/D/p/r are
+// untouched in keys.go) and stay documented in the "?" help overlay
+// (app/help.go), simply no longer advertised here. groupBounds is derived
+// from the list this function just built, not hardcoded, so a conditional
+// entry (KeyShiftUp below) never silently misaligns the "│" dividers the
+// way the upstream {0,2},{2,5},{6,8} literal did.
 func (m *Menu) addInstanceOptions() {
 	// Loading instances only get minimal options
 	if m.instance != nil && m.instance.Status == session.Loading {
 		m.options = []keys.KeyName{keys.KeyNew, keys.KeyHelp, keys.KeyQuit}
+		m.groupBounds = nil
 		return
 	}
 
-	// Instance management group
-	options := []keys.KeyName{keys.KeyNew, keys.KeyKill}
+	options := []keys.KeyName{keys.KeySelect, keys.KeyEnter, keys.KeyMsg, keys.KeyCopy, keys.KeyOpenFolder}
 
-	// Action group
-	actionGroup := []keys.KeyName{keys.KeyEnter, keys.KeySubmit, keys.KeyMsg}
-	if m.instance.Status == session.Paused {
-		actionGroup = append(actionGroup, keys.KeyResume)
-	} else {
-		actionGroup = append(actionGroup, keys.KeyCheckout)
-	}
-
-	// Navigation group (when in a scrollable tab)
+	// Scroll hint (when in a scrollable tab) - appended before the system
+	// group, same position upstream used.
 	if m.activeTab == NeedsYouTab || m.activeTab == TerminalTab {
-		actionGroup = append(actionGroup, keys.KeyShiftUp)
+		options = append(options, keys.KeyShiftUp)
 	}
 
-	// System group
-	systemGroup := []keys.KeyName{keys.KeyTab, keys.KeyHelp, keys.KeyQuit}
-
-	// Combine all groups
-	options = append(options, actionGroup...)
-	options = append(options, systemGroup...)
+	systemStart := len(options)
+	options = append(options, keys.KeyTab, keys.KeyHelp, keys.KeyQuit)
 
 	m.options = options
+	m.groupBounds = [][2]int{{0, 2}, {2, systemStart}, {systemStart, len(options)}}
 }
 
 // SetSize sets the width of the window. The menu will be centered horizontally within this width.
@@ -190,15 +227,7 @@ func (m *Menu) String() string {
 
 	var s strings.Builder
 
-	// Define group boundaries
-	groups := []struct {
-		start int
-		end   int
-	}{
-		{0, 2}, // Instance management group (n, d)
-		{2, 5}, // Action group (enter, submit, pause/resume)
-		{6, 8}, // System group (tab, help, q)
-	}
+	groups := m.groupBounds
 
 	for i, k := range m.options {
 		binding := keys.GlobalkeyBindings[k]
@@ -214,6 +243,17 @@ func (m *Menu) String() string {
 			localDescStyle = localDescStyle.Underline(true)
 		}
 
+		// ↵ attach and m message are dimmed on an external row
+		// (DECISIONS.md slice 7's own "greyed" requirement) - m still works
+		// as a clipboard copy (slice 5), ↵ still no-ops outside the Terminal
+		// tab and shows the "no terminal yet" footer inside it (app.go), so
+		// the dimming is cosmetic only, never a disabled control.
+		if m.isExternal && (k == keys.KeyEnter || k == keys.KeyMsg) {
+			localActionStyle = localActionStyle.Faint(true)
+			localKeyStyle = localKeyStyle.Faint(true)
+			localDescStyle = localDescStyle.Faint(true)
+		}
+
 		var inActionGroup bool
 		switch m.state {
 		case StateEmpty:
@@ -221,7 +261,7 @@ func (m *Menu) String() string {
 			inActionGroup = i <= 1
 		default:
 			// For other states, the action group is the second group
-			inActionGroup = i >= groups[1].start && i < groups[1].end
+			inActionGroup = len(groups) > 1 && i >= groups[1][0] && i < groups[1][1]
 		}
 
 		if inActionGroup {
@@ -238,7 +278,7 @@ func (m *Menu) String() string {
 		if i != len(m.options)-1 {
 			isGroupEnd := false
 			for _, group := range groups {
-				if i == group.end-1 {
+				if i == group[1]-1 {
 					s.WriteString(sepStyle.Render(verticalSeparator))
 					isGroupEnd = true
 					break
