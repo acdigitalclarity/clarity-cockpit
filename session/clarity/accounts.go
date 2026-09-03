@@ -10,10 +10,14 @@ package clarity
 
 import (
 	"claude-squad/log"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 // AccountsRegistryEnvVar overrides the registry path. Set only for tests;
@@ -210,6 +214,65 @@ func LoadAccountsRegistryFull() ([]RegistryAccount, RegistryPolicy) {
 // CLAUDE_CONFIG_DIR for this one; every other seat's does.
 func IsDefaultConfigDir(configDir string) bool {
 	return filepath.Clean(configDir) == filepath.Clean(filepath.Dir(DefaultClaudeProjectsRoot))
+}
+
+// keychainServicePrefix mirrors account_probe_verify.sh's own constant
+// (scripts/account_probe_verify.sh:57): the harness's own keychain service
+// name for a seat's OAuth credential entry.
+const keychainServicePrefix = "Claude Code-credentials"
+
+// keychainServiceName returns the exact keychain service name a seat's
+// credential entry carries, front-door slice 7 item 6b. Derivation
+// established by reading THIS machine's own keychain metadata (service
+// names only, via `security dump-keychain`, never `-d` and never a value)
+// and comparing them with a SHA-256 of each registered seat's config dir:
+// the default config dir's own entry carries the bare prefix with no
+// suffix ("Claude Code-credentials"), and every other seat's entry carries
+// the prefix plus a dash and the first 4 bytes (8 hex characters) of
+// sha256(configDir) - team-a, team-b and max-2 each matched their own
+// registered config dir's hash exactly, zero false matches, against this
+// machine's own keychain and registry (3 Sep 2026). This is the harness's
+// own keying scheme, read as metadata, not invented here - the probe
+// itself only greps the bare prefix fleet-wide (account_probe_verify.sh:85,
+// KEYCHAIN_SERVICE_PREFIX ends in a dash, so it never matches the default
+// seat's own suffix-less entry either), which is the bug this derivation
+// fixes: every seat, main included, gets its own check.
+func keychainServiceName(configDir string) string {
+	if IsDefaultConfigDir(configDir) {
+		return keychainServicePrefix
+	}
+	sum := sha256.Sum256([]byte(filepath.Clean(configDir)))
+	return fmt.Sprintf("%s-%x", keychainServicePrefix, sum[:4])
+}
+
+// securityDumpKeychain runs `security dump-keychain`, resolved through PATH
+// like account_probe_verify.sh's own `security` calls - swappable in tests
+// by prepending a scratch directory holding a fake `security` script to
+// PATH, never by touching the real keychain. No flag here is ever `-d`; the
+// output is service-name metadata only.
+var securityDumpKeychain = func() ([]byte, error) {
+	return exec.Command("security", "dump-keychain").Output()
+}
+
+// HasCredentialStore is the presence-only check step 2's credential-store
+// column and slice 7's `l` key both read (front-door slice 7 items 1 and
+// 6b), mirroring account_probe_verify.sh's own presence test
+// (scripts/account_probe_verify.sh:83-89) in the same order - a file-based
+// store first, then the seat's own Keychain entry - except keyed per seat
+// via keychainServiceName above rather than the probe's fleet-wide prefix
+// grep. Never reads the store's value on either path; a security failure
+// or missing binary reports false, not an error - there is nothing else
+// this call is entitled to assume.
+func HasCredentialStore(configDir string) bool {
+	if _, err := os.Stat(filepath.Join(configDir, ".credentials.json")); err == nil {
+		return true
+	}
+	out, err := securityDumpKeychain()
+	if err != nil {
+		return false
+	}
+	needle := `"svce"<blob>="` + keychainServiceName(configDir) + `"`
+	return strings.Contains(string(out), needle)
 }
 
 // AccountFromLaneDir exposes discover.go's accountFromLaneDir (unexported,

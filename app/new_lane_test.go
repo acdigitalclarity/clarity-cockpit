@@ -6,6 +6,7 @@ import (
 	"claude-squad/session"
 	"claude-squad/session/clarity"
 	"claude-squad/ui"
+	"claude-squad/ui/overlay"
 	"context"
 	"os"
 	"path/filepath"
@@ -309,4 +310,188 @@ func TestNewLaneFinish_SelectionLandsOnDrawnPosition(t *testing.T) {
 	stripped2 := ansi.Strip(h2.list.String())
 	require.Equal(t, "p2p-supply-chain", highlightedRowTitleApp(t, stripped2, titles),
 		"the highlight band must have moved to the same row the selection did")
+}
+
+// (4b) loginProgram's own exact string - front-door slice 7 item 2, quoted
+// verbatim from the brief: "CLAUDE_CONFIG_DIR=<config_dir> claude /login".
+func TestLoginProgram_ExactString(t *testing.T) {
+	require.Equal(t, "CLAUDE_CONFIG_DIR=/Users/allencoates/.claude-team-b claude /login",
+		loginProgram("claude", "/Users/allencoates/.claude-team-b"))
+}
+
+// loginOverlayAtStep2 walks a fresh overlay to step 2 with the given rows,
+// the same way the real "n" flow does (NextFromName), so handleLoginKey's
+// own tests drive the actual step-2 handler rather than reaching into the
+// overlay's internals.
+func loginOverlayAtStep2(t *testing.T, rows []overlay.NewLaneAccountRow, name string) *overlay.NewLaneOverlay {
+	t.Helper()
+	o := overlay.NewNewLaneOverlay(t.TempDir(), "", rows, "")
+	require.NoError(t, o.TypeRune(name))
+	o.NextFromName()
+	require.Equal(t, overlay.NewLaneStepAccount, o.Step())
+	return o
+}
+
+// (4c) l on a seat that already has a credential store does nothing but
+// name why on the foot - the overlay stays open, nothing is added to the
+// list.
+func TestHandleLoginKey_AlreadyLoggedIn_NoOpBesidesFoot(t *testing.T) {
+	scratchNewLaneEnv(t)
+	h := newLaneTestHome(t)
+
+	seatDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(seatDir, ".credentials.json"), []byte("{}"), 0600))
+	rows := []overlay.NewLaneAccountRow{{Tag: "signed-in-seat", ConfigDir: seatDir, CredentialStore: true}}
+	h.newLaneOverlay = loginOverlayAtStep2(t, rows, "acme-project")
+	h.state = stateNew
+
+	model, gotCmd := h.handleNewLaneKey(tea.KeyPressMsg{Code: 'l', Text: "l"})
+	h2, ok := model.(*home)
+	require.True(t, ok)
+
+	require.NotNil(t, h2.newLaneOverlay, "the overlay must stay open - l on a signed-in seat is a no-op besides the foot")
+	require.Equal(t, stateNew, h2.state)
+	require.Zero(t, h2.list.NumInstances(), "nothing must be created for a seat that already has a store")
+	require.NotNil(t, gotCmd, "setStatus must still return its own hide-after-a-few-seconds cmd")
+	require.Equal(t, "already logged in", h2.statusText)
+}
+
+// (4b) l on a no-store seat closes the overlay synchronously (the
+// background half - the instance and its exact program string - is proven
+// separately below, never by running the returned cmd here, which would
+// reach real tmux via inst.Start(true); TestClarityWrapperNew_... above
+// sets the same precedent for the normal flow).
+func TestHandleLoginKey_NoStore_ClosesOverlaySynchronously(t *testing.T) {
+	scratchNewLaneEnv(t)
+	h := newLaneTestHome(t)
+
+	rows := []overlay.NewLaneAccountRow{{Tag: "fresh-seat", ConfigDir: t.TempDir(), CredentialStore: false}}
+	h.newLaneOverlay = loginOverlayAtStep2(t, rows, "acme-project")
+	h.state = stateNew
+
+	model, gotCmd := h.handleNewLaneKey(tea.KeyPressMsg{Code: 'l', Text: "l"})
+	h2, ok := model.(*home)
+	require.True(t, ok)
+
+	require.Nil(t, h2.newLaneOverlay, "l on a no-store seat must close the overlay")
+	require.Equal(t, stateDefault, h2.state)
+	require.NotNil(t, gotCmd, "l on a no-store seat must return the background start cmd")
+}
+
+// (4b continued) the wrapper + NewInstance half of the same "l" flow, run
+// against the REAL clarity wrapper on a scratch CLARITY_ROOT/registry -
+// TestClarityWrapperNew_WritesAccountAndModality_InstanceCarriesBoth's own
+// shape (above, this file), for the login program instead of the normal
+// one. inst.Start is never called, so no tmux session is created by this
+// test.
+func TestHandleLoginKey_NoStore_InstanceCarriesExactLoginProgram(t *testing.T) {
+	clarityRoot := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(clarityRoot, "CLAUDE.md"), []byte("# root\n"), 0644))
+	require.NoError(t, os.MkdirAll(filepath.Join(clarityRoot, ".claude", "agents"), 0755))
+	require.NoError(t, os.MkdirAll(filepath.Join(clarityRoot, "repos"), 0755))
+	require.NoError(t, os.MkdirAll(filepath.Join(clarityRoot, "work"), 0755))
+
+	seatConfigDir := filepath.Join(clarityRoot, ".claude-fresh-seat")
+	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	registryJSON := `{"accounts":{"fresh-seat":{"config_dir":"` + seatConfigDir + `"}},"policy":{"default_account":"main"}}`
+	require.NoError(t, os.WriteFile(registryPath, []byte(registryJSON), 0644))
+
+	t.Setenv("CLARITY_ROOT", clarityRoot)
+	t.Setenv(clarity.AccountsRegistryEnvVar, registryPath)
+	t.Setenv(clarity.SessionsRootEnvVar, filepath.Join(clarityRoot, "sessions"))
+
+	require.NoError(t, clarityWrapperNew(cmd.MakeExecutor(), "q3-login-lane", "fresh-seat", "project"))
+
+	lanePath, err := clarity.ResolveExistingLaneDir("q3-login-lane")
+	require.NoError(t, err)
+
+	inst, err := session.NewInstance(session.InstanceOptions{
+		Title:      "q3-login-lane",
+		Path:       lanePath,
+		Program:    loginProgram("claude", seatConfigDir),
+		NoWorktree: true,
+		Account:    "fresh-seat",
+		Modality:   "project",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "CLAUDE_CONFIG_DIR="+seatConfigDir+" claude /login", inst.Program,
+		"the instance's own program string must match the spec's own quoted format exactly")
+}
+
+// (4b message-level) newLaneLoginStartedMsg's own handler: registers the
+// instance, selects it, records it as a pending login and sets the foot
+// text - the async counterpart to TestNewLaneFinish_SelectionLandsOnDrawnPosition
+// above, never running inst.Start (fixtureInstance never calls it either).
+func TestNewLaneLoginStartedMsg_RegistersPendingLoginAndSetsFoot(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	storage, err := session.NewStorage(config.LoadState())
+	require.NoError(t, err)
+
+	h := newComposerTestHome(t)
+	h.storage = storage
+	h.state = stateDefault
+	h.newLaneOverlay = nil
+
+	inst := fixtureInstance(t, "q3-login-lane", "project")
+
+	model, _ := h.Update(newLaneLoginStartedMsg{instance: inst, normalProgram: "claude"})
+	h2, ok := model.(*home)
+	require.True(t, ok)
+
+	require.Same(t, inst, h2.list.GetSelectedInstance(), "the new login instance must be selected")
+	require.Equal(t, "log in, then enter to start", h2.statusText)
+	normalProgram, pending := h2.pendingLogins[inst]
+	require.True(t, pending, "the instance must be tracked as a pending login")
+	require.Equal(t, "claude", normalProgram)
+}
+
+// (4d) after the login pane is marked done (completePendingLogin, called
+// from the instanceAttachFinishedMsg handler once the owner detaches), the
+// instance's own Program flips to the normal launch string and the pending
+// entry is forgotten - proven both directly and through the message that
+// wires it in production.
+func TestCompletePendingLogin_FlipsProgramAndForgetsEntry(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	storage, err := session.NewStorage(config.LoadState())
+	require.NoError(t, err)
+
+	h := newComposerTestHome(t)
+	h.storage = storage
+	h.pendingLogins = map[*session.Instance]string{}
+
+	inst := fixtureInstance(t, "q3-login-lane", "project")
+	inst.Program = "CLAUDE_CONFIG_DIR=/Users/allencoates/.claude-fresh-seat claude /login"
+	h.list.AddInstance(inst)
+	h.list.SetSelectedInstance(0)
+	h.pendingLogins[inst] = "CLAUDE_CONFIG_DIR=/Users/allencoates/.claude-fresh-seat claude"
+
+	model, _ := h.Update(instanceAttachFinishedMsg{})
+	h2, ok := model.(*home)
+	require.True(t, ok)
+
+	require.Equal(t, "CLAUDE_CONFIG_DIR=/Users/allencoates/.claude-fresh-seat claude", inst.Program,
+		"the next start must use the normal launch string, never the login one")
+	_, stillPending := h2.pendingLogins[inst]
+	require.False(t, stillPending, "a completed login must be forgotten, not re-flipped on a later attach")
+}
+
+// completePendingLogin must be a true no-op for an ordinary attach - an
+// instance never in pendingLogins keeps whatever Program it already had.
+func TestCompletePendingLogin_NoOpForOrdinaryAttach(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	storage, err := session.NewStorage(config.LoadState())
+	require.NoError(t, err)
+
+	h := newComposerTestHome(t)
+	h.storage = storage
+	h.pendingLogins = map[*session.Instance]string{}
+
+	inst := fixtureInstance(t, "ordinary-lane", "project")
+	inst.Program = "claude"
+	h.list.AddInstance(inst)
+	h.list.SetSelectedInstance(0)
+
+	h.completePendingLogin()
+
+	require.Equal(t, "claude", inst.Program)
 }

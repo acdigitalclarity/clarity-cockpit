@@ -199,6 +199,15 @@ func (o *NewLaneOverlay) NextFromAccount() {
 	}
 }
 
+// DefaultModalityKey runs the same autodetect ladder NextFromAccount uses,
+// without advancing the step or moving the modality cursor - front-door
+// slice 7's "l" key needs step 3's own default (item 2, "modality from
+// step 3 defaults") while the overlay never actually leaves step 2.
+func (o *NewLaneOverlay) DefaultModalityKey() string {
+	key, _ := o.autodetect()
+	return key
+}
+
 // BackToAccount returns to step 2, keeping the chosen seat.
 func (o *NewLaneOverlay) BackToAccount() {
 	o.step = NewLaneStepAccount
@@ -415,13 +424,38 @@ func (o *NewLaneOverlay) mostWindowLeftNote() string {
 	return fmt.Sprintf("%s has the most window left of the %s signed-in seats.", best.tag, wordForCount(len(signedIn)))
 }
 
+// accountDirFieldWidth is the step-2 config-dir cell's own column width -
+// measured off the mock-up row layout renderAccountRow builds (prefix 5 +
+// tag 9 + dir 23 + status 12 + tail 33 = newLaneInnerWidth).
+const accountDirFieldWidth = 23
+
+// truncateAccountDir keeps a seat's config-dir cell within its own column
+// width, ellipsis-cutting the FRONT and keeping the TAIL - front-door slice
+// 7 item 6a, the owner's own first-use defect: an unclipped cell (e.g. a
+// scratch registry's deep config dir, longer than displayHome's "~" shorcut
+// ever shortens a non-$HOME path to) ran past its own column and into the
+// status column's own x. The tail is what tells seats apart; the shared
+// prefix is not. Same ellipsis-cut-the-front idiom as truncateFolderLine
+// above.
+func truncateAccountDir(s string, width int) string {
+	if runewidth.StringWidth(s) <= width {
+		return s
+	}
+	const ellipsis = "…"
+	n := runewidth.StringWidth(s) - width + runewidth.StringWidth(ellipsis)
+	if n < 0 {
+		n = 0
+	}
+	return ansi.TruncateLeft(s, n, ellipsis)
+}
+
 func (o *NewLaneOverlay) renderAccountRow(acc NewLaneAccountRow, selected bool) string {
 	prefix := "     "
 	if selected {
 		prefix = "   ▸ "
 	}
 	tagField := padRight(acc.Tag, 9)
-	dirField := padRight(displayHome(acc.ConfigDir), 23)
+	dirField := padRight(truncateAccountDir(displayHome(acc.ConfigDir), accountDirFieldWidth), accountDirFieldWidth)
 
 	var statusField, tailField string
 	if acc.CredentialStore {
