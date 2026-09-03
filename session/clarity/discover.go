@@ -46,11 +46,18 @@ type ExternalLane struct {
 	Fill           Fill
 	FillOK         bool
 
-	// Account is the seat tag the root this lane's transcript sat under
-	// resolves to (claudeProjectsRoots' own resolution) - derived, never
-	// declared twice, per FRONTDOOR-SPEC.md "Discovery across roots". "" for
-	// a root the registry names no account for.
+	// Account is the seat tag resolveSeat resolves for this lane, in rule
+	// order (a)-(d) (BRIEF-FRONTDOOR-3B.md item 1): a lane's own declared
+	// Account: line beats a Desktop-entrypoint transcript beats a seat
+	// folder's own oauthAccount login beats the honest "default" floor.
+	// Never "" - rule (d) is the floor every lane resolves to.
 	Account string
+
+	// SeatSource names which rule fired: "declared", "desktop",
+	// "folder-login" or "folder" (the SeatSource* constants below). Paired
+	// with Account by SeatTag to render the printed "[<tag>]" or
+	// "[<tag> <source>]" bracket.
+	SeatSource string
 
 	// Modality is read from the lane folder's own .claude/CLAUDE.md
 	// Modality: line (WorkDir below), mirroring scripts/clarity's
@@ -80,11 +87,11 @@ type ExternalLane struct {
 // externalTranscriptRow is the pre-dedupe intermediate the discovery loop
 // builds before collapsing to one row per lane name.
 type externalTranscriptRow struct {
-	lane    string
-	path    string
-	mod     time.Time
-	cwd     string // "" when the transcript's own cwd field could not be read
-	account string // the root this row's transcript sat under resolves to
+	lane string
+	path string
+	mod  time.Time
+	cwd  string       // "" when the transcript's own cwd field could not be read
+	root ProjectsRoot // the root this row's transcript sat under
 }
 
 // laneNameFromTranscriptDir mirrors fleet_dashboard.py's lane derivation
@@ -180,6 +187,117 @@ func readTranscriptCwd(transcriptPath string) (cwd string, ok bool) {
 	return "", false
 }
 
+// accountFromLaneDir reads the Account: line from lanePath's own
+// .claude/CLAUDE.md, mirroring scripts/clarity's session_account() (grep -i
+// '^Account:' | sed 's/^Account:[[:space:]]*//') - the tag `clarity new
+// --account <tag>` writes at session creation (BRIEF-FRONTDOOR-3B.md rule
+// a). "" when lanePath is empty, the folder does not exist, or the line is
+// absent - never an error, since most lanes predate this convention.
+func accountFromLaneDir(lanePath string) string {
+	if lanePath == "" {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(lanePath, ".claude", "CLAUDE.md"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if v, ok := claudeMDFieldValue(line, "Account"); ok {
+			return v
+		}
+	}
+	return ""
+}
+
+// DesktopEntrypoint is the "entrypoint" value the Claude Desktop app writes
+// on every conversational record of a session it launched - confirmed
+// against a live transcript before this file was written (BRIEF-FRONTDOOR-
+// 3B.md's field-name survey). The CLI writes "cli" instead.
+const DesktopEntrypoint = "claude-desktop"
+
+// transcriptEntrypoint reads forward from the start of transcriptPath
+// looking for the first record carrying a non-empty top-level "entrypoint"
+// field, the same forward-scan shape readTranscriptCwd applies to "cwd" -
+// the two fields sit on the same early conversational records in practice.
+// ok is false when no such record turns up inside the scan budget.
+func transcriptEntrypoint(transcriptPath string) (entrypoint string, ok bool) {
+	f, err := os.Open(transcriptPath)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), scannerMaxLine)
+
+	read := 0
+	for line := 0; scanner.Scan() && line < cwdScanMaxLines && read < cwdScanMaxBytes; line++ {
+		b := scanner.Bytes()
+		read += len(b) + 1
+		if len(bytes.TrimSpace(b)) == 0 {
+			continue
+		}
+		var rec struct {
+			Entrypoint string `json:"entrypoint"`
+		}
+		if err := json.Unmarshal(b, &rec); err != nil {
+			continue
+		}
+		if rec.Entrypoint != "" {
+			return rec.Entrypoint, true
+		}
+	}
+	return "", false
+}
+
+// Seat resolution sources (BRIEF-FRONTDOOR-3B.md item 1) - the rule that
+// resolved a lane's Account tag, paired with it on ExternalLane.SeatSource
+// and rendered by SeatTag.
+const (
+	SeatSourceDeclared    = "declared"     // rule (a): the lane's own Account: line
+	SeatSourceDesktop     = "desktop"      // rule (b): newest transcript entrypoint claude-desktop
+	SeatSourceFolderLogin = "folder-login" // rule (c): non-default seat folder's own oauthAccount
+	SeatSourceFolder      = "folder"       // rule (d): the floor - default root, or an unlogged-in seat root
+)
+
+// resolveSeat applies the seat-resolution rule in order (a)-(d): a lane's
+// own declared Account: line beats a Desktop-entrypoint transcript beats a
+// non-default seat folder's own oauthAccount login beats the honest
+// "default" floor - never "main", never any other registry bookkeeping
+// name, for the machine's own default root. lanePath is the lane's own
+// working directory ("" when unknown, in which case rule (a) never fires);
+// transcriptPath is the lane's newest transcript; root is the ProjectsRoot
+// that transcript was found under.
+func resolveSeat(lanePath, transcriptPath string, root ProjectsRoot) (tag, source string) {
+	if declared := accountFromLaneDir(lanePath); declared != "" {
+		return declared, SeatSourceDeclared
+	}
+	if entrypoint, ok := transcriptEntrypoint(transcriptPath); ok && entrypoint == DesktopEntrypoint {
+		return "desktop", SeatSourceDesktop
+	}
+	if !root.IsDefault && root.Account != "" {
+		if oauth := ReadSeatOAuthAccount(filepath.Dir(root.Path)); oauth.Present {
+			return root.Account, SeatSourceFolderLogin
+		}
+	}
+	if root.IsDefault || root.Account == "" {
+		return "default", SeatSourceFolder
+	}
+	return root.Account, SeatSourceFolder
+}
+
+// SeatTag renders the printed seat bracket's contents (without the
+// brackets themselves, which callers add): the tag alone when source is
+// "declared" or is itself identical to tag (the "desktop"/"desktop" case -
+// appending it a second time would say nothing new), otherwise "<tag>
+// <source>" - "team-b", "desktop", "team-a folder-login", "default folder".
+func SeatTag(tag, source string) string {
+	if source == "" || source == SeatSourceDeclared || source == tag {
+		return tag
+	}
+	return tag + " " + source
+}
+
 // modalityFromLaneDir reads the Modality: line from lanePath's own
 // .claude/CLAUDE.md, mirroring scripts/clarity's session_modality() (grep -i
 // '^Modality:' | sed 's/^Modality:[[:space:]]*//'). "" when lanePath is
@@ -248,7 +366,7 @@ func DiscoverExternalLanes(excludeDirs map[string]bool) ([]ExternalLane, error) 
 			if strings.HasPrefix(lane, "subagents") {
 				continue
 			}
-			rows = append(rows, externalTranscriptRow{lane: lane, path: p, mod: info.ModTime(), account: root.Account})
+			rows = append(rows, externalTranscriptRow{lane: lane, path: p, mod: info.ModTime(), root: root})
 		}
 	}
 
@@ -260,7 +378,7 @@ func DiscoverExternalLanes(excludeDirs map[string]bool) ([]ExternalLane, error) 
 	seen := make(map[string]bool, len(rows))
 	out := make([]ExternalLane, 0, len(rows))
 	for _, r := range rows {
-		key := r.account + "\x00" + r.lane
+		key := r.root.Account + "\x00" + r.lane
 		if seen[key] {
 			continue
 		}
@@ -270,6 +388,7 @@ func DiscoverExternalLanes(excludeDirs map[string]bool) ([]ExternalLane, error) 
 			continue
 		}
 		fill, ok := ReadFill(r.path, "")
+		seatTag, seatSource := resolveSeat(cwd, r.path, r.root)
 		out = append(out, ExternalLane{
 			Name:           strings.TrimPrefix(r.lane, "sessions-"),
 			Key:            r.lane,
@@ -278,7 +397,8 @@ func DiscoverExternalLanes(excludeDirs map[string]bool) ([]ExternalLane, error) 
 			Fill:           fill,
 			FillOK:         ok,
 			WorkDir:        cwd,
-			Account:        r.account,
+			Account:        seatTag,
+			SeatSource:     seatSource,
 			Modality:       modalityFromLaneDir(cwd),
 		})
 	}
