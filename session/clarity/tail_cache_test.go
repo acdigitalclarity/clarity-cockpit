@@ -3,6 +3,7 @@ package clarity
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -83,4 +84,72 @@ func TestLaneTailCache_WiderMaxTurnsReparses(t *testing.T) {
 	second, err := c.Get(path, 8, now)
 	require.NoError(t, err)
 	require.Len(t, second.Turns, 8, "a wider request against the same unchanged file must reparse for the extra history, not return the narrower cached slice")
+}
+
+// fortyTurnFixtureLines builds a representative fixture at the Session
+// pane's own read size (app/app.go's sessionMaxTurns == 40) - the shape the
+// Latency ruling's rule 1 asks to have its per-tick cost measured against,
+// rather than a single-line toy fixture.
+func fortyTurnFixtureLines(now time.Time) []string {
+	var lines []string
+	for i := 0; i < 40; i++ {
+		lines = append(lines, ownerLine(now.Add(-time.Duration(40-i)*time.Minute),
+			fmt.Sprintf("turn number %d, a bit more realistic in length than a bare word", i)))
+	}
+	return lines
+}
+
+// BenchmarkLaneTailCache_Get_UnchangedFile measures rule 1's own claim ("an
+// unchanged file costs one stat") at that 40-turn size: the file's mtime
+// and size never change across b.N calls, so every call after the first
+// must be served from the cache - an os.Stat plus a map lookup, never a
+// reparse of the fixture.
+func BenchmarkLaneTailCache_Get_UnchangedFile(b *testing.B) {
+	now := time.Now()
+	path := filepath.Join(b.TempDir(), "bench.jsonl")
+	body := ""
+	for _, l := range fortyTurnFixtureLines(now) {
+		body += l + "\n"
+	}
+	require.NoError(b, os.WriteFile(path, []byte(body), 0644))
+
+	c := NewLaneTailCache()
+	if _, err := c.Get(path, 40, now); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := c.Get(path, 40, now); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkLaneTailCache_Get_ChangedFile is rule 1's other half: the file
+// grows by one line before every call (a genuine new transcript record
+// every tick), forcing a real reparse each time - the ceiling the unchanged
+// case above is measured against.
+func BenchmarkLaneTailCache_Get_ChangedFile(b *testing.B) {
+	now := time.Now()
+	path := filepath.Join(b.TempDir(), "bench.jsonl")
+	base := fortyTurnFixtureLines(now)
+
+	c := NewLaneTailCache()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		body := ""
+		for _, l := range base {
+			body += l + "\n"
+		}
+		body += ownerLine(now.Add(time.Duration(i)*time.Millisecond), fmt.Sprintf("live turn %d", i)) + "\n"
+		if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+			b.Fatal(err)
+		}
+		b.StartTimer()
+		if _, err := c.Get(path, 40, now); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
