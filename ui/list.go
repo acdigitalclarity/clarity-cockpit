@@ -17,29 +17,42 @@ import (
 	"github.com/mattn/go-runewidth"
 )
 
-var addedLinesStyle = lipgloss.NewStyle().
-	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#51bd73"), Dark: lipgloss.Color("#51bd73")})
-
+// removedLinesStyle is also ui/session.go's own removed-text colour - kept
+// here since this file declared it first; addedLinesStyle (its old pair)
+// is gone with slice 19's diff badge (see InstanceRenderer.Render's own
+// comment: a compact one-row lane carries no room for it, and the
+// mock-up's own target row - PANE-MOCKUP-164x45.md - never showed one).
 var removedLinesStyle = lipgloss.NewStyle().
 	Foreground(lipgloss.Color("#de613e"))
 
+// laneRowSelectedBg/laneRowSelectedFg are the selected row's own band
+// (owner, 3 Sep 11:3x, "the highlight of the active session is a bit
+// naff" - design/cockpit-pane/CURRENT-ROW-HIGHLIGHT-2026-09-03.png shows
+// the old #dde4f0 pale-lavender background as a two-row inverted block
+// with a ragged right edge). laneRowSelectedBg is a dark tint of the same
+// accent teal laneRowMarkerStyle draws the ▌ marker in below - rule 2's
+// "a subtle full-width band (a dark tint of the accent, not the inverted
+// pale block)". laneRowSelectedFg is the app's own ordinary text colour
+// (the same pair titleStyle already carries), never a foreground forced to
+// one value regardless of light/dark mode the way the old selectedTitleStyle
+// was - that fixed #1a1a1a is what made the pale block read as "inverted"
+// in the first place.
+var laneRowSelectedBg = compat.AdaptiveColor{Light: lipgloss.Color("#cdeef0"), Dark: lipgloss.Color("#153a3d")}
+var laneRowSelectedFg = compat.AdaptiveColor{Light: lipgloss.Color("#1a1a1a"), Dark: lipgloss.Color("#dddddd")}
+
+// titleStyle/selectedTitleStyle now carry no Padding at all: the marker
+// column (laneRowMarker) and the row's own single trailing space
+// (laneRowFrame) take over the left/right columns Padding used to add, and
+// every row is exactly one line - rule 1's "ONE ROW per lane ... no spacer
+// rows" - so the old top/bottom Padding that produced a blank line above
+// and below each tracked instance (four instances, twenty rows, the
+// owner's own screenshot) is gone with it.
 var titleStyle = lipgloss.NewStyle().
-	Padding(1, 1, 0, 1).
 	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#1a1a1a"), Dark: lipgloss.Color("#dddddd")})
 
-var listDescStyle = lipgloss.NewStyle().
-	Padding(0, 1, 1, 1).
-	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#A49FA5"), Dark: lipgloss.Color("#777777")})
-
 var selectedTitleStyle = lipgloss.NewStyle().
-	Padding(1, 1, 0, 1).
-	Background(lipgloss.Color("#dde4f0")).
-	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#1a1a1a"), Dark: lipgloss.Color("#1a1a1a")})
-
-var selectedDescStyle = lipgloss.NewStyle().
-	Padding(0, 1, 1, 1).
-	Background(lipgloss.Color("#dde4f0")).
-	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#1a1a1a"), Dark: lipgloss.Color("#1a1a1a")})
+	Background(laneRowSelectedBg).
+	Foreground(laneRowSelectedFg)
 
 var mainTitle = lipgloss.NewStyle().
 	Background(lipgloss.Color("62")).
@@ -54,17 +67,16 @@ var needsYouTitleStyle = lipgloss.NewStyle().
 	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#b5581a"), Dark: lipgloss.Color("#e0a458")})
 
 var needsYouLineStyle = lipgloss.NewStyle().
-	Padding(0, 0, 0, 1).
 	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#5a5a5a"), Dark: lipgloss.Color("#aaaaaa")})
 
 // needsYouLineSelectedStyle is the current Needs-you row's own highlight -
-// the same background externalRowSelectedStyle already uses, so the one
-// cursor reads as one style regardless of which of the three groups it is
-// currently in (the brief's "the current highlight style").
+// rule 3's "keep their existing selection treatment but use the same ▌
+// marker and band rule for consistency": the same band colour every
+// selected row now shares (laneRowSelectedBg), so the one cursor reads as
+// one style regardless of which of the three groups it is currently in.
 var needsYouLineSelectedStyle = lipgloss.NewStyle().
-	Padding(0, 0, 0, 1).
-	Background(lipgloss.Color("#dde4f0")).
-	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#1a1a1a"), Dark: lipgloss.Color("#1a1a1a")})
+	Background(laneRowSelectedBg).
+	Foreground(laneRowSelectedFg)
 
 var externalTitleStyle = lipgloss.NewStyle().
 	Bold(true).
@@ -72,23 +84,55 @@ var externalTitleStyle = lipgloss.NewStyle().
 	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#5a5a5a"), Dark: lipgloss.Color("#999999")})
 
 var externalRowStyle = lipgloss.NewStyle().
-	Padding(0, 1, 0, 1).
 	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#777777"), Dark: lipgloss.Color("#999999")})
 
 var externalRowSelectedStyle = lipgloss.NewStyle().
-	Padding(0, 1, 0, 1).
-	Background(lipgloss.Color("#dde4f0")).
-	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#1a1a1a"), Dark: lipgloss.Color("#1a1a1a")})
+	Background(laneRowSelectedBg).
+	Foreground(laneRowSelectedFg)
 
-// laneStateAccentStyle/laneStateStalledStyle/laneStateIdleStyle are the
-// state-word row's own colours (DECISIONS.md, 2 Sep evening, PANE-MOCKUP-*):
-// working and waiting on you reuse the selected row's own accent
-// (selectedTitleStyle/externalRowSelectedStyle's background colour, #dde4f0
-// - the accent already used for the selected row), stalled reuses the
-// Needs-you heading's orange (needsYouTitleStyle's foreground), idle is
-// dim (externalRowStyle's own dim foreground).
-var laneStateAccentStyle = lipgloss.NewStyle().
-	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#dde4f0"), Dark: lipgloss.Color("#dde4f0")})
+// laneRowMarkerStyle draws the ▌ marker rule 2 gives every selected row -
+// "a left marker ▌ in the accent (the splash teal used for CLAUDE tags)",
+// the same colour pair as ui/session.go's sessionClaudeStyle, repeated here
+// (this package's own convention for a shared colour role - #b5581a/
+// #e0a458 above is already duplicated the same way between
+// needsYouTitleStyle and laneStateStalledStyle) rather than exported,
+// since session.go and list.go are legs owned separately (pane-14/pane-19).
+var laneRowMarkerStyle = lipgloss.NewStyle().
+	Bold(true).
+	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#0f7f83"), Dark: lipgloss.Color("#54E6EA")})
+
+// laneBranchSuffixFg is the branch suffix's own faint colour (rule 1: "a
+// faint suffix") - the same dim tone the old, now-removed second line
+// (branchLine, via listDescStyle) used for exactly this text.
+var laneBranchSuffixFg = compat.AdaptiveColor{Light: lipgloss.Color("#A49FA5"), Dark: lipgloss.Color("#777777")}
+
+// laneStateWorkingStyle/laneStateWaitingStyle/laneStateStalledStyle/
+// laneStateIdleStyle are the state-word row's own colours (rule 2: "working
+// teal, waiting orange, stalled orange, idle muted" - test that the state
+// colour survives inside the selected row). DEFECT (the owner's own
+// screenshot, "the state glyph and word lose their colour inside it"):
+// working and waiting on you used to share ONE style
+// (laneStateAccentStyle) whose colour, #dde4f0, was the exact same value
+// as the selected row's own OLD background - so on a selected row that
+// text painted itself the same colour as the band under it and vanished.
+// Split three ways here: working gets its own teal (the splash/reading-
+// layout accent, same pair as laneRowMarkerStyle above), waiting on you
+// shares stalled's orange (both are attention states a lane cannot clear
+// without the owner), and neither collides with laneRowSelectedBg's new,
+// deliberately distinct dark tint.
+var laneStateWorkingStyle = lipgloss.NewStyle().
+	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#0f7f83"), Dark: lipgloss.Color("#54E6EA")})
+
+// laneStateAccentStyle is kept under its old name as an alias for
+// laneStateWorkingStyle - ui/session.go's own animated header glyph
+// (headerGlyph, a pane-14 file this leg does not touch) still references
+// it by this name. The DEFECT this file's state-colour split fixes (see
+// laneStateWorkingStyle's own comment above) was always this style's old
+// VALUE, #dde4f0, never its name.
+var laneStateAccentStyle = laneStateWorkingStyle
+
+var laneStateWaitingStyle = lipgloss.NewStyle().
+	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#b5581a"), Dark: lipgloss.Color("#e0a458")})
 
 var laneStateStalledStyle = lipgloss.NewStyle().
 	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#b5581a"), Dark: lipgloss.Color("#e0a458")})
@@ -97,17 +141,17 @@ var laneStateIdleStyle = lipgloss.NewStyle().
 	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#777777"), Dark: lipgloss.Color("#999999")})
 
 // laneStateGlyph returns the glyph and style ClassifyState's four words
-// render as - working ● and waiting on you ◉ share the accent style,
-// stalled ◐ the orange, idle ○ dim. An unknown/not-yet-computed state (the
-// empty string, before the first feed tick has classified this lane) draws
-// a blank glyph: the row still reserves the column, it simply has nothing
-// to show yet, same convention as the ctx gauge's "show nothing, not n/a".
+// render as - working ● its own teal, waiting on you ◉ and stalled ◐ share
+// the orange, idle ○ dim. An unknown/not-yet-computed state (the empty
+// string, before the first feed tick has classified this lane) draws a
+// blank glyph: the row still reserves the column, it simply has nothing to
+// show yet, same convention as the ctx gauge's "show nothing, not n/a".
 func laneStateGlyph(state string) (string, lipgloss.Style) {
 	switch state {
 	case clarity.StateWorking:
-		return "●", laneStateAccentStyle
+		return "●", laneStateWorkingStyle
 	case clarity.StateWaitingYou:
-		return "◉", laneStateAccentStyle
+		return "◉", laneStateWaitingStyle
 	case clarity.StateStalled:
 		return "◐", laneStateStalledStyle
 	case clarity.StateIdle:
@@ -202,9 +246,9 @@ func lanePctField(pct int, ok bool) string {
 // collapsed), then the last-turn time (unless the row is too narrow to
 // carry it - laneShowTime) - the FINISH defect's "one table" requirement.
 // Every segment carries rowBg/rowFg forward explicitly (the same technique
-// the diff-stat badge already uses, see Render() below) so the glyph's own
-// state colour does not reset the row's selected-highlight background for
-// the characters after it.
+// laneRowMarker and laneRowFrame below use for the rest of the row) so the
+// glyph's own state colour does not reset the row's selected-highlight
+// background for the characters after it.
 func laneRowSuffix(rowBg, rowFg color.Color, pct int, fillOK bool, state string, lastTurn time.Time, turnOK bool, showWord, showTime bool) string {
 	plain := lipgloss.NewStyle().Background(rowBg).Foreground(rowFg)
 	glyph, glyphStyle := laneStateGlyph(state)
@@ -237,6 +281,65 @@ func laneRowSuffix(rowBg, rowFg color.Color, pct int, fillOK bool, state string,
 	// through the same plain style keeps the whole suffix one continuous
 	// rowBg band with no un-styled character in it.
 	return plain.Render(" ") + pctSeg + plain.Render("  ") + glyphStyle.Render(glyph) + wordSeg + timeSeg
+}
+
+// laneRowMarker returns the styled single-column cell every selectable row
+// now begins with (rule 2: "a left marker ▌ in the accent ... Unselected
+// rows have a single space in column 1"; rule 3 extends this to Needs-you
+// rows too). It is rendered as its own fully self-contained ANSI span
+// (opens, prints the one cell, resets) rather than folded into a larger
+// wrapped string: laneRowFrame below concatenates it directly against
+// content that opens its own styling immediately after, so the marker's
+// own trailing reset is never followed by a bare, un-styled character -
+// the same continuous-band property DEFECT 2 (board #280 pane-10
+// walkthrough) required of laneRowSuffix's own separators.
+func laneRowMarker(rowBg color.Color, selected bool) string {
+	if selected {
+		return laneRowMarkerStyle.Background(rowBg).Render("▌")
+	}
+	return lipgloss.NewStyle().Background(rowBg).Render(" ")
+}
+
+// laneRowFrame wraps a row's own already-styled, already-truncated content
+// (every one of its segments carrying rowBg/rowFg forward explicitly, the
+// laneRowSuffix convention) with the marker cell and the row's own single
+// trailing padding column - the two columns Padding used to add on every
+// row's style before slice 19 moved the marker into column 1 and dropped
+// the second line entirely. Both frame pieces are self-contained ANSI
+// spans of their own, so concatenating marker+content+pad leaves no
+// un-styled byte anywhere in the line.
+func laneRowFrame(rowBg, rowFg color.Color, selected bool, content string) string {
+	plain := lipgloss.NewStyle().Background(rowBg).Foreground(rowFg)
+	return laneRowMarker(rowBg, selected) + content + plain.Render(" ")
+}
+
+// laneNameFieldParts builds a tracked-instance row's own name-column
+// content: the "N. title" text, an optional faint " · branch" suffix, and
+// the trailing spaces that pad the whole thing out to nameCol - split into
+// three return values so InstanceRenderer.Render can style each part on
+// its own (bold name, faint branch, plain pad) rather than one flat
+// string. Rule 1's own branch rule: "moves into the name column as a faint
+// suffix (' · branch') only if it fits, else dropped" - the branch is
+// shown WHOLE or not at all, it is never itself truncated to make room
+// (unlike the name, which still truncates with an ellipsis exactly as
+// before when the name alone overruns nameCol).
+func laneNameFieldParts(prefix, title, branch string, hasWorktree bool, nameCol int) (base, branchSuffix, pad string) {
+	full := prefix + title
+	if hasWorktree && branch != "" {
+		candidate := full + " · " + branch
+		if runewidth.StringWidth(candidate) <= nameCol {
+			branchSuffix = " · " + branch
+		}
+	}
+	if branchSuffix == "" {
+		full = runewidth.Truncate(full, nameCol, "…")
+	}
+	used := runewidth.StringWidth(full) + runewidth.StringWidth(branchSuffix)
+	padN := nameCol - used
+	if padN < 0 {
+		padN = 0
+	}
+	return full, branchSuffix, strings.Repeat(" ", padN)
 }
 
 type List struct {
@@ -492,97 +595,35 @@ func (r *InstanceRenderer) setWidth(width int) {
 	r.width = width
 }
 
-// ɹ and ɻ are other options.
-const branchIcon = "Ꮧ"
-
 func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, hasMultipleRepos bool, showWord bool) string {
-	prefix := fmt.Sprintf(" %d. ", idx)
+	prefix := fmt.Sprintf("%d. ", idx)
 	if idx >= 10 {
 		prefix = prefix[:len(prefix)-1]
 	}
-	titleS := selectedTitleStyle
-	descS := selectedDescStyle
-	if !selected {
-		titleS = titleStyle
-		descS = listDescStyle
+	rowS := titleStyle
+	if selected {
+		rowS = selectedTitleStyle
 	}
+	rowBg, rowFg := rowS.GetBackground(), rowS.GetForeground()
+	plain := lipgloss.NewStyle().Background(rowBg).Foreground(rowFg)
 
-	// The title line now carries the same state table every lane row
-	// shares (item 1): name padded to a column, ctx right-aligned, the
-	// clarity-derived state glyph and word, then last-turn time - replacing
-	// the plain tmux-status glyph (ready/paused/spinner) this line used to
-	// end with, since ClassifyState's four words are a strict superset of
-	// what that conveyed (a Paused instance's transcript reads idle or
-	// stalled on its own merits).
+	// The row carries the same state table every lane row shares (item 1):
+	// name padded to a column, ctx right-aligned, the clarity-derived state
+	// glyph and word, then last-turn time - and, since slice 19, that is
+	// the WHOLE row: rule 1's "ONE ROW per lane, no spacer rows" folds the
+	// old second line (branch + diff stats) into this one, so a fleet of
+	// four instances takes four rows, not twenty (the owner's own
+	// screenshot). Diff stats have no home left to go: this compact row
+	// has no room for them and the mock-up's own target row
+	// (PANE-MOCKUP-164x45.md) never carried one - dropped, not moved.
 	rowInner := laneRowInnerWidth(r.width)
 	nameCol := laneNameColWidthFor(rowInner, showWord)
-	name := runewidth.FillRight(runewidth.Truncate(prefix+i.Title, nameCol, "…"), nameCol)
 
-	pct, fillOK := i.GetContextFill()
-	state, lastTurn, turnOK := i.GetLaneState()
-	suffix := laneRowSuffix(titleS.GetBackground(), titleS.GetForeground(), pct, fillOK, state, lastTurn, turnOK, showWord, laneShowTime(rowInner))
-	// titleS carries its own left/right Padding, added once by wrapping the
-	// WHOLE truncated line in it here (not the name alone) - the truncation
-	// budget (laneRowInnerWidth) already excludes that padding's width, so
-	// truncating first and padding last is the order that keeps the styled
-	// result within r.width; truncating an already-padded string instead
-	// (as an earlier version of this line did) over-truncates by exactly
-	// the padding's own width, eating into the suffix's last-turn time.
-	title := titleS.Render(ansiTruncateRow(name+suffix, laneRowInnerWidth(r.width)))
-
-	stat := i.GetDiffStats()
-
-	var diff string
-	var addedDiff, removedDiff string
-	if stat == nil || stat.Error != nil || stat.IsEmpty() {
-		// Don't show diff stats if there's an error or if they don't exist
-		addedDiff = ""
-		removedDiff = ""
-		diff = ""
-	} else {
-		addedDiff = fmt.Sprintf("+%d", stat.Added)
-		removedDiff = fmt.Sprintf("-%d ", stat.Removed)
-		diff = lipgloss.JoinHorizontal(
-			lipgloss.Center,
-			addedLinesStyle.Background(descS.GetBackground()).Render(addedDiff),
-			lipgloss.Style{}.Background(descS.GetBackground()).Foreground(descS.GetForeground()).Render(","),
-			removedLinesStyle.Background(descS.GetBackground()).Render(removedDiff),
-		)
-	}
-
-	// laneRowInnerWidth(r.width), not r.width itself: descS (below) carries
-	// the same left/right Padding as titleS, so the branch line's own fill
-	// target has to leave the same 2 columns of room the title line already
-	// does via this same helper - a pre-existing gap in this budget (it
-	// always started from the bare r.width) that stayed invisible while
-	// r.width was itself discounted 10% by AdjustPreviewWidth, and became a
-	// real overflow the moment defect 2 removed that discount to give the
-	// list column back its own full width.
-	remainingWidth := laneRowInnerWidth(r.width)
-	remainingWidth -= runewidth.StringWidth(prefix)
-	remainingWidth -= runewidth.StringWidth(branchIcon)
-	// 3, not 2: the branchLine format string below ("%s %s%s %s") carries
-	// TWO literal separator spaces (one before branchSegment, one before
-	// diff) plus the "-" inside branchSegment's own "<icon>-<branch>" -
-	// this budget only ever subtracted one of the two spaces, a pre-
-	// existing gap that stayed invisible while r.width was itself
-	// discounted 10% by AdjustPreviewWidth and became a real one-column
-	// overflow the moment defect 2 removed that discount.
-	remainingWidth -= 3
-
-	diffWidth := runewidth.StringWidth(addedDiff) + runewidth.StringWidth(removedDiff)
-	if diffWidth > 0 {
-		diffWidth += 1
-	}
-
-	// Use fixed width for diff stats to avoid layout issues
-	remainingWidth -= diffWidth
-
-	branch := i.Branch
 	// A NoWorktree instance (slice 8) has no git worktree and so no repo
 	// name to look up at all - RepoName() would return its own "no git
 	// worktree" error every render tick for an entirely expected condition,
 	// not a real failure, so this is skipped rather than logged.
+	branch := i.Branch
 	if i.Started() && i.HasWorktree() && hasMultipleRepos {
 		repoName, err := i.RepoName()
 		if err != nil {
@@ -591,47 +632,24 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, h
 			branch += fmt.Sprintf(" (%s)", repoName)
 		}
 	}
-	// Don't show branch if there's no space for it. Or show ellipsis if it's too long.
-	branchWidth := runewidth.StringWidth(branch)
-	if remainingWidth < 0 {
-		branch = ""
-	} else if remainingWidth < branchWidth {
-		if remainingWidth < 3 {
-			branch = ""
-		} else {
-			// We know the remainingWidth is at least 4 and branch is longer than that, so this is safe.
-			branch = runewidth.Truncate(branch, remainingWidth-3, "...")
-		}
+	base, branchSuffix, pad := laneNameFieldParts(prefix, i.Title, branch, i.HasWorktree(), nameCol)
+
+	// The name itself is bold on the selected row (rule 2: "the name in
+	// bold in the normal foreground"); the branch suffix stays faint
+	// regardless of selection, the same dim tone the old, now-removed
+	// second line used for it.
+	nameStyle := plain
+	if selected {
+		nameStyle = nameStyle.Bold(true)
 	}
-	remainingWidth -= runewidth.StringWidth(branch)
+	branchStyle := plain.Foreground(laneBranchSuffixFg)
 
-	// Add spaces to fill the remaining width.
-	spaces := ""
-	if remainingWidth > 0 {
-		spaces = strings.Repeat(" ", remainingWidth)
-	}
+	pct, fillOK := i.GetContextFill()
+	state, lastTurn, turnOK := i.GetLaneState()
+	suffix := laneRowSuffix(rowBg, rowFg, pct, fillOK, state, lastTurn, turnOK, showWord, laneShowTime(rowInner))
 
-	// clarity-attach instances (session/clarity/attach.go) have no git
-	// worktree and so no branch to show. Upstream's "<icon>-<branch>"
-	// segment rendered unconditionally, so a branchless row showed a bare
-	// Cherokee glyph and hyphen with nothing after it (the OWN ROW defect's
-	// garbled second line) - blank space of the same width keeps the diff
-	// badge lined up with every other row instead.
-	branchSegment := fmt.Sprintf("%s-%s", branchIcon, branch)
-	if !i.HasWorktree() {
-		branchSegment = strings.Repeat(" ", runewidth.StringWidth(branchSegment))
-	}
-
-	branchLine := fmt.Sprintf("%s %s%s %s", strings.Repeat(" ", len(prefix)), branchSegment, spaces, diff)
-
-	// join title and subtitle
-	text := lipgloss.JoinVertical(
-		lipgloss.Left,
-		title,
-		descS.Render(branchLine),
-	)
-
-	return text
+	content := nameStyle.Render(base) + branchStyle.Render(branchSuffix) + plain.Render(pad) + suffix
+	return laneRowFrame(rowBg, rowFg, selected, ansiTruncateRow(content, rowInner))
 }
 
 func (l *List) String() string {
@@ -672,15 +690,22 @@ func (l *List) String() string {
 		b.WriteString(needsYouTitleStyle.Render(" Needs you "))
 		b.WriteString("\n")
 		if l.needsYouStatus != "" {
-			b.WriteString(needsYouLineStyle.Render(ansiTruncateRow(l.needsYouStatus, innerWidth)))
+			rowBg, rowFg := needsYouLineStyle.GetBackground(), needsYouLineStyle.GetForeground()
+			plain := lipgloss.NewStyle().Background(rowBg).Foreground(rowFg)
+			content := plain.Render(ansiTruncateRow(l.needsYouStatus, innerWidth))
+			b.WriteString(laneRowFrame(rowBg, rowFg, false, content))
 			b.WriteString("\n")
 		}
 		for i, item := range l.needsYou {
+			selected := l.selNeedsYou && i == l.selectedIdx
 			style := needsYouLineStyle
-			if l.selNeedsYou && i == l.selectedIdx {
+			if selected {
 				style = needsYouLineSelectedStyle
 			}
-			b.WriteString(style.Render(ansiTruncateRow(clarity.FeedLine(item), innerWidth)))
+			rowBg, rowFg := style.GetBackground(), style.GetForeground()
+			plain := lipgloss.NewStyle().Background(rowBg).Foreground(rowFg)
+			content := plain.Render(ansiTruncateRow(clarity.FeedLine(item), innerWidth))
+			b.WriteString(laneRowFrame(rowBg, rowFg, selected, content))
 			b.WriteString("\n")
 		}
 		b.WriteString("\n")
@@ -688,14 +713,14 @@ func (l *List) String() string {
 
 	// Render the list. showWord is item 1's "below 100 columns drop the
 	// word, keep the glyph" - one decision per render pass, shared by every
-	// tracked and external row alike (item 4's "one table").
+	// tracked and external row alike (item 4's "one table"). One row per
+	// lane, no blank line between them (rule 1: "no spacer rows" - the
+	// owner's own screenshot showed four instances taking twenty rows).
 	showWord := !l.collapsed
 	for i, item := range l.items {
 		selected := !l.selExternal && !l.selNeedsYou && i == l.selectedIdx
 		b.WriteString(l.renderer.Render(item, i+1, selected, len(l.repos) > 1, showWord))
-		if i != len(l.items)-1 {
-			b.WriteString("\n\n")
-		}
+		b.WriteString("\n")
 	}
 
 	// Render the external lanes - live on this Mac but not tracked here
@@ -703,15 +728,24 @@ func (l *List) String() string {
 	// branch, no attach/kill affordance, because none of that exists for a
 	// lane with no tracked tmux session or git worktree.
 	if len(l.external) > 0 {
-		if len(l.items) > 0 {
-			b.WriteString("\n\n")
-		}
+		// externalTitleStyle carries its own top Padding(1) - that IS the
+		// rule 1 blank line between the tracked-instance block and this
+		// heading (a second, explicit "\n" here on top of it was the old
+		// "\n\n" spacer bug's own other half: two blank-line sources
+		// stacking into the owner's screenshot).
 		b.WriteString(externalTitleStyle.Render(" External lanes (message only) "))
 		b.WriteString("\n")
 		for i, lane := range l.external {
+			selected := l.selExternal && i == l.selectedIdx
 			style := externalRowStyle
-			if l.selExternal && i == l.selectedIdx {
+			if selected {
 				style = externalRowSelectedStyle
+			}
+			rowBg, rowFg := style.GetBackground(), style.GetForeground()
+			plain := lipgloss.NewStyle().Background(rowBg).Foreground(rowFg)
+			nameStyle := plain
+			if selected {
+				nameStyle = nameStyle.Bold(true)
 			}
 			// Pad (or truncate) the name to a fixed column first, so every
 			// row's suffix lines up regardless of how long an individual
@@ -720,14 +754,11 @@ func (l *List) String() string {
 			// fixed suffix can still run past a narrow terminal.
 			nameCol := l.laneNameColWidth(showWord)
 			name := runewidth.FillRight(ansiTruncateRow(lane.Name, nameCol), nameCol)
-			suffix := laneRowSuffix(style.GetBackground(), style.GetForeground(),
+			suffix := laneRowSuffix(rowBg, rowFg,
 				lane.Fill.Pct, lane.FillOK, lane.State, lane.LastTurn, lane.StateOK, showWord, laneShowTime(innerWidth))
-			// style carries its own left/right Padding, added once by
-			// wrapping the WHOLE truncated line in it here (not the name
-			// alone) - see the matching comment on the tracked-row title
-			// line above; the same over-truncation bug applied here first.
-			line := name + suffix
-			b.WriteString(style.Render(ansiTruncateRow(line, innerWidth)))
+			line := nameStyle.Render(name) + suffix
+			content := ansiTruncateRow(line, innerWidth)
+			b.WriteString(laneRowFrame(rowBg, rowFg, selected, content))
 			b.WriteString("\n")
 		}
 	}

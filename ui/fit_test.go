@@ -91,9 +91,12 @@ func runeIndexOf(s string, r rune) int {
 }
 
 // TestRender_NoWorktreeInstance_NoGarbledGlyph is the OWN ROW defect's row
-// test: a clarity-attach instance (NoWorktree) has no git worktree and so
-// no branch - upstream's "<icon>-<branch>" segment must not render as a
-// bare, meaningless icon-and-hyphen when there is nothing after it.
+// test, carried forward into slice 19's compact row: a clarity-attach
+// instance (NoWorktree) has no git worktree and so no branch at all -
+// laneNameFieldParts' own hasWorktree guard must never render the " ·
+// branch" suffix (rule 1) for it, upstream's old bare icon-and-hyphen with
+// nothing after it, now generalised to "no dangling separator of any
+// kind".
 func TestRender_NoWorktreeInstance_NoGarbledGlyph(t *testing.T) {
 	inst, err := session.NewInstance(session.InstanceOptions{
 		Title:      "ways-of-working",
@@ -109,8 +112,8 @@ func TestRender_NoWorktreeInstance_NoGarbledGlyph(t *testing.T) {
 	l.AddInstance(inst)
 	l.SetSize(80, 40)
 
-	out := l.String()
-	require.NotContains(t, out, branchIcon, "no worktree means no branch to show a branch icon for")
+	out := ansi.Strip(l.String())
+	require.NotContains(t, out, " · ", "no worktree means no branch suffix to show at all")
 }
 
 // TestRender_UndeterminedContextFill_ShowsNothingNotNA is the OWN ROW
