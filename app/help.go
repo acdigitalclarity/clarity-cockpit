@@ -40,6 +40,7 @@ func (h helpTypeGeneral) toContent() string {
 		"A terminal UI that manages multiple Claude Code (and other local agents) in separate workspaces.",
 		"",
 		headerStyle.Render("Managing:"),
+		descStyle.Render("             Instances shows one line per seat with a live lane - the figure is that seat's per-seat maximum, not a sum"),
 		keyStyle.Render("n")+descStyle.Render("         - Create a new session"),
 		keyStyle.Render("N")+descStyle.Render("         - Create a new session with a prompt"),
 		keyStyle.Render("D")+descStyle.Render("         - Kill (delete) the selected session"),

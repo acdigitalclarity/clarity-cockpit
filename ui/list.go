@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"image/color"
+	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/lipgloss/v2"
@@ -89,6 +91,23 @@ var externalRowStyle = lipgloss.NewStyle().
 var externalRowSelectedStyle = lipgloss.NewStyle().
 	Background(laneRowSelectedBg).
 	Foreground(laneRowSelectedFg)
+
+// modalityHeadingStyle is a modality group heading's own style (slice 5
+// item 1) - bold, the same muted grey externalTitleStyle already uses for
+// "External lanes", but with NO padding: FRONTDOOR-MOCKUP-164x45.md screen
+// 4 draws a group heading directly against the row above it, no blank
+// line, unlike externalTitleStyle's own top Padding(1) (that heading is a
+// one-off divider between the whole tracked and external blocks, not a
+// heading repeated once per group).
+var modalityHeadingStyle = lipgloss.NewStyle().
+	Bold(true).
+	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#5a5a5a"), Dark: lipgloss.Color("#999999")})
+
+// fleetLineStyle is the per-seat fleet line's own style (slice 5 item 3) -
+// muted like needsYouLineStyle: plain informational text under the
+// "Instances" title, never a heading and never selectable.
+var fleetLineStyle = lipgloss.NewStyle().
+	Foreground(compat.AdaptiveColor{Light: lipgloss.Color("#5a5a5a"), Dark: lipgloss.Color("#aaaaaa")})
 
 // laneRowMarkerStyle draws the ▌ marker rule 2 gives every selected row -
 // "a left marker ▌ in the accent (the splash teal used for CLAUDE tags)",
@@ -235,6 +254,41 @@ func laneSuffixWidth(showWord, showTime bool) int {
 	return w
 }
 
+// laneTagFieldWidth is the seat-tag column's own width (slice 5 item 2,
+// FRONTDOOR-SPEC.md "The list": "The account tag costs three columns...
+// the name field keeps its full 20") - three columns, left-justified,
+// blank when the row carries no tag text at all.
+const laneTagFieldWidth = 3
+
+// laneTagGapWidth is the pct-to-glyph gap when the tag column is showing -
+// one column narrower than the plain two-space gap laneRowSuffix uses
+// without it (the spec's own "the tag takes one of the two spaces before
+// the glyph"). Reverse-engineered against FRONTDOOR-MOCKUP-164x45.md screen
+// 4's own byte positions (this leg's report): the tag sits directly after
+// the row's existing name-to-pct separator, the pct field itself keeps its
+// full right-justified width, and it is this gap that narrows to make room.
+const laneTagGapWidth = 1
+
+// laneTagNetCost is the tag column's own net width cost against a row's
+// total budget once the gap it narrows is credited back - laneTagFieldWidth
+// minus the one column laneTagGapWidth reclaims from the ordinary two-space
+// gap.
+const laneTagNetCost = laneTagFieldWidth - (2 - laneTagGapWidth)
+
+// laneShowTagMinWidth reserves the tag column only when the row's own name
+// column would sit at its full, untruncated laneNameColMax (20) anyway -
+// "the name field keeps its full 20": below this rowInner budget the tag
+// drops entirely rather than steal room from an already-shrinking name
+// column. Verified against FRONTDOOR-MOCKUP-164x45.md's own 120-column
+// screen, which carries no tag column at all.
+var laneShowTagMinWidth = laneNameColMax + laneSuffixWidth(true, true) + laneTagNetCost
+
+// laneShowTag reports whether a row built from a rowInner budget this wide
+// carries the seat-tag column.
+func laneShowTag(rowInner int) bool {
+	return rowInner >= laneShowTagMinWidth
+}
+
 // lanePctField renders a lane's bare "NN%" right-justified within a
 // fixed-width field, so the trailing "%" always lands in the same column
 // regardless of how many digits the percentage has (item 1's "ctx
@@ -250,17 +304,31 @@ func lanePctField(pct int, ok bool) string {
 }
 
 // laneRowSuffix renders the fixed-width tail every lane row (tracked or
-// external) shares: right-aligned ctx, the state glyph (and word, unless
-// collapsed), then the last-turn time (unless the row is too narrow to
-// carry it - laneShowTime) - the FINISH defect's "one table" requirement.
-// Every segment carries rowBg/rowFg forward explicitly (the same technique
-// laneRowMarker and laneRowFrame below use for the rest of the row) so the
-// glyph's own state colour does not reset the row's selected-highlight
-// background for the characters after it.
-func laneRowSuffix(rowBg, rowFg color.Color, pct int, fillOK bool, state string, lastTurn time.Time, turnOK bool, showWord, showTime bool) string {
+// external) shares: the seat tag when showTag is set (slice 5 item 2, muted
+// grey, blank field when tag is ""), right-aligned ctx, the state glyph
+// (and word, unless collapsed), then the last-turn time (unless the row is
+// too narrow to carry it - laneShowTime) - the FINISH defect's "one table"
+// requirement. Every segment carries rowBg/rowFg forward explicitly (the
+// same technique laneRowMarker and laneRowFrame below use for the rest of
+// the row) so the glyph's own state colour does not reset the row's
+// selected-highlight background for the characters after it.
+func laneRowSuffix(rowBg, rowFg color.Color, tag string, showTag bool, pct int, fillOK bool, state string, lastTurn time.Time, turnOK bool, showWord, showTime bool) string {
 	plain := lipgloss.NewStyle().Background(rowBg).Foreground(rowFg)
 	glyph, glyphStyle := laneStateGlyph(state)
 	glyphStyle = glyphStyle.Background(rowBg)
+
+	// The tag column, when present, narrows the ordinary two-space
+	// pct-to-glyph gap to one column (laneTagGapWidth) rather than the pct
+	// field itself, which keeps its own full right-justified width either
+	// way (laneShowTagMinWidth's own derivation).
+	var tagSeg string
+	gapWidth := 2
+	if showTag {
+		tagStyle := externalRowStyle.Background(rowBg)
+		tagField := runewidth.FillRight(ansiTruncateRow(tag, laneTagFieldWidth), laneTagFieldWidth)
+		tagSeg = tagStyle.Render(tagField)
+		gapWidth = laneTagGapWidth
+	}
 
 	pctSeg := plain.Render(lanePctField(pct, fillOK))
 
@@ -288,7 +356,7 @@ func laneRowSuffix(rowBg, rowFg color.Color, pct int, fillOK bool, state string,
 	// a black gap on a selected (highlighted) row. Rendering the separators
 	// through the same plain style keeps the whole suffix one continuous
 	// rowBg band with no un-styled character in it.
-	return plain.Render(" ") + pctSeg + plain.Render("  ") + glyphStyle.Render(glyph) + wordSeg + timeSeg
+	return plain.Render(" ") + tagSeg + pctSeg + plain.Render(strings.Repeat(" ", gapWidth)) + glyphStyle.Render(glyph) + wordSeg + timeSeg
 }
 
 // laneRowMarker returns the styled single-column cell every selectable row
@@ -402,12 +470,26 @@ type List struct {
 	// terminal is collapsed or not, so l.width alone cannot tell the two
 	// apart.
 	collapsed bool
+
+	// accountsRegistry mirrors clarity.LoadAccountsRegistry()'s own tag ->
+	// config_dir map (slice 5 item 3) - loaded once per feed tick by app.go
+	// and pushed here via SetAccountsRegistry, never read by String()
+	// itself, the same push convention SetExternal/SetNeedsYou already
+	// follow. Only the tag SET matters to the fleet line below; the config
+	// dir values are not read here.
+	accountsRegistry map[string]string
 }
 
 // SetCollapsed records whether the terminal itself is below
 // app.go's collapsePreviewBelowWidth threshold.
 func (l *List) SetCollapsed(collapsed bool) {
 	l.collapsed = collapsed
+}
+
+// SetAccountsRegistry replaces the registry.json seat-tag set the fleet
+// line under "Instances" reads on the next render (slice 5 item 3).
+func (l *List) SetAccountsRegistry(registry map[string]string) {
+	l.accountsRegistry = registry
 }
 
 // SetAnsweredIssues replaces the answered-marker set the needsYou row
@@ -665,7 +747,7 @@ func (r *InstanceRenderer) setWidth(width int) {
 	r.width = width
 }
 
-func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, hasMultipleRepos bool, showWord bool) string {
+func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, hasMultipleRepos bool, showWord bool, showTag bool) string {
 	prefix := fmt.Sprintf("%d. ", idx)
 	if idx >= 10 {
 		prefix = prefix[:len(prefix)-1]
@@ -723,10 +805,186 @@ func (r *InstanceRenderer) Render(i *session.Instance, idx int, selected bool, h
 		// real state underneath).
 		state = clarity.StateNeedsKey
 	}
-	suffix := laneRowSuffix(rowBg, rowFg, pct, fillOK, state, lastTurn, turnOK, showWord, laneShowTime(rowInner))
+	suffix := laneRowSuffix(rowBg, rowFg, i.Account(), showTag, pct, fillOK, state, lastTurn, turnOK, showWord, laneShowTime(rowInner))
 
 	content := nameStyle.Render(base) + branchStyle.Render(branchSuffix) + plain.Render(pad) + suffix
 	return laneRowFrame(rowBg, rowFg, selected, ansiTruncateRow(content, rowInner))
+}
+
+// externalRowTag is the seat-tag TEXT an external lane's row shows (slice 5
+// item 2) - the bare seat, never SeatTag's own "<tag> <source>" bracket
+// text (that belongs to lane-tail/discover, not this row): a "default
+// folder" lane (resolveSeat's own unlogged-in-default floor) shows no tag
+// at all; every other source shows the seat alone.
+func externalRowTag(lane clarity.ExternalLane) string {
+	if lane.Account == "default" && lane.SeatSource == clarity.SeatSourceFolder {
+		return ""
+	}
+	return lane.Account
+}
+
+// modalityHeading title-cases just the first rune of a declared modality
+// value for its bare group-heading string ("app pipeline" -> "App
+// pipeline", "ways of working" -> "Ways of working") - the value itself,
+// never a fixed vocabulary table, since a heading exists for whatever
+// modality a lane actually declares (FRONTDOOR-MOCKUP-164x45.md screen 4's
+// own "Ways of working" heading is not one of the four forge/project/bid/
+// enhancement buckets the modality picker also offers).
+func modalityHeading(modality string) string {
+	if modality == "" {
+		return ""
+	}
+	r := []rune(modality)
+	r[0] = unicode.ToUpper(r[0])
+	return string(r)
+}
+
+// laneGroup is one modality bucket's own row set for String()'s grouped
+// render (slice 5 item 1): the tracked-instance and external-lane indices
+// (into l.items/l.external, in their own existing order) that carry this
+// modality. modality is "" for the trailing catch-all bucket, which keeps
+// today's plain, un-headed presentation for both row kinds (a tracked row
+// with no heading at all, an external row under the old "External lanes
+// (message only)" title) rather than a bare heading of its own.
+type laneGroup struct {
+	modality    string
+	itemIdx     []int
+	externalIdx []int
+}
+
+// groupLanesByModality buckets tracked instances and external lanes by
+// their own declared Modality()/Modality, in FIRST-SEEN order scanning the
+// tracked instances first, then the external lanes. This is what makes
+// FRONTDOOR-MOCKUP-164x45.md screen 4's own heading order (Ways of working,
+// App pipeline, Enhancement, Project, Bid) fall out of the fleet's own item
+// order, rather than a fixed canonical list this fork would have to keep in
+// step with the modality picker's own five rows by hand - the two do not
+// actually agree on order (see this leg's report), and the drawing is the
+// bar. Lanes with no modality declared land in one trailing, un-headed
+// catch-all group, always the last element of the returned slice.
+func groupLanesByModality(items []*session.Instance, external []clarity.ExternalLane) []laneGroup {
+	order := make([]string, 0, 4)
+	index := make(map[string]int, 4)
+	for _, it := range items {
+		m := it.Modality()
+		if m == "" {
+			continue
+		}
+		if _, ok := index[m]; !ok {
+			index[m] = len(order)
+			order = append(order, m)
+		}
+	}
+	for _, ext := range external {
+		m := ext.Modality
+		if m == "" {
+			continue
+		}
+		if _, ok := index[m]; !ok {
+			index[m] = len(order)
+			order = append(order, m)
+		}
+	}
+
+	groups := make([]laneGroup, len(order)+1)
+	for i, m := range order {
+		groups[i].modality = m
+	}
+	catchAll := len(order)
+
+	for i, it := range items {
+		g := catchAll
+		if m := it.Modality(); m != "" {
+			g = index[m]
+		}
+		groups[g].itemIdx = append(groups[g].itemIdx, i)
+	}
+	for i, ext := range external {
+		g := catchAll
+		if m := ext.Modality; m != "" {
+			g = index[m]
+		}
+		groups[g].externalIdx = append(groups[g].externalIdx, i)
+	}
+	return groups
+}
+
+// renderExternalRow renders one external-lane row (message-only: no diff
+// stats, no branch, no attach/kill affordance) - shared by every modality
+// group's own external members and by the trailing catch-all's "External
+// lanes (message only)" block, so the two paths can never drift out of step
+// on column layout.
+func (l *List) renderExternalRow(lane clarity.ExternalLane, selected, showWord, showTag bool, innerWidth int) string {
+	style := externalRowStyle
+	if selected {
+		style = externalRowSelectedStyle
+	}
+	rowBg, rowFg := style.GetBackground(), style.GetForeground()
+	plain := lipgloss.NewStyle().Background(rowBg).Foreground(rowFg)
+	nameStyle := plain
+	if selected {
+		nameStyle = nameStyle.Bold(true)
+	}
+	// Pad (or truncate) the name to a fixed column first, so every row's
+	// suffix lines up regardless of how long an individual lane name is -
+	// then truncate the WHOLE row to the list's inner width, since a name
+	// near the column width plus the fixed suffix can still run past a
+	// narrow terminal.
+	nameCol := l.laneNameColWidth(showWord)
+	name := runewidth.FillRight(ansiTruncateRow(lane.Name, nameCol), nameCol)
+	suffix := laneRowSuffix(rowBg, rowFg, externalRowTag(lane), showTag,
+		lane.Fill.Pct, lane.FillOK, lane.State, lane.LastTurn, lane.StateOK, showWord, laneShowTime(innerWidth))
+	line := nameStyle.Render(name) + suffix
+	content := ansiTruncateRow(line, innerWidth)
+	return laneRowFrame(rowBg, rowFg, selected, content)
+}
+
+// fleetLine renders the per-seat fill line under "Instances" (slice 5 item
+// 3): "<tag> <pct>%" for every registry seat with at least one live lane
+// (a tracked instance or external lane whose own Account matches it),
+// joined by " · ", sorted by tag for a stable render. The figure is the
+// MAXIMUM context fill across that seat's own lanes - research finding F7,
+// "the harness sums nothing" - never their sum; a seat with no live lane at
+// all is omitted rather than shown at 0%. "" when no registry has been set
+// (SetAccountsRegistry never called, or the registry is empty) - the line
+// itself is then dropped, never rendered blank.
+func (l *List) fleetLine() string {
+	if len(l.accountsRegistry) == 0 {
+		return ""
+	}
+	tags := make([]string, 0, len(l.accountsRegistry))
+	for tag := range l.accountsRegistry {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+
+	parts := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		maxPct := 0
+		live := false
+		for _, inst := range l.items {
+			if inst.Account() != tag {
+				continue
+			}
+			live = true
+			if pct, ok := inst.GetContextFill(); ok && pct > maxPct {
+				maxPct = pct
+			}
+		}
+		for _, ext := range l.external {
+			if ext.Account != tag {
+				continue
+			}
+			live = true
+			if ext.FillOK && ext.Fill.Pct > maxPct {
+				maxPct = ext.Fill.Pct
+			}
+		}
+		if live {
+			parts = append(parts, fmt.Sprintf("%s %d%%", tag, maxPct))
+		}
+	}
+	return strings.Join(parts, " · ")
 }
 
 func (l *List) String() string {
@@ -754,6 +1012,18 @@ func (l *List) String() string {
 	}
 
 	header.WriteString("\n")
+	// The per-seat fleet line (slice 5 item 3) sits directly under the
+	// title, no blank line either side, per FRONTDOOR-MOCKUP-164x45.md
+	// screen 4's rows 4-6 (Instances, fleet line, Needs you all adjacent).
+	// When there is nothing to show (no registry loaded, or no seat
+	// qualifies) this writes nothing, leaving the ORIGINAL "\n\n" - one
+	// blank line under the title - exactly as before slice 5.
+	if fleet := l.fleetLine(); fleet != "" {
+		rowBg, rowFg := fleetLineStyle.GetBackground(), fleetLineStyle.GetForeground()
+		plain := lipgloss.NewStyle().Background(rowBg).Foreground(rowFg)
+		content := plain.Render(ansiTruncateRow(fleet, l.rowInnerWidth()))
+		header.WriteString(laneRowFrame(rowBg, rowFg, false, content))
+	}
 	header.WriteString("\n")
 
 	// Render the list (Instances, then External lanes) FIRST, into its own
@@ -762,23 +1032,57 @@ func (l *List) String() string {
 	// the Needs-you feed, only the Needs-you section itself does (below).
 	// showWord is item 1's "below 100 columns drop the word, keep the
 	// glyph" - one decision per render pass, shared by every tracked and
-	// external row alike (item 4's "one table"). One row per lane, no
-	// blank line between them (rule 1: "no spacer rows" - the owner's own
-	// screenshot showed four instances taking twenty rows).
+	// external row alike (item 4's "one table"). showTag is slice 5 item
+	// 2's own collapse point, dropping the whole seat-tag column below 120
+	// columns (laneShowTagMinWidth). One row per lane, no blank line
+	// between them (rule 1: "no spacer rows" - the owner's own screenshot
+	// showed four instances taking twenty rows).
 	innerWidth := l.rowInnerWidth()
 	showWord := !l.collapsed
+	showTag := laneShowTag(innerWidth)
 	var rest strings.Builder
-	for i, item := range l.items {
-		selected := !l.selExternal && !l.selNeedsYou && i == l.selectedIdx
-		rest.WriteString(l.renderer.Render(item, i+1, selected, len(l.repos) > 1, showWord))
+
+	// Group both tracked instances and external lanes by modality (slice 5
+	// item 1) - groupLanesByModality's own doc comment explains the order.
+	// The trailing element is always the no-modality catch-all.
+	groups := groupLanesByModality(l.items, l.external)
+	namedGroups := groups[:len(groups)-1]
+	catchAll := groups[len(groups)-1]
+
+	for _, g := range namedGroups {
+		if len(g.itemIdx) == 0 && len(g.externalIdx) == 0 {
+			continue
+		}
+		rest.WriteString(modalityHeadingStyle.Render(" " + modalityHeading(g.modality) + " "))
+		rest.WriteString("\n")
+		for _, idx := range g.itemIdx {
+			item := l.items[idx]
+			selected := !l.selExternal && !l.selNeedsYou && idx == l.selectedIdx
+			rest.WriteString(l.renderer.Render(item, idx+1, selected, len(l.repos) > 1, showWord, showTag))
+			rest.WriteString("\n")
+		}
+		for _, idx := range g.externalIdx {
+			selected := l.selExternal && idx == l.selectedIdx
+			rest.WriteString(l.renderExternalRow(l.external[idx], selected, showWord, showTag, innerWidth))
+			rest.WriteString("\n")
+		}
+	}
+
+	// The catch-all's own tracked rows keep today's plain presentation: no
+	// heading at all, directly under "Instances".
+	for _, idx := range catchAll.itemIdx {
+		item := l.items[idx]
+		selected := !l.selExternal && !l.selNeedsYou && idx == l.selectedIdx
+		rest.WriteString(l.renderer.Render(item, idx+1, selected, len(l.repos) > 1, showWord, showTag))
 		rest.WriteString("\n")
 	}
 
-	// Render the external lanes - live on this Mac but not tracked here
-	// (see clarity.DiscoverExternalLanes). Message-only: no diff stats, no
+	// The catch-all's own external lanes keep today's "External lanes
+	// (message only)" heading - live on this Mac but not tracked here (see
+	// clarity.DiscoverExternalLanes). Message-only: no diff stats, no
 	// branch, no attach/kill affordance, because none of that exists for a
 	// lane with no tracked tmux session or git worktree.
-	if len(l.external) > 0 {
+	if len(catchAll.externalIdx) > 0 {
 		// externalTitleStyle carries its own top Padding(1) - that IS the
 		// rule 1 blank line between the tracked-instance block and this
 		// heading (a second, explicit "\n" here on top of it was the old
@@ -786,30 +1090,9 @@ func (l *List) String() string {
 		// stacking into the owner's screenshot).
 		rest.WriteString(externalTitleStyle.Render(" External lanes (message only) "))
 		rest.WriteString("\n")
-		for i, lane := range l.external {
-			selected := l.selExternal && i == l.selectedIdx
-			style := externalRowStyle
-			if selected {
-				style = externalRowSelectedStyle
-			}
-			rowBg, rowFg := style.GetBackground(), style.GetForeground()
-			plain := lipgloss.NewStyle().Background(rowBg).Foreground(rowFg)
-			nameStyle := plain
-			if selected {
-				nameStyle = nameStyle.Bold(true)
-			}
-			// Pad (or truncate) the name to a fixed column first, so every
-			// row's suffix lines up regardless of how long an individual
-			// lane name is - then truncate the WHOLE row to the list's
-			// inner width, since a name near the column width plus the
-			// fixed suffix can still run past a narrow terminal.
-			nameCol := l.laneNameColWidth(showWord)
-			name := runewidth.FillRight(ansiTruncateRow(lane.Name, nameCol), nameCol)
-			suffix := laneRowSuffix(rowBg, rowFg,
-				lane.Fill.Pct, lane.FillOK, lane.State, lane.LastTurn, lane.StateOK, showWord, laneShowTime(innerWidth))
-			line := nameStyle.Render(name) + suffix
-			content := ansiTruncateRow(line, innerWidth)
-			rest.WriteString(laneRowFrame(rowBg, rowFg, selected, content))
+		for _, idx := range catchAll.externalIdx {
+			selected := l.selExternal && idx == l.selectedIdx
+			rest.WriteString(l.renderExternalRow(l.external[idx], selected, showWord, showTag, innerWidth))
 			rest.WriteString("\n")
 		}
 	}
