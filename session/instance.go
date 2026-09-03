@@ -59,6 +59,15 @@ type Instance struct {
 	// no diff, and cannot be paused/resumed/pushed/checked out.
 	NoWorktree bool
 
+	// account and modality are the seat identity FRONTDOOR-SPEC.md's "The
+	// store" section adds (slice 4) - unexported, with accessors below, so
+	// every existing direct-field caller of Instance (Title, Path, ...)
+	// stays exactly as it was and this pair is the only part of the store
+	// identity that goes through a method. An empty account is itself a
+	// valid seat (today's lanes).
+	account  string
+	modality string
+
 	// DiffStats stores the current git diff statistics
 	diffStats *git.DiffStats
 
@@ -111,6 +120,8 @@ func (i *Instance) ToInstanceData() InstanceData {
 		Program:    i.Program,
 		AutoYes:    i.AutoYes,
 		NoWorktree: i.NoWorktree,
+		Account:    i.account,
+		Modality:   i.modality,
 	}
 
 	// Only include worktree data if gitWorktree is initialized
@@ -150,6 +161,8 @@ func FromInstanceData(data InstanceData) (*Instance, error) {
 		UpdatedAt:  data.UpdatedAt,
 		Program:    data.Program,
 		NoWorktree: data.NoWorktree,
+		account:    data.Account,
+		modality:   data.Modality,
 		diffStats: &git.DiffStats{
 			Added:   data.DiffStats.Added,
 			Removed: data.DiffStats.Removed,
@@ -198,6 +211,12 @@ type InstanceOptions struct {
 	// NoWorktree is true for instances that run directly in Path with no git
 	// worktree of their own. See Instance.NoWorktree.
 	NoWorktree bool
+	// Account is the seat tag this instance registers under (e.g.
+	// "team-b"). Empty is itself a valid seat (today's lanes).
+	Account string
+	// Modality is the lane's declared or autodetected modality (e.g.
+	// "bid", "enhancement"). Empty when unknown.
+	Modality string
 }
 
 func NewInstance(opts InstanceOptions) (*Instance, error) {
@@ -221,7 +240,31 @@ func NewInstance(opts InstanceOptions) (*Instance, error) {
 		AutoYes:        false,
 		selectedBranch: opts.Branch,
 		NoWorktree:     opts.NoWorktree,
+		account:        opts.Account,
+		modality:       opts.Modality,
 	}, nil
+}
+
+// Account returns the seat tag this instance is registered under. Empty is
+// itself a valid seat (today's lanes) - see FRONTDOOR-SPEC.md "The store".
+func (i *Instance) Account() string {
+	return i.account
+}
+
+// SetAccount sets the seat tag this instance is registered under.
+func (i *Instance) SetAccount(account string) {
+	i.account = account
+}
+
+// Modality returns the instance's declared or autodetected modality (e.g.
+// "bid", "enhancement"). Empty when unknown.
+func (i *Instance) Modality() string {
+	return i.modality
+}
+
+// SetModality sets the instance's modality.
+func (i *Instance) SetModality(modality string) {
+	i.modality = modality
 }
 
 func (i *Instance) RepoName() (string, error) {
