@@ -64,6 +64,7 @@ func (h helpTypeGeneral) toContent() string {
 		"",
 		headerStyle.Render("Deciding and closing out:"),
 		keyStyle.Render("y")+descStyle.Render("         - Answer a Needs-you row with its own recommended response, then comment the board row"),
+		descStyle.Render("             (m on a Needs-you row does the same for typed text) - the comment posts, the board issue closes, and the row leaves the list at once"),
 		keyStyle.Render("b")+descStyle.Render("         - Bank and close a lane: sends the standard bank line, then shows the CONTINUATION path once written"),
 		descStyle.Render("             The permission-prompt state word (◆ needs a key) only ever appears for a lane the cockpit started -"),
 		descStyle.Render("             a lane running in your own terminal has no tmux pane for the cockpit to sample"),

@@ -446,6 +446,37 @@ func (l *List) SetNeedsYou(items []clarity.FeedItem, status string) {
 	}
 }
 
+// RemoveNeedsYouIssue drops the Needs-you row sourced from board issue n
+// from the CURRENTLY held feed slice (this is the row-removal rule: "removes the row
+// from the list on the same tick, without waiting for the feed rebuild") -
+// called the instant a close lands, rather than waiting for the next feed
+// tick's SetNeedsYou to rebuild the section. Clamps the cursor exactly the
+// way SetNeedsYou already does when the queue shrinks out from under the
+// current selection. Returns false when no row carries n (already removed,
+// or never a board row at all).
+func (l *List) RemoveNeedsYouIssue(n int) bool {
+	idx := -1
+	for i, it := range l.needsYou {
+		if issue, ok := clarity.BoardIssueNumber(it.Source); ok && issue == n {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return false
+	}
+	l.needsYou = append(l.needsYou[:idx], l.needsYou[idx+1:]...)
+	if l.selNeedsYou {
+		if len(l.needsYou) == 0 {
+			l.selNeedsYou = false
+			l.selectedIdx = 0
+		} else if l.selectedIdx >= len(l.needsYou) {
+			l.selectedIdx = len(l.needsYou) - 1
+		}
+	}
+	return true
+}
+
 // SetExternal replaces the external-lane rows shown below the tracked
 // instances. If the current selection was pointing into external and the
 // new list is shorter (or empty), the selection is clamped so it never
@@ -502,6 +533,13 @@ func (l *List) SetSessionPreviewSize(width, height int) (err error) {
 
 func (l *List) NumInstances() int {
 	return len(l.items)
+}
+
+// NumNeedsYou returns the number of Needs-you rows currently held - slice
+// 24's own same-tick removal (RemoveNeedsYouIssue) is proven by this count
+// dropping without waiting for a fresh SetNeedsYou.
+func (l *List) NumNeedsYou() int {
+	return len(l.needsYou)
 }
 
 // Width returns the column width SetSize last gave this list - app.go's own
@@ -696,81 +734,44 @@ func (l *List) String() string {
 	const autoYesText = " auto-yes "
 
 	// Write the title.
-	var b strings.Builder
-	b.WriteString("\n")
-	b.WriteString("\n")
+	var header strings.Builder
+	header.WriteString("\n")
+	header.WriteString("\n")
 
 	// Write title line
 	// add padding of 2 because the border on list items adds some extra characters
 	titleWidth := AdjustPreviewWidth(l.width) + 2
 	if !l.autoyes {
-		b.WriteString(lipgloss.Place(
+		header.WriteString(lipgloss.Place(
 			titleWidth, 1, lipgloss.Left, lipgloss.Bottom, mainTitle.Render(titleText)))
 	} else {
 		title := lipgloss.Place(
 			titleWidth/2, 1, lipgloss.Left, lipgloss.Bottom, mainTitle.Render(titleText))
 		autoYes := lipgloss.Place(
 			titleWidth-(titleWidth/2), 1, lipgloss.Right, lipgloss.Bottom, autoYesStyle.Render(autoYesText))
-		b.WriteString(lipgloss.JoinHorizontal(
+		header.WriteString(lipgloss.JoinHorizontal(
 			lipgloss.Top, title, autoYes))
 	}
 
-	b.WriteString("\n")
-	b.WriteString("\n")
+	header.WriteString("\n")
+	header.WriteString("\n")
 
-	// Render the "Needs you" feed, once per feed tick (see app.go) - never
-	// a bare empty section when the queue is absent, per the brief. Every
-	// row is truncated to the list's own inner width first (the OVERFLOW
-	// defect: a feed row can run to 100+ characters, and nothing downstream
-	// clips it back down). Rows are selectable (slice 5): the current one
-	// carries the same highlight style external rows already use.
+	// Render the list (Instances, then External lanes) FIRST, into its own
+	// block - the Instances and External sections keep
+	// their place below": these two never scroll or shrink to make room for
+	// the Needs-you feed, only the Needs-you section itself does (below).
+	// showWord is item 1's "below 100 columns drop the word, keep the
+	// glyph" - one decision per render pass, shared by every tracked and
+	// external row alike (item 4's "one table"). One row per lane, no
+	// blank line between them (rule 1: "no spacer rows" - the owner's own
+	// screenshot showed four instances taking twenty rows).
 	innerWidth := l.rowInnerWidth()
-	if len(l.needsYou) > 0 || l.needsYouStatus != "" {
-		b.WriteString(needsYouTitleStyle.Render(" Needs you "))
-		b.WriteString("\n")
-		if l.needsYouStatus != "" {
-			rowBg, rowFg := needsYouLineStyle.GetBackground(), needsYouLineStyle.GetForeground()
-			plain := lipgloss.NewStyle().Background(rowBg).Foreground(rowFg)
-			content := plain.Render(ansiTruncateRow(l.needsYouStatus, innerWidth))
-			b.WriteString(laneRowFrame(rowBg, rowFg, false, content))
-			b.WriteString("\n")
-		}
-		for i, item := range l.needsYou {
-			selected := l.selNeedsYou && i == l.selectedIdx
-			style := needsYouLineStyle
-			if selected {
-				style = needsYouLineSelectedStyle
-			}
-			answered := l.isAnsweredItem(item)
-			if answered {
-				// Ticked and dimmed (ANSWER-AND-BANK-SPEC.md) - the row's own
-				// selected/unselected background is kept, only the foreground
-				// dims to the shared muted tone.
-				style = style.Foreground(sessionMutedStyle.GetForeground())
-			}
-			rowBg, rowFg := style.GetBackground(), style.GetForeground()
-			plain := lipgloss.NewStyle().Background(rowBg).Foreground(rowFg)
-			text := clarity.FeedLine(item)
-			if answered {
-				text = "✓ " + text
-			}
-			content := plain.Render(ansiTruncateRow(text, innerWidth))
-			b.WriteString(laneRowFrame(rowBg, rowFg, selected, content))
-			b.WriteString("\n")
-		}
-		b.WriteString("\n")
-	}
-
-	// Render the list. showWord is item 1's "below 100 columns drop the
-	// word, keep the glyph" - one decision per render pass, shared by every
-	// tracked and external row alike (item 4's "one table"). One row per
-	// lane, no blank line between them (rule 1: "no spacer rows" - the
-	// owner's own screenshot showed four instances taking twenty rows).
 	showWord := !l.collapsed
+	var rest strings.Builder
 	for i, item := range l.items {
 		selected := !l.selExternal && !l.selNeedsYou && i == l.selectedIdx
-		b.WriteString(l.renderer.Render(item, i+1, selected, len(l.repos) > 1, showWord))
-		b.WriteString("\n")
+		rest.WriteString(l.renderer.Render(item, i+1, selected, len(l.repos) > 1, showWord))
+		rest.WriteString("\n")
 	}
 
 	// Render the external lanes - live on this Mac but not tracked here
@@ -783,8 +784,8 @@ func (l *List) String() string {
 		// heading (a second, explicit "\n" here on top of it was the old
 		// "\n\n" spacer bug's own other half: two blank-line sources
 		// stacking into the owner's screenshot).
-		b.WriteString(externalTitleStyle.Render(" External lanes (message only) "))
-		b.WriteString("\n")
+		rest.WriteString(externalTitleStyle.Render(" External lanes (message only) "))
+		rest.WriteString("\n")
 		for i, lane := range l.external {
 			selected := l.selExternal && i == l.selectedIdx
 			style := externalRowStyle
@@ -808,15 +809,25 @@ func (l *List) String() string {
 				lane.Fill.Pct, lane.FillOK, lane.State, lane.LastTurn, lane.StateOK, showWord, laneShowTime(innerWidth))
 			line := nameStyle.Render(name) + suffix
 			content := ansiTruncateRow(line, innerWidth)
-			b.WriteString(laneRowFrame(rowBg, rowFg, selected, content))
-			b.WriteString("\n")
+			rest.WriteString(laneRowFrame(rowBg, rowFg, selected, content))
+			rest.WriteString("\n")
 		}
 	}
 
+	// The Needs-you feed's own budget is whatever l.height leaves once the
+	// header and the (never-shrinking) rest block above are accounted for -
+	// see renderNeedsYouBlock's own doc comment for how that budget is
+	// spent (every row when it fits, a scrolled window with "… N more"
+	// markers when it does not).
+	budget := l.height - strings.Count(header.String(), "\n") - strings.Count(rest.String(), "\n")
+	needsYouBlock := l.renderNeedsYouBlock(budget, innerWidth)
+
+	content := header.String() + needsYouBlock + rest.String()
+
 	// Cap the block to l.height before handing it to Place: with the "Needs
 	// you" feed, every tracked instance and a full external-lane section
-	// all present at once, the natural content height can exceed l.height
-	// on a short terminal (24 rows, say) - and lipgloss.Place's own
+	// all present at once, the natural content height can still exceed
+	// l.height by a line or two of rounding - and lipgloss.Place's own
 	// documented behaviour is a no-op ("If the given height is shorter
 	// than the content height... this will be a noöp") rather than a
 	// crop, so an unenforced budget here let the list's block grow past
@@ -827,7 +838,6 @@ func (l *List) String() string {
 	// last, message-only), so they are what a tight terminal loses first;
 	// cutting on whole lines (never mid-row) keeps every ANSI style
 	// sequence intact.
-	content := b.String()
 	if l.height > 0 {
 		lines := strings.Split(content, "\n")
 		if len(lines) > l.height {
@@ -836,6 +846,140 @@ func (l *List) String() string {
 	}
 
 	return lipgloss.Place(l.width, l.height, lipgloss.Left, lipgloss.Top, content)
+}
+
+// renderNeedsYouBlock draws the "Needs you" section within budget lines
+// (title + rows/status + one trailing blank, matching the fixed section
+// this replaces) - never a bare empty section when the queue is absent
+// (l.needsYouStatus), per the brief. Every row is truncated to width first
+// (the OVERFLOW defect: a feed row can run to 100+ characters). When every
+// row fits within budget they all render, in feed order (every feed row
+// renders now, never a fixed five-row cap); when they do not, the section
+// SCROLLS instead of truncating - the window always includes the current
+// selection, and a
+// one-line "… N more" marker (styled like the section title) appears at
+// whichever edge (or edges) still hides rows.
+func (l *List) renderNeedsYouBlock(budget, width int) string {
+	if len(l.needsYou) == 0 && l.needsYouStatus == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(needsYouTitleStyle.Render(" Needs you "))
+	b.WriteString("\n")
+
+	rowsBudget := budget - 2 // this block's own title line + trailing blank
+	if l.needsYouStatus != "" {
+		rowsBudget--
+	}
+
+	if l.needsYouStatus != "" {
+		rowBg, rowFg := needsYouLineStyle.GetBackground(), needsYouLineStyle.GetForeground()
+		plain := lipgloss.NewStyle().Background(rowBg).Foreground(rowFg)
+		content := plain.Render(ansiTruncateRow(l.needsYouStatus, width))
+		b.WriteString(laneRowFrame(rowBg, rowFg, false, content))
+		b.WriteString("\n")
+	}
+
+	sel := 0
+	if l.selNeedsYou {
+		sel = l.selectedIdx
+	}
+	start, count, topMore, bottomMore := needsYouScrollWindow(len(l.needsYou), rowsBudget, sel)
+
+	if topMore {
+		b.WriteString(needsYouMoreMarker(start, width))
+		b.WriteString("\n")
+	}
+	for i := start; i < start+count; i++ {
+		item := l.needsYou[i]
+		selected := l.selNeedsYou && i == l.selectedIdx
+		style := needsYouLineStyle
+		if selected {
+			style = needsYouLineSelectedStyle
+		}
+		answered := l.isAnsweredItem(item)
+		if answered {
+			// Ticked and dimmed (ANSWER-AND-BANK-SPEC.md) - the row's own
+			// selected/unselected background is kept, only the foreground
+			// dims to the shared muted tone.
+			style = style.Foreground(sessionMutedStyle.GetForeground())
+		}
+		rowBg, rowFg := style.GetBackground(), style.GetForeground()
+		plain := lipgloss.NewStyle().Background(rowBg).Foreground(rowFg)
+		text := clarity.FeedLine(item)
+		if answered {
+			text = "✓ " + text
+		}
+		content := plain.Render(ansiTruncateRow(text, width))
+		b.WriteString(laneRowFrame(rowBg, rowFg, selected, content))
+		b.WriteString("\n")
+	}
+	if bottomMore {
+		b.WriteString(needsYouMoreMarker(len(l.needsYou)-(start+count), width))
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\n")
+	return b.String()
+}
+
+// needsYouMoreMarker is the "… N more" edge marker,
+// styled like the section's own title so it reads as part of the same
+// section rather than another row.
+func needsYouMoreMarker(hidden, width int) string {
+	text := fmt.Sprintf("… %d more", hidden)
+	return needsYouTitleStyle.Render(ansiTruncateRow(text, width))
+}
+
+// needsYouScrollWindow picks which of n rows are visible within budget
+// lines, given the currently selected index sel: every row when they all
+// fit (start 0, count n, no markers); otherwise a window that always
+// includes sel, shrunk by one line per edge that still hides rows so the
+// markers themselves stay inside budget. n>budget (the only case a window
+// is needed at all) means the window can touch AT MOST one edge on its
+// own - touching neither means both markers apply, so capacity is re-cut
+// to budget-2 and the window recomputed once more.
+func needsYouScrollWindow(n, budget, sel int) (start, count int, topMore, bottomMore bool) {
+	if budget <= 0 {
+		return 0, 0, false, n > 0
+	}
+	if n <= budget {
+		return 0, n, false, false
+	}
+	if sel < 0 {
+		sel = 0
+	} else if sel >= n {
+		sel = n - 1
+	}
+	start, end := needsYouClampWindow(n, budget-1, sel)
+	topMore = start > 0
+	bottomMore = end < n
+	if topMore && bottomMore {
+		start, end = needsYouClampWindow(n, budget-2, sel)
+		topMore = start > 0
+		bottomMore = end < n
+	}
+	return start, end - start, topMore, bottomMore
+}
+
+// needsYouClampWindow returns a [start, end) window of capacity rows (never
+// less than 1) that contains sel and never runs past [0, n).
+func needsYouClampWindow(n, capacity, sel int) (start, end int) {
+	if capacity < 1 {
+		capacity = 1
+	}
+	start = sel - capacity + 1
+	if start < 0 {
+		start = 0
+	}
+	if maxStart := n - capacity; maxStart >= 0 && start > maxStart {
+		start = maxStart
+	}
+	end = start + capacity
+	if end > n {
+		end = n
+	}
+	return start, end
 }
 
 // RowKind identifies which of the three selectable groups the cursor

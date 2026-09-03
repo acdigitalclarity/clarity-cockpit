@@ -138,6 +138,17 @@ func (c *Composer) Open(lane string, isExternal bool) {
 	c.confirmText = ""
 }
 
+// OpenForIssue is Open (m on a Needs-you board row, board #295) plus a
+// tagged answerIssue: identical typing-mode box, but Enter (app.go's
+// stateMsg handling) sees a non-zero AnswerIssue and routes the typed text
+// through the same two-write answer flow OpenAnswerConfirm's own enter uses
+// (post the comment, then close the issue) rather than an ordinary message
+// send with no board write.
+func (c *Composer) OpenForIssue(lane string, isExternal bool, issue int) {
+	c.Open(lane, isExternal)
+	c.answerIssue = issue
+}
+
 // OpenAnswerConfirm loads the y key's confirm strip (RULE 6): text is
 // already the card's own recommended response, AnswerText-stripped by the
 // caller - the strip shows it verbatim, unedited, until enter sends it or e

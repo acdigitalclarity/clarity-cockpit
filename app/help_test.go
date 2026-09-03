@@ -47,3 +47,14 @@ func TestHelpGeneral_NamesButterflyToggle(t *testing.T) {
 	require.Contains(t, content, "Toggle the tab-bar butterfly",
 		"B's own help line must name the butterfly toggle")
 }
+
+// TestHelpGeneral_NamesAnsweredRowLeavesAtOnce is board #295's own "help
+// says so" requirement: the general help screen states that an answered
+// row's comment closes the board issue and leaves the list at once, not
+// just that y posts a comment.
+func TestHelpGeneral_NamesAnsweredRowLeavesAtOnce(t *testing.T) {
+	content := helpTypeGeneral{}.toContent()
+
+	require.Contains(t, content, "the board issue closes, and the row leaves the list at once",
+		"the general help screen must name the answered-row-leaves-at-once rule")
+}

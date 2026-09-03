@@ -168,6 +168,22 @@ func (c *BoardCache) PostComment(n int, body string) error {
 	return nil
 }
 
+// CloseIssue closes issue n via the SAME gh api REST path contract Post-
+// Comment above uses - `gh api -X PATCH repos/<repo>/issues/<n> -f
+// state=closed` (the answered-row flow's second write, attempted
+// only once the comment has landed). A failure here never touches the
+// comment that already posted; the caller (app.go's pendingComment, tagged
+// commentDone once the comment itself is confirmed) queues a retry of this
+// call alone, never a repeat of the comment.
+func (c *BoardCache) CloseIssue(n int) error {
+	path := fmt.Sprintf("repos/%s/issues/%d", c.repo, n)
+	command := exec.Command(c.ghBin, "api", "-X", "PATCH", path, "-f", "state=closed")
+	if _, err := c.exec.Output(command); err != nil {
+		return errors.New(reasonFromExecError(err))
+	}
+	return nil
+}
+
 func (c *BoardCache) fetch(n int) BoardExplanation {
 	path := fmt.Sprintf("repos/%s/issues/%d", c.repo, n)
 	command := exec.Command(c.ghBin, "api", path)

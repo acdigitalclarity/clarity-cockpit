@@ -170,6 +170,14 @@ type home struct {
 	// (clarity.BoardRetryInterval), abandoned after 5 attempts. Memory-only
 	// - lost on quit, the foot says "pending", never "commented".
 	pendingComments map[int]*pendingComment
+	// closedIssues is the set of board issue numbers this session has
+	// already closed by REST this session - filtered out of every
+	// feed tick's needsYouItems before they reach the list, so a queue
+	// file the fleet's own build script has not yet rebuilt does not
+	// resurrect a row already removed this tick. Dropped once the rebuilt
+	// queue itself no longer carries the issue (pruneClosedIssues), the
+	// same lifetime rule answeredIssues already follows.
+	closedIssues map[int]bool
 	// bankWatch is the b-key bank flow's own CONTINUATION-*.md poll, set on
 	// a successful bank send and cleared on the first hit, on 30 minutes
 	// elapsed, or on quit - nil otherwise. Only one watch is ever live at a
@@ -572,7 +580,15 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// clarity.RankedNeedsYou's doc comment. This self-reschedules the
 		// same way previewTickMsg/tickUpdateMetadataCmd do above: message-
 		// driven, never a blocking polling loop.
-		needsYouItems, needsYouStatus := clarity.RankedNeedsYou(clarity.DefaultFeedPath(), feedTopN)
+		needsYouItems, needsYouStatus := clarity.RankedNeedsYou(clarity.DefaultFeedPath(), 0)
+		// Closed-marker lifetime mirrors the answered marker below: dropped
+		// the instant the rebuilt queue no longer carries the issue (the
+		// fleet's own queue script has caught up with the close), never
+		// before - checked against the RAW items, so a row already removed
+		// this session is not resurrected by a queue rebuild that has not
+		// caught up yet.
+		m.pruneClosedIssues(needsYouItems)
+		needsYouItems = m.filterClosedIssues(needsYouItems)
 		m.list.SetNeedsYou(needsYouItems, needsYouStatus)
 		// Answered-marker lifetime (ANSWER-AND-BANK-SPEC.md): dropped the
 		// instant the rebuilt queue no longer carries an issue, never before.
@@ -803,8 +819,19 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.answered {
 				m.markAnswered(msg.issue)
 			}
-			if msg.pendingBody != "" {
-				m.addPendingComment(msg.issue, msg.pendingBody, msg.sendResult)
+			switch {
+			case msg.closed:
+				// Comment posted and the issue closed in this same call
+				// - the row leaves the list on this tick,
+				// no tick-and-dim wait.
+				m.markClosed(msg.issue)
+			case msg.closePending:
+				// The comment posted but the close failed - queue the close
+				// alone for retry; the row keeps slice 18's tick-and-dim
+				// state until the close finally lands.
+				m.addPendingClose(msg.issue, msg.sendResult, msg.lane, msg.isExternal)
+			case msg.pendingBody != "":
+				m.addPendingComment(msg.issue, msg.pendingBody, msg.sendResult, msg.lane, msg.isExternal)
 			}
 		default:
 			m.composer.SetResult(msg.result)
@@ -817,9 +844,23 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// e.g. an owner-driven clear) - nothing to update.
 			return m, nil
 		}
-		if msg.err == nil {
+		if msg.closed {
+			// The comment (already posted, possibly on an earlier attempt)
+			// and now the close both landed - remove the row on this tick.
 			delete(m.pendingComments, msg.issue)
-			m.composer.UpdateResultIfIssue(msg.issue, fmt.Sprintf("%s · board #%d commented", msg.sendResult, msg.issue))
+			m.markClosed(msg.issue)
+			m.composer.UpdateResultIfIssue(msg.issue, msg.result)
+			return m, nil
+		}
+		if msg.closeErr != nil {
+			// The comment is confirmed posted; only the close still needs a
+			// retry - same entry, same retry cadence (RULE: "queues behind
+			// the comment in the same retry path").
+			p.commentDone = true
+			m.composer.UpdateResultIfIssue(msg.issue, fmt.Sprintf("answered #%d · close pending", msg.issue))
+			if p.attempts >= 5 {
+				delete(m.pendingComments, msg.issue)
+			}
 			return m, nil
 		}
 		if p.attempts >= 5 {
@@ -1435,6 +1476,21 @@ func (m *home) handleKeyPress(msg tea.KeyPressMsg) (mod tea.Model, cmd tea.Cmd) 
 		if !ok {
 			return m, nil
 		}
+		// Board #295: m on a NOT-yet-answered board-sourced Needs-you row
+		// tags the composer with its own issue number, so Enter posts the
+		// typed text as the board comment and closes the issue (sendAnswer-
+		// Cmd) instead of an ordinary message send that never touches the
+		// board. A lane-file-sourced row (no issue to comment on) and an
+		// already-answered row both fall through to the plain Open below,
+		// exactly as today.
+		if item, isNeedsYou := m.list.GetSelectedNeedsYou(); isNeedsYou {
+			if n, isBoard := clarity.BoardIssueNumber(item.Source); isBoard && !m.answeredIssues[n] {
+				m.composer.OpenForIssue(lane, isExternal, n)
+				m.state = stateMsg
+				m.menu.SetState(ui.StateMsg)
+				return m, nil
+			}
+		}
 		m.composer.Open(lane, isExternal)
 		m.state = stateMsg
 		m.menu.SetState(ui.StateMsg)
@@ -1902,7 +1958,7 @@ type composerResultMsg struct {
 	result string
 	err    error
 
-	// -- y-key answer flow only (issue != 0) --
+	// -- y-key answer flow / m on a Needs-you row (issue != 0) --
 	// issue is the board issue number this result belongs to.
 	issue int
 	// answered is true once the send itself succeeded - the row is marked
@@ -1918,6 +1974,18 @@ type composerResultMsg struct {
 	// Msg) can rebuild the full foot without a fresh, possibly-stale
 	// time.Now().
 	sendResult string
+	// lane/isExternal are the delivery target, carried alongside issue so a
+	// queued retry (comment or close) can rebuild the eventual "answered #N
+	// · closed · ..." footer without needing to re-resolve the row.
+	lane       string
+	isExternal bool
+	// closed is true when the comment posted AND the issue closed in this
+	// same call - Update removes the row on this tick.
+	closed bool
+	// closePending is true when the comment posted but the close itself
+	// failed - Update queues a close-only retry; the row keeps slice 18's
+	// tick-and-dim state until the close finally lands.
+	closePending bool
 
 	// -- b-key bank flow only --
 	bank    bool
@@ -1925,12 +1993,19 @@ type composerResultMsg struct {
 	bankAt  time.Time
 }
 
-// pendingComment is one board comment that failed to post, held in memory
-// for the retry queue (ANSWER-AND-BANK-SPEC.md "Ordering and retry") -
-// never persisted, lost on quit.
+// pendingComment is one board write still owed for an answered issue, held
+// in memory for the retry queue (ANSWER-AND-BANK-SPEC.md "Ordering and
+// retry" - a close failure queues behind the comment in the same retry
+// path) - never persisted, lost on quit. commentDone starts false (the
+// comment itself still needs posting) and flips true the moment a retry
+// confirms it landed - from then on only CloseIssue is retried, never a
+// second PostComment for the same reply.
 type pendingComment struct {
 	body        string
 	sendResult  string
+	lane        string
+	isExternal  bool
+	commentDone bool
 	attempts    int
 	lastAttempt time.Time
 }
@@ -1954,7 +2029,16 @@ type bankWatch struct {
 type commentRetryMsg struct {
 	issue      int
 	sendResult string
-	err        error
+	// err is non-nil when the comment post itself still failed this
+	// attempt (commentDone was false going in).
+	err error
+	// closeErr is non-nil when the comment is confirmed posted but the
+	// close attempted in the same call failed.
+	closeErr error
+	// closed is true once both the comment and the close have landed -
+	// result is the final "answered #N · closed · ..." footer.
+	closed bool
+	result string
 }
 
 // boardFetchedMsg signals that a background board-issue fetch (fetchBoard-
@@ -2043,8 +2127,11 @@ type sessionTickMsg struct{}
 // sessionTickInterval is the Latency ruling's own number, verbatim: 500ms.
 const sessionTickInterval = 500 * time.Millisecond
 
-// feedTopN is how many ranked entries the "Needs you" section shows.
-const feedTopN = 5
+// feedTopN was the "Needs you" section's own five-row cap - removed (slice
+// 24 rule 1, the owner's own "at most 5 are listed so its difficult for me
+// to get through them"): RankedNeedsYou is now called with n=0 (no cap,
+// see its own doc comment), every ranked row renders, and ui.List's own
+// render scrolls the section instead of truncating it.
 
 // metadataUpdateDoneMsg is sent when the background metadata update completes.
 type metadataUpdateDoneMsg struct {
@@ -2336,13 +2423,29 @@ func copiedIntoLanePrefix(lane string) string {
 	return fmt.Sprintf("copied · paste it in %s", lane)
 }
 
-// sendAnswerCmd is the y-key answer flow's own Enter (ANSWER-AND-BANK-
-// SPEC.md "Ordering and retry"): the reply is the act, the board comment is
-// bookkeeping - it runs the SAME send-or-copy delivery every composer flow
-// shares, then - only once that succeeds - posts the comment; a comment
-// failure never blocks or reverses the reply, it becomes a pendingComment
-// retried on the feed tick instead (test 10). A send failure posts no
-// comment at all and never marks the row answered (test 9).
+// closedFooter is the answer flow's own success footer once BOTH writes
+// have landed, verbatim: "answered #N · closed · sent
+// into <lane>" for a tracked delivery, "answered #N · closed · copied
+// (lane in your terminal)" for the copy path - the same two strings whether
+// they land on the first attempt (sendAnswerCmd) or a later retry (retry-
+// CommentCmd), so a caller never has to special-case which one produced it.
+func closedFooter(issue int, lane string, isExternal bool) string {
+	if isExternal {
+		return fmt.Sprintf("answered #%d · closed · copied (lane in your terminal)", issue)
+	}
+	return fmt.Sprintf("answered #%d · closed · sent into %s", issue, lane)
+}
+
+// sendAnswerCmd is the y-key answer flow's own Enter, and (board #295) m's
+// enter on a NOT-yet-answered board-sourced Needs-you row: the reply is the
+// act, the board comment and the issue close are bookkeeping - it runs the
+// SAME send-or-copy delivery every composer flow shares, then - only once
+// that succeeds - posts the comment, then - only once THAT succeeds - closes
+// the issue and the row leaves the list on this tick. A
+// comment failure never blocks or reverses the reply, it becomes a pending-
+// Comment retried on the feed tick instead (test 10); a close failure queues
+// behind it the same way, retried in the same entry (test (e)). A send
+// failure posts no comment at all and never marks the row answered (test 9).
 func (m *home) sendAnswerCmd(issue int, lane string, isExternal bool, text string) tea.Cmd {
 	return func() tea.Msg {
 		r := m.deliverToLane(lane, isExternal, text)
@@ -2367,12 +2470,26 @@ func (m *home) sendAnswerCmd(issue int, lane string, isExternal bool, text strin
 				answered:    true,
 				pendingBody: body,
 				sendResult:  prefix,
+				lane:        lane,
+				isExternal:  isExternal,
+			}
+		}
+		if err := m.boardCache.CloseIssue(issue); err != nil {
+			return composerResultMsg{
+				result:       fmt.Sprintf("answered #%d · close pending", issue),
+				issue:        issue,
+				answered:     true,
+				closePending: true,
+				sendResult:   prefix,
+				lane:         lane,
+				isExternal:   isExternal,
 			}
 		}
 		return composerResultMsg{
-			result:   fmt.Sprintf("%s · board #%d commented", prefix, issue),
+			result:   closedFooter(issue, lane, isExternal),
 			issue:    issue,
 			answered: true,
+			closed:   true,
 		}
 	}
 }
@@ -2491,18 +2608,89 @@ func (m *home) pruneAnsweredIssues(items []clarity.FeedItem) {
 	}
 }
 
+// markClosed is the row-removal rule's own immediate half: the row leaves
+// ui.List's needsYou slice on THIS tick, without waiting for the next feed
+// rebuild - and issue is remembered (closedIssues) so a feed tick whose
+// queue file has not yet caught up with the close does not resurrect it.
+// The answered marker is dropped too - a removed row has nothing left to
+// tick-and-dim.
+func (m *home) markClosed(issue int) {
+	if issue == 0 {
+		return
+	}
+	if m.closedIssues == nil {
+		m.closedIssues = make(map[int]bool)
+	}
+	m.closedIssues[issue] = true
+	delete(m.answeredIssues, issue)
+	m.list.SetAnsweredIssues(m.answeredIssues)
+	m.list.RemoveNeedsYouIssue(issue)
+}
+
+// pruneClosedIssues drops any closed-marker entry the rebuilt Needs-you
+// queue no longer carries - the same lifetime rule pruneAnsweredIssues
+// already follows, checked against the queue's RAW items (before filter-
+// ClosedIssues removes them), so the marker survives exactly until the
+// fleet's own queue-build script has caught up with the close.
+func (m *home) pruneClosedIssues(items []clarity.FeedItem) {
+	if len(m.closedIssues) == 0 {
+		return
+	}
+	live := make(map[int]bool, len(items))
+	for _, it := range items {
+		if n, ok := clarity.BoardIssueNumber(it.Source); ok {
+			live[n] = true
+		}
+	}
+	for n := range m.closedIssues {
+		if !live[n] {
+			delete(m.closedIssues, n)
+		}
+	}
+}
+
+// filterClosedIssues drops any row this session has already closed
+// (closedIssues) from a freshly loaded feed tick - without this, a queue
+// file the fleet's own build script has not yet rebuilt would resurrect a
+// row markClosed already removed.
+func (m *home) filterClosedIssues(items []clarity.FeedItem) []clarity.FeedItem {
+	if len(m.closedIssues) == 0 {
+		return items
+	}
+	out := make([]clarity.FeedItem, 0, len(items))
+	for _, it := range items {
+		if n, ok := clarity.BoardIssueNumber(it.Source); ok && m.closedIssues[n] {
+			continue
+		}
+		out = append(out, it)
+	}
+	return out
+}
+
 // addPendingComment queues a failed board comment for retry - attempts
 // starts at 1 (the send flow's own first attempt already happened), so the
 // retry queue below dispatches at most 4 more before abandoning at 5 total
-// (test 10).
-func (m *home) addPendingComment(issue int, body, sendResult string) {
+// (test 10). lane/isExternal are carried so a later successful retry can
+// still attempt the close and build the eventual closedFooter text.
+func (m *home) addPendingComment(issue int, body, sendResult, lane string, isExternal bool) {
 	if m.pendingComments == nil {
 		m.pendingComments = make(map[int]*pendingComment)
 	}
-	m.pendingComments[issue] = &pendingComment{body: body, sendResult: sendResult, attempts: 1, lastAttempt: time.Now()}
+	m.pendingComments[issue] = &pendingComment{body: body, sendResult: sendResult, lane: lane, isExternal: isExternal, attempts: 1, lastAttempt: time.Now()}
 }
 
-// retryPendingCommentsCmd dispatches a retry for every pending comment due
+// addPendingClose queues a failed issue close for retry - the comment
+// itself already posted (commentDone true from the start), so the retry
+// loop below only ever attempts CloseIssue for this entry, never a second
+// PostComment (test (e)).
+func (m *home) addPendingClose(issue int, sendResult, lane string, isExternal bool) {
+	if m.pendingComments == nil {
+		m.pendingComments = make(map[int]*pendingComment)
+	}
+	m.pendingComments[issue] = &pendingComment{sendResult: sendResult, lane: lane, isExternal: isExternal, commentDone: true, attempts: 1, lastAttempt: time.Now()}
+}
+
+// retryPendingCommentsCmd dispatches a retry for every pending write due
 // another attempt - never more often than clarity.BoardRetryInterval, never
 // past 5 attempts total (test 10). attempts/lastAttempt are bumped HERE, on
 // the main thread at dispatch time, not when the retry's own result comes
@@ -2519,7 +2707,7 @@ func (m *home) retryPendingCommentsCmd(now time.Time) tea.Cmd {
 		}
 		p.attempts++
 		p.lastAttempt = now
-		cmds = append(cmds, m.retryCommentCmd(issue, p.body, p.sendResult))
+		cmds = append(cmds, m.retryCommentCmd(issue, p))
 	}
 	if len(cmds) == 0 {
 		return nil
@@ -2527,13 +2715,27 @@ func (m *home) retryPendingCommentsCmd(now time.Time) tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
-func (m *home) retryCommentCmd(issue int, body, sendResult string) tea.Cmd {
+// retryCommentCmd re-attempts whichever write p still owes: the comment
+// itself when p.commentDone is still false, then - in the SAME attempt,
+// once that succeeds (or had already succeeded on an earlier attempt) - the
+// issue close. p's own fields are read into locals before the closure runs,
+// since p may be mutated (or the map entry deleted) on the main thread
+// again before this background call returns.
+func (m *home) retryCommentCmd(issue int, p *pendingComment) tea.Cmd {
+	body, sendResult, lane, isExternal, commentDone := p.body, p.sendResult, p.lane, p.isExternal, p.commentDone
 	return func() tea.Msg {
 		if m.boardCache == nil {
 			m.boardCache = clarity.NewBoardCache()
 		}
-		err := m.boardCache.PostComment(issue, body)
-		return commentRetryMsg{issue: issue, sendResult: sendResult, err: err}
+		if !commentDone {
+			if err := m.boardCache.PostComment(issue, body); err != nil {
+				return commentRetryMsg{issue: issue, sendResult: sendResult, err: err}
+			}
+		}
+		if err := m.boardCache.CloseIssue(issue); err != nil {
+			return commentRetryMsg{issue: issue, sendResult: sendResult, closeErr: err}
+		}
+		return commentRetryMsg{issue: issue, closed: true, result: closedFooter(issue, lane, isExternal)}
 	}
 }
 
