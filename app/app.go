@@ -307,24 +307,24 @@ func newHome(ctx context.Context, program string, autoYes bool, noSplash bool) *
 	needsYouPane.SetComposer(composer)
 
 	h := &home{
-		ctx:          ctx,
-		spinner:      spinner.New(spinner.WithSpinner(spinner.MiniDot)),
-		menu:         ui.NewMenu(),
-		tabbedWindow: ui.NewTabbedWindow(sessionPane, needsYouPane, ui.NewTerminalPane()),
-		sessionPane:  sessionPane,
-		errBox:       ui.NewErrBox(),
-		statusBox:    ui.NewStatusBox(),
-		storage:      storage,
-		appConfig:    appConfig,
-		program:      program,
-		autoYes:      autoYes,
-		state:        stateDefault,
-		appState:     appState,
-		composer:     composer,
-		cmdExec:      cmd.MakeExecutor(),
-		laneTab:      ui.SessionTab,
-		needsYouTab:  ui.NeedsYouTab,
-		prevRowKind:  ui.RowKindTracked,
+		ctx:           ctx,
+		spinner:       spinner.New(spinner.WithSpinner(spinner.MiniDot)),
+		menu:          ui.NewMenu(),
+		tabbedWindow:  ui.NewTabbedWindow(sessionPane, needsYouPane, ui.NewTerminalPane()),
+		sessionPane:   sessionPane,
+		errBox:        ui.NewErrBox(),
+		statusBox:     ui.NewStatusBox(),
+		storage:       storage,
+		appConfig:     appConfig,
+		program:       program,
+		autoYes:       autoYes,
+		state:         stateDefault,
+		appState:      appState,
+		composer:      composer,
+		cmdExec:       cmd.MakeExecutor(),
+		laneTab:       ui.SessionTab,
+		needsYouTab:   ui.NeedsYouTab,
+		prevRowKind:   ui.RowKindTracked,
 		pendingLogins: make(map[*session.Instance]string),
 		windowTitle:   attentionDefaultTitle,
 	}
@@ -526,14 +526,24 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tabbedWindow.TickSpinner()
 		// Slice 21's own tab-bar butterfly rides the same 100ms tick.
 		m.tabbedWindow.TickButterfly()
-		cmd := m.instanceChanged()
-		return m, tea.Batch(
-			cmd,
-			func() tea.Msg {
-				time.Sleep(100 * time.Millisecond)
-				return previewTickMsg{}
-			},
-		)
+		// instanceChanged (the Terminal tab's own live-mirror refresh, plus
+		// the menu/needs-you-answered bookkeeping) used to run HERE, on
+		// every 100ms tick, forever - slice 20's own idle-CPU profile named
+		// the resulting full-screen View() re-render (never instanceChanged
+		// itself, which is a no-op off the Terminal tab) as the tick's real
+		// cost. It moved to sessionTickMsg's own 500ms cadence below - the
+		// same "reuse the Session tab's existing slower tick, never run
+		// preview content work on the 100ms animation tick" rule
+		// retargetTranscriptWatch's own comment already states one case of.
+		// Every explicit selection/tab-switch/start/kill call site (see
+		// instanceChanged's own callers) still calls it directly and
+		// instantly - this tick's own copy was purely "keep repainting a
+		// parked Terminal tab while nothing else changed", which a 500ms
+		// cadence still delivers with no perceptible lag.
+		return m, func() tea.Msg {
+			time.Sleep(100 * time.Millisecond)
+			return previewTickMsg{}
+		}
 	case sessionTickMsg:
 		// The Latency ruling (design/cockpit-pane/DECISIONS.md): the
 		// SELECTED lane's Session tab refreshes on its OWN 500ms tick,
@@ -546,6 +556,11 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.laneTailCache = clarity.NewLaneTailCache()
 		}
 		m.updateSessionTabInfo(time.Now())
+		// instanceChanged's own preview-content refresh (the Terminal tab's
+		// live mirror) rides this same 500ms tick now, not the 100ms
+		// previewTickMsg animation tick above - see that case's own
+		// comment (slice 20).
+		terminalCmd := m.instanceChanged()
 		// The fsnotify watch (slice 14 rule 3) follows the selection on
 		// this 500ms cadence, NEVER on the 100ms previewTickMsg animation
 		// tick (rule 1's own "no file read on it" - selectedTranscriptPath
@@ -554,7 +569,7 @@ func (m *home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// the retarget in there measurably raised idle CPU in this leg's
 		// own proof and was removed for exactly that reason).
 		watchCmd := m.retargetTranscriptWatch()
-		return m, tea.Batch(watchCmd, func() tea.Msg {
+		return m, tea.Batch(terminalCmd, watchCmd, func() tea.Msg {
 			time.Sleep(sessionTickInterval)
 			return sessionTickMsg{}
 		})

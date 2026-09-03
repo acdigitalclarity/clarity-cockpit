@@ -125,6 +125,35 @@ func TestSessionPane_RestingFrame_WhenNothingSelected(t *testing.T) {
 	require.NotContains(t, out, "waiting on you", "an unselected pane must not carry conversation state text")
 }
 
+// TestSessionPane_RestingFrame_CachedButInvalidatesOnInputChange is slice
+// 20's own idle-CPU fix: renderResting's splash.RenderFrame call is a pure
+// function of width, height, live and waiting (RenderFrame's own resting
+// branch takes no frame/tick number at all - see ui/splash/render.go) and
+// used to be recomputed from scratch on every previewTickMsg regardless -
+// the idle-CPU profile named it the single largest per-tick cost. Cached
+// now (SessionPane.restingCache*, session.go) - this proves the cache
+// still tracks its own inputs rather than going stale: two calls with the
+// same fleet counts return byte-identical output, and a fleet-count change
+// (SetFleetCounts, the feed tick's own write) is reflected on the very
+// next call, never the count that was cached before it.
+func TestSessionPane_RestingFrame_CachedButInvalidatesOnInputChange(t *testing.T) {
+	s := NewSessionPane()
+	s.SetSize(115, 34)
+	s.SetFleetCounts(5, 2)
+
+	first := s.String()
+	second := s.String()
+	require.Equal(t, first, second, "two renders with unchanged inputs must be identical (the cached path)")
+
+	s.SetFleetCounts(9, 4)
+	third := s.String()
+	require.NotEqual(t, second, third, "a fleet-counts change must invalidate the cache on the very next render")
+
+	s.SetSize(100, 30)
+	fourth := s.String()
+	require.NotEqual(t, third, fourth, "a size change must invalidate the cache on the very next render")
+}
+
 // TestSessionPane_NewestTurnPinnedToBottom is the brief's own named
 // behaviour: with more turns than the turns region can show, the LATEST
 // turn is always visible and an early one has scrolled off.

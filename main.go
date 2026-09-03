@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -545,10 +546,50 @@ func init() {
 	rootCmd.AddCommand(laneTailCmd)
 }
 
+// startCPUProfileIfRequested writes a CPU profile for the process lifetime
+// when CLARITY_CPUPROFILE names a path - off by default (slice 20's own
+// measurement rig, kept in place afterwards since it costs nothing while
+// unset). The TUI's own Program.handleSignals (bubbletea v2, tea.go) already
+// turns SIGINT/SIGTERM into a QuitMsg and returns p.Run() gracefully rather
+// than exiting the process itself, so main()'s own deferred stop below runs
+// on every quit path (ctrl-q, ctrl-c, an external SIGTERM) with nothing
+// else racing it: an earlier version of this hook ALSO registered its own
+// signal.Notify and called os.Exit(0) from a second goroutine, which raced
+// bubbletea's graceful quit back to main()'s return - normal main() return
+// exits the whole process the instant the faster of the two finishes,
+// truncating whichever profile write was still in flight on the other path.
+// Losing that race is exactly how this rig's own first measurement attempt
+// produced a 0-byte profile.
+func startCPUProfileIfRequested() (stop func()) {
+	path := os.Getenv("CLARITY_CPUPROFILE")
+	if path == "" {
+		return func() {}
+	}
+
+	f, err := os.Create(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "CLARITY_CPUPROFILE: could not create %s: %v\n", path, err)
+		return func() {}
+	}
+	if err := pprof.StartCPUProfile(f); err != nil {
+		fmt.Fprintf(os.Stderr, "CLARITY_CPUPROFILE: could not start profile: %v\n", err)
+		_ = f.Close()
+		return func() {}
+	}
+
+	return func() {
+		pprof.StopCPUProfile()
+		_ = f.Close()
+	}
+}
+
 func main() {
 	// Extract the binary name from how this was invoked
 	binName = filepath.Base(os.Args[0])
 	rootCmd.Use = binName
+
+	stopProfile := startCPUProfileIfRequested()
+	defer stopProfile()
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
