@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/creack/pty"
@@ -81,6 +82,45 @@ type TmuxSession struct {
 	// buffer until something else does - never delivered as the single byte
 	// this loop's `nr == 1` check needs.
 	stdinRawState *term.State
+
+	// Board #325: the stdin-forwarding goroutine below reads with a blocking
+	// os.Stdin.Read that cannot be cancelled, so a read started during one
+	// attach can return after that attach ended - or after a new one has
+	// already started. These fields are how the goroutine (started at most
+	// once per TmuxSession, never stacked - see startStdinReader) decides,
+	// each time a read actually returns, whether an attach is live RIGHT
+	// NOW and if so which pty owns the byte. They persist ACROSS attach
+	// cycles (unlike ctx/cancel/wg above, which Detach nils every cycle)
+	// because the goroutine itself can outlive a single cycle.
+	stdinMu        sync.Mutex
+	stdinGen       uint64    // bumped by every Attach call; carried in log lines for debugging, not itself load-bearing for the live/target check below.
+	stdinLive      bool      // true only while the attach at stdinGen is still attached; cleared by both Detach and DetachSafely (board #317's two teardown paths).
+	stdinTarget    *os.File  // the ptmx to forward to while stdinLive is true.
+	stdinNukeUntil time.Time // end of the "nuke first bytes" window for the CURRENT attach cycle; reset by every Attach call.
+
+	// stdinReader is where the goroutine reads from; nil in every real
+	// build, where startStdinReader defaults it to os.Stdin. Tests
+	// substitute a fake pipe so a byte's timing relative to attach/detach
+	// can be controlled without a real terminal.
+	stdinReader io.Reader
+	// stdinReaderAlive is 1 while the persistent goroutine is running, 0
+	// once it has returned - on real EOF, or on the first read that
+	// completes with no attach live (an attach ending by itself does not
+	// stop a reader still blocked in Read, since that syscall cannot be
+	// interrupted; the reader stops on the byte after). startStdinReader
+	// CAS's this 0->1 to claim the right to spawn; a failed CAS means a
+	// goroutine is still blocked in Read - either forwarding a live attach
+	// or stuck in the gap waiting for its next byte - and must be reused,
+	// never joined by a second one.
+	stdinReaderAlive int32
+	// stdinReaderStarts counts real goroutine launches, for tests to prove
+	// a leaked reader was reused rather than duplicated.
+	stdinReaderStarts int32
+	// stdinProcessed is a test-only hook: when non-nil, stdinForwardLoop
+	// sends on it after fully handling each read, giving tests a
+	// deterministic point to synchronize on instead of sleeping. Always nil
+	// in production.
+	stdinProcessed chan struct{}
 }
 
 const TmuxPrefix = "claudesquad_"
@@ -429,55 +469,142 @@ func (t *TmuxSession) Attach() (chan struct{}, error) {
 		}
 	}()
 
-	go func() {
-		// Close the channel after 50ms
-		timeoutCh := make(chan struct{})
-		go func() {
-			time.Sleep(50 * time.Millisecond)
-			close(timeoutCh)
-		}()
+	// Board #325: record this cycle's live state for the persistent stdin
+	// reader to consult, then make sure a reader exists - starting one only
+	// if none is already alive. Order matters: the state is published
+	// before startStdinReader runs so a reader left over from a leaked
+	// cycle (still blocked in Read, never joined by a second one - see
+	// startStdinReader) sees the new target the instant it next wakes,
+	// rather than a window where it could wake to stale state.
+	t.stdinMu.Lock()
+	t.stdinGen++
+	t.stdinLive = true
+	t.stdinTarget = t.ptmx
+	t.stdinNukeUntil = time.Now().Add(50 * time.Millisecond)
+	t.stdinMu.Unlock()
 
-		// Read input from stdin and check for Ctrl+q
-		buf := make([]byte, 32)
-		for {
-			nr, err := os.Stdin.Read(buf)
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
-				continue
-			}
-
-			// Nuke the first bytes of stdin, up to 64, to prevent tmux from reading it.
-			// When we attach, there tends to be terminal control sequences like ?[?62c0;95;0c or
-			// ]10;rgb:f8f8f8. The control sequences depend on the terminal (warp vs iterm). We should use regex ideally
-			// but this works well for now. Log this for debugging.
-			//
-			// There seems to always be control characters, but I think it's possible for there not to be. The heuristic
-			// here can be: if there's characters within 50ms, then assume they are control characters and nuke them.
-			select {
-			case <-timeoutCh:
-			default:
-				log.InfoLog.Printf("nuked first stdin: %s", buf[:nr])
-				continue
-			}
-
-			// Check for the detach key: Ctrl+] (GS, ASCII 29) or Ctrl+q (ASCII 17).
-			// Ctrl-] is offered first because it reaches the terminal in every
-			// editor; Ctrl-q alone doesn't - VS Code's integrated terminal binds
-			// it to Quick Open View before it ever gets to us.
-			if isDetachByte(nr, buf[0]) {
-				// Detach from the session
-				t.Detach()
-				return
-			}
-
-			// Forward other input to tmux
-			_, _ = t.ptmx.Write(buf[:nr])
-		}
-	}()
+	t.startStdinReader()
 
 	return ch, nil
+}
+
+// startStdinReader launches the persistent stdin-forwarding goroutine the
+// first time any Attach call needs one, and is a no-op on every later call
+// while that goroutine is still alive (board #325). Without the CAS guard,
+// a cycle that ends without a detach byte (board #317: the program inside
+// tmux exits on its own) leaves its reader blocked in os.Stdin.Read - not
+// cancellable, and not returning until the next byte arrives, however long
+// that is - and the next Attach would spawn a second one, stacking readers
+// that race the next keystroke against each other; whichever wins can
+// forward it to the wrong pty or call Detach on an attach it was never
+// part of. Reusing the stuck reader instead is safe because
+// stdinForwardLoop always re-checks stdinLive/stdinTarget against the
+// moment a read actually returns, never against whatever was live when
+// the read began.
+func (t *TmuxSession) startStdinReader() {
+	if !atomic.CompareAndSwapInt32(&t.stdinReaderAlive, 0, 1) {
+		return
+	}
+	atomic.AddInt32(&t.stdinReaderStarts, 1)
+
+	reader := io.Reader(os.Stdin)
+	if t.stdinReader != nil {
+		reader = t.stdinReader
+	}
+	go t.stdinForwardLoop(reader)
+}
+
+// stdinForwardLoop is the persistent stdin-forwarding goroutine body
+// (board #325). It returns on a genuine EOF from src (real stdin closing -
+// practically never in production, used by tests to end the goroutine
+// deterministically), right after it processes a real detach byte for an
+// attach that was live when the byte was checked, or - since #325's own
+// fix - on any read that completes with no attach live at all. That last
+// case is what ends a reader left over from a cycle that ended without a
+// detach byte (board #317) instead of leaving it blocked on the shared
+// stdin forever, silently dropping every later keystroke typed on the
+// list; the next Attach's startStdinReader CAS starts a fresh reader for
+// the next cycle. Only the current attach's nuke window loops back to read
+// the next byte instead of returning.
+func (t *TmuxSession) stdinForwardLoop(src io.Reader) {
+	defer atomic.StoreInt32(&t.stdinReaderAlive, 0)
+
+	buf := make([]byte, 32)
+	for {
+		nr, err := src.Read(buf)
+		if err != nil {
+			if err == io.EOF {
+				return
+			}
+			continue
+		}
+
+		t.stdinMu.Lock()
+		gen := t.stdinGen
+		live := t.stdinLive
+		target := t.stdinTarget
+		nukeUntil := t.stdinNukeUntil
+		t.stdinMu.Unlock()
+
+		if !live {
+			// No attach is live right now: this byte belongs to no pty -
+			// either it arrived in the gap between two attaches, or its
+			// owning attach already ended while this read was blocked.
+			// Drop it and return: the deferred store below clears
+			// stdinReaderAlive, so the next Attach's startStdinReader CAS
+			// starts a fresh reader instead of this one looping forever on
+			// a dead attach and silently swallowing every keystroke typed
+			// afterwards - bubbletea owns stdin between attaches.
+			t.notifyStdinProcessed()
+			return
+		}
+
+		// Nuke the first bytes of this attach cycle, up to 64, to prevent
+		// tmux from reading it. When we attach, there tends to be terminal
+		// control sequences like ?[?62c0;95;0c or ]10;rgb:f8f8f8. The
+		// control sequences depend on the terminal (warp vs iterm). We
+		// should use regex ideally but this works well for now. Log this
+		// for debugging.
+		//
+		// There seems to always be control characters, but I think it's
+		// possible for there not to be. The heuristic here can be: if
+		// there's characters within 50ms of THIS attach starting, assume
+		// they are control characters and nuke them.
+		if time.Now().Before(nukeUntil) {
+			log.InfoLog.Printf("nuked first stdin (gen %d): %s", gen, buf[:nr])
+			t.notifyStdinProcessed()
+			continue
+		}
+
+		// Check for the detach key: Ctrl+] (GS, ASCII 29) or Ctrl+q (ASCII 17).
+		// Ctrl-] is offered first because it reaches the terminal in every
+		// editor; Ctrl-q alone doesn't - VS Code's integrated terminal binds
+		// it to Quick Open View before it ever gets to us.
+		if isDetachByte(nr, buf[0]) {
+			t.Detach()
+			t.notifyStdinProcessed()
+			return
+		}
+
+		// Forward other input to the pty live right now - never t.ptmx read
+		// fresh, which could already belong to a different attach cycle by
+		// the time this line runs.
+		_, _ = target.Write(buf[:nr])
+		t.notifyStdinProcessed()
+	}
+}
+
+// notifyStdinProcessed signals stdinProcessed, if a test set one, after
+// stdinForwardLoop has fully handled one read. Non-blocking so a test that
+// isn't currently receiving never stalls the loop.
+func (t *TmuxSession) notifyStdinProcessed() {
+	if t.stdinProcessed == nil {
+		return
+	}
+	select {
+	case t.stdinProcessed <- struct{}{}:
+	default:
+	}
 }
 
 // restoreStdinRawState reverses whatever Attach's own term.MakeRaw call did
@@ -500,6 +627,15 @@ func (t *TmuxSession) DetachSafely() error {
 	if t.attachCh == nil {
 		return nil // Already detached
 	}
+
+	// Board #325: clear the live target as the very first thing, before
+	// closing anything below - the stdin-forwarding goroutine must never
+	// observe stdinLive still true once this teardown has begun, or it
+	// could write to a ptmx that's about to be closed under it.
+	t.stdinMu.Lock()
+	t.stdinLive = false
+	t.stdinTarget = nil
+	t.stdinMu.Unlock()
 
 	var errs []error
 
@@ -549,6 +685,13 @@ func (t *TmuxSession) Detach() {
 	if t.ptmx == nil {
 		return
 	}
+
+	// Board #325: same reasoning as DetachSafely's own early clear - done
+	// before anything below closes or reassigns t.ptmx.
+	t.stdinMu.Lock()
+	t.stdinLive = false
+	t.stdinTarget = nil
+	t.stdinMu.Unlock()
 
 	// TODO: control flow is a bit messy here. If there's an error,
 	// I'm not sure if we get into a bad state. Needs testing.
