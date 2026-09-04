@@ -104,11 +104,14 @@ type TmuxSession struct {
 	// can be controlled without a real terminal.
 	stdinReader io.Reader
 	// stdinReaderAlive is 1 while the persistent goroutine is running, 0
-	// once it has returned (real EOF only - a live attach ending does not
-	// stop it, since os.Stdin.Read cannot be interrupted). startStdinReader
+	// once it has returned - on real EOF, or on the first read that
+	// completes with no attach live (an attach ending by itself does not
+	// stop a reader still blocked in Read, since that syscall cannot be
+	// interrupted; the reader stops on the byte after). startStdinReader
 	// CAS's this 0->1 to claim the right to spawn; a failed CAS means a
-	// goroutine from an earlier cycle is still blocked in Read and must be
-	// reused, never joined by a second one.
+	// goroutine is still blocked in Read - either forwarding a live attach
+	// or stuck in the gap waiting for its next byte - and must be reused,
+	// never joined by a second one.
 	stdinReaderAlive int32
 	// stdinReaderStarts counts real goroutine launches, for tests to prove
 	// a leaked reader was reused rather than duplicated.
@@ -489,13 +492,14 @@ func (t *TmuxSession) Attach() (chan struct{}, error) {
 // first time any Attach call needs one, and is a no-op on every later call
 // while that goroutine is still alive (board #325). Without the CAS guard,
 // a cycle that ends without a detach byte (board #317: the program inside
-// tmux exits on its own) leaves its reader permanently blocked in
-// os.Stdin.Read - unable to be cancelled - and the next Attach would spawn
-// a second one, stacking readers that race the next keystroke against each
-// other; whichever wins can forward it to the wrong pty or call Detach on
-// an attach it was never part of. Reusing the stuck reader instead is safe
-// because stdinForwardLoop always re-checks stdinLive/stdinTarget against
-// the moment a read actually returns, never against whatever was live when
+// tmux exits on its own) leaves its reader blocked in os.Stdin.Read - not
+// cancellable, and not returning until the next byte arrives, however long
+// that is - and the next Attach would spawn a second one, stacking readers
+// that race the next keystroke against each other; whichever wins can
+// forward it to the wrong pty or call Detach on an attach it was never
+// part of. Reusing the stuck reader instead is safe because
+// stdinForwardLoop always re-checks stdinLive/stdinTarget against the
+// moment a read actually returns, never against whatever was live when
 // the read began.
 func (t *TmuxSession) startStdinReader() {
 	if !atomic.CompareAndSwapInt32(&t.stdinReaderAlive, 0, 1) {
@@ -511,17 +515,17 @@ func (t *TmuxSession) startStdinReader() {
 }
 
 // stdinForwardLoop is the persistent stdin-forwarding goroutine body
-// (board #325). It returns only on a genuine EOF from src (real stdin
-// closing - practically never in production, used by tests to end the
-// goroutine deterministically) or right after it processes a real detach
-// byte for an attach that was live when the byte was checked - the same
-// bounded lifetime the pre-fix code had for a normal Ctrl-Q/Ctrl-] cycle,
-// so a well-behaved attach/detach still leaves no background reader racing
-// bubbletea's own stdin reads between cycles. Every other outcome (no
-// attach live right now, or inside the current attach's nuke window) loops
-// back to read the next byte instead of returning, because that is what
-// lets a reader stuck from a leaked cycle (see startStdinReader) pick up
-// the NEXT attach's live state instead of vanishing along with the leak.
+// (board #325). It returns on a genuine EOF from src (real stdin closing -
+// practically never in production, used by tests to end the goroutine
+// deterministically), right after it processes a real detach byte for an
+// attach that was live when the byte was checked, or - since #325's own
+// fix - on any read that completes with no attach live at all. That last
+// case is what ends a reader left over from a cycle that ended without a
+// detach byte (board #317) instead of leaving it blocked on the shared
+// stdin forever, silently dropping every later keystroke typed on the
+// list; the next Attach's startStdinReader CAS starts a fresh reader for
+// the next cycle. Only the current attach's nuke window loops back to read
+// the next byte instead of returning.
 func (t *TmuxSession) stdinForwardLoop(src io.Reader) {
 	defer atomic.StoreInt32(&t.stdinReaderAlive, 0)
 
@@ -545,12 +549,14 @@ func (t *TmuxSession) stdinForwardLoop(src io.Reader) {
 		if !live {
 			// No attach is live right now: this byte belongs to no pty -
 			// either it arrived in the gap between two attaches, or its
-			// owning attach already ended. Forwarding it to whatever
-			// t.ptmx happens to be current is exactly the board #325 bug;
-			// drop it and keep reading so a later Attach can still reuse
-			// this same goroutine.
+			// owning attach already ended while this read was blocked.
+			// Drop it and return: the deferred store below clears
+			// stdinReaderAlive, so the next Attach's startStdinReader CAS
+			// starts a fresh reader instead of this one looping forever on
+			// a dead attach and silently swallowing every keystroke typed
+			// afterwards - bubbletea owns stdin between attaches.
 			t.notifyStdinProcessed()
-			continue
+			return
 		}
 
 		// Nuke the first bytes of this attach cycle, up to 64, to prevent
