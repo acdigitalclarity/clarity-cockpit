@@ -23,7 +23,6 @@ import (
 
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
 	"github.com/mattn/go-runewidth"
 )
 
@@ -3485,7 +3484,18 @@ func (m *home) View() tea.View {
 		return v
 	}
 
-	listWithPadding := lipgloss.NewStyle().PaddingTop(1).Render(m.list.String())
+	// listWithPadding/previewWithPadding/listAndPreview go through
+	// view_assembly.go's own padTop1/joinHorizontalTop (slice 20C,
+	// COCKPIT-CONTRACT.md S2) rather than lipgloss.NewStyle().PaddingTop(1)
+	// .Render/lipgloss.JoinHorizontal directly - the pprof-identified
+	// remainder after slice 20/20B cut TabbedWindow's own render cost and
+	// the external-lane discovery walk. Both helpers reproduce the
+	// lipgloss algorithm exactly (see view_assembly.go's own doc comment
+	// for the derivation) rather than caching or memoising anything, and
+	// fall back to the real lipgloss calls the moment either block is not
+	// already the fixed-width shape ui/list.go and ui/tabbed_window.go's
+	// own String() methods are built to produce.
+	listWithPadding := padTop1(m.list.String())
 
 	previewContent := m.tabbedWindow.String()
 	if m.state == stateNew && m.newLaneOverlay != nil {
@@ -3496,8 +3506,8 @@ func (m *home) View() tea.View {
 		// the pane behind the box gets PlaceOverlay's own fade.
 		previewContent = overlay.PlaceOverlay(0, 0, m.newLaneOverlay.Render(), previewContent, false, true)
 	}
-	previewWithPadding := lipgloss.NewStyle().PaddingTop(1).Render(previewContent)
-	listAndPreview := lipgloss.JoinHorizontal(lipgloss.Top, listWithPadding, previewWithPadding)
+	previewWithPadding := padTop1(previewContent)
+	listAndPreview := joinHorizontalTop(listWithPadding, previewWithPadding)
 
 	// The error box and status box share one footer row: an error always
 	// wins if somehow both are set (it should never lose visibility behind
@@ -3515,9 +3525,11 @@ func (m *home) View() tea.View {
 	// pushing the list's own one-space-margined " Instances " title right
 	// by half of it (the MARGIN defect: column 5-6 at 164 wide instead of
 	// column 1). Left leaves the shortfall entirely on the right, where
-	// nothing is drawn anyway.
-	mainView := lipgloss.JoinVertical(
-		lipgloss.Left,
+	// nothing is drawn anyway. joinVerticalLeft is view_assembly.go's own
+	// replacement for lipgloss.JoinVertical here too (item 2c) - same
+	// derivation and same fallback rule as listWithPadding/listAndPreview
+	// above.
+	mainView := joinVerticalLeft(
 		listAndPreview,
 		m.menu.String(),
 		footer,
